@@ -179,6 +179,22 @@ export interface RuntimeStats {
   cacheHitRatio?: number | null;
 }
 
+export interface ReclaimedQueuedMessage {
+  text: string;
+  images?: Array<{ mediaType: string; data: string }>;
+}
+
+/**
+ * Native `abort` reply. The host drains steering/follow-up queues as part of
+ * cancelling the run and hands the messages back here; a UI that ignores them
+ * silently swallows input staged during the run.
+ */
+export interface AbortResult {
+  aborted?: boolean;
+  steer?: ReclaimedQueuedMessage[];
+  followUp?: ReclaimedQueuedMessage[];
+}
+
 export interface QueueItem {
   entryId: string;
   queue: string;

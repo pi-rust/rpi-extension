@@ -115,6 +115,9 @@ const messages = {
     queuePlaceholder: "Queue a follow-up…",
     queueKindNotResubmittable:
       "This {kind} queued message cannot be re-queued; copy its text before cancelling it.",
+    queueRestored: "Restored {count} queued message(s) to the composer",
+    queueRestoreImages:
+      "{count} queued image(s) could not be restored to the composer",
     followUp: "follow-up",
     steer: "steer",
     nextTurn: "next turn",
@@ -500,6 +503,8 @@ const messages = {
     queuePlaceholder: "添加后续消息…",
     queueKindNotResubmittable:
       "这条{kind}排队消息无法重新入队；请先复制内容再取消。",
+    queueRestored: "已将 {count} 条排队消息恢复到输入框",
+    queueRestoreImages: "有 {count} 张排队图片无法恢复到输入框",
     followUp: "后续消息",
     steer: "引导消息",
     nextTurn: "下一轮",

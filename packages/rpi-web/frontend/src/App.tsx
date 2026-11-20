@@ -82,6 +82,7 @@ import {
   hostIsRetired,
   reopenHost,
   roleOf,
+  type AbortResult,
   type AuthProviderStatus,
   type Capabilities,
   type HistoryResponse,
@@ -938,6 +939,25 @@ export default function App() {
     draftBySession.current.clear();
     saveDrafts(draftBySession.current);
   }, []);
+
+  /**
+   * Put reclaimed queue text back into a session's composer, keeping the draft
+   * the user typed after queueing it. Mirrors the native order (restored text
+   * first, existing draft second) so a stop never reorders staged input.
+   */
+  function restoreQueuedDraft(targetSession: string, queuedText: string) {
+    const current =
+      (targetSession === activeSessionRef.current ? draft : "") ||
+      draftBySession.current.get(targetSession) ||
+      "";
+    const merged = current.trim() ? `${queuedText}\n\n${current}` : queuedText;
+    draftBySession.current.set(targetSession, merged);
+    saveDrafts(draftBySession.current);
+    if (targetSession === activeSessionRef.current) {
+      setDraft(merged);
+      composerInputRef.current?.focus();
+    }
+  }
 
   const draftSessionIds = useMemo(
     () => new Set(draftBySession.current.keys()),
@@ -4253,11 +4273,38 @@ export default function App() {
   async function abort() {
     if (!sessionId || !supported.has("abort")) return;
     const navigation = navigationRevision.current;
+    const targetSession = sessionId;
     try {
-      await commandData(sessionId, "abort");
+      const result = await commandData<AbortResult>(targetSession, "abort");
+      if (navigation !== navigationRevision.current) return;
+      // The native host drains both queues as part of the cancel and hands the
+      // messages back (`steer` + `followUp`). Dropping that reply is what made
+      // staged input disappear after a stop, so put it back in the composer.
+      const reclaimed = [...(result.steer ?? []), ...(result.followUp ?? [])];
+      if (reclaimed.length === 0) return;
+      const queuedText = reclaimed
+        .map((message) => message.text ?? "")
+        .filter((text) => text.trim().length > 0)
+        .join("\n\n");
+      const images = reclaimed.reduce(
+        (total, message) => total + (message.images?.length ?? 0),
+        0,
+      );
+      if (queuedText) restoreQueuedDraft(targetSession, queuedText);
+      if (targetSession !== activeSessionRef.current) return;
+      // Any reclaimed entry means the host drained the queue, so the rows the
+      // panel showed mid-run are stale whether or not they carried text.
+      setQueueItems([]);
+      void refreshDiagnostics(targetSession);
+      if (queuedText) note(t("queueRestored", { count: reclaimed.length }));
+      if (images > 0) note(t("queueRestoreImages", { count: images }));
     } catch (cause) {
       if (navigation !== navigationRevision.current) return;
       setError(errorText(cause));
+      // A trampled abort reply can still have drained the native queue, so read
+      // the host's list instead of showing rows that may already be gone.
+      if (targetSession === activeSessionRef.current)
+        void refreshQueue(targetSession);
     }
   }
 
