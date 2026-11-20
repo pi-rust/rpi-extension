@@ -986,7 +986,7 @@ mod transport_tests {
         for certificate in rustls_pemfile::certs(&mut cert_pem.as_bytes()) {
             roots.add(certificate.expect("cert der")).expect("add root");
         }
-        let client_config = tokio_rustls::rustls::ClientConfig::builder()
+        let client_config = crate::tls::client_config_builder()
             .with_root_certificates(roots)
             .with_no_client_auth();
         let connector = tokio_tungstenite::Connector::Rustls(Arc::new(client_config));
@@ -1181,7 +1181,7 @@ mod transport_tests {
             .expect("trust ca");
 
         // A client without a certificate cannot complete the handshake.
-        let anonymous = tokio_rustls::rustls::ClientConfig::builder()
+        let anonymous = crate::tls::client_config_builder()
             .with_root_certificates(roots.clone())
             .with_no_client_auth();
         let refused = tokio_tungstenite::connect_async_tls_with_config(
@@ -1197,7 +1197,7 @@ mod transport_tests {
         );
 
         // With a certificate signed by the CA the session works.
-        let authenticated = tokio_rustls::rustls::ClientConfig::builder()
+        let authenticated = crate::tls::client_config_builder()
             .with_root_certificates(roots)
             .with_client_auth_cert(
                 vec![CertificateDer::from(client_cert.der().to_vec())],

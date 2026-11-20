@@ -522,7 +522,7 @@ impl WebSocketTransport {
         }
         let mut roots = tokio_rustls::rustls::RootCertStore::empty();
         roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-        let config = tokio_rustls::rustls::ClientConfig::builder()
+        let config = crate::tls::client_config_builder()
             .with_root_certificates(roots)
             .with_no_client_auth();
         let connector = tokio_rustls::TlsConnector::from(Arc::new(config));
@@ -821,7 +821,7 @@ mod websocket_tests {
             tokio::spawn(async move { server.accept().await })
         };
         let connector = tokio_tungstenite::Connector::Rustls(Arc::new(
-            tokio_rustls::rustls::ClientConfig::builder()
+            crate::tls::client_config_builder()
                 .with_root_certificates(trust(&first.0))
                 .with_no_client_auth(),
         ));
@@ -854,7 +854,7 @@ mod websocket_tests {
             tokio::spawn(async move { server.accept().await })
         };
         let connector = tokio_tungstenite::Connector::Rustls(Arc::new(
-            tokio_rustls::rustls::ClientConfig::builder()
+            crate::tls::client_config_builder()
                 .with_root_certificates(trust(&second.0))
                 .with_no_client_auth(),
         ));
@@ -889,7 +889,7 @@ mod websocket_tests {
             tokio::spawn(async move { server.accept().await })
         };
         let connector = tokio_tungstenite::Connector::Rustls(Arc::new(
-            tokio_rustls::rustls::ClientConfig::builder()
+            crate::tls::client_config_builder()
                 .with_root_certificates(trust(&first.0))
                 .with_no_client_auth(),
         ));

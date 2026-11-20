@@ -4,9 +4,22 @@
 //! existing PEM certificate chain and private key, and every failure is reported
 //! without echoing file contents.
 
-use rustls::ServerConfig;
+use rustls::{ClientConfig, ConfigBuilder, ServerConfig, WantsVerifier};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+
+// Select the same backend as rustls' defaults, but locally: workspace feature
+// unification can enable both backends, and a library must not install a
+// process-wide default on behalf of its caller.
+fn crypto_provider() -> Arc<rustls::crypto::CryptoProvider> {
+    Arc::new(rustls::crypto::aws_lc_rs::default_provider())
+}
+
+pub(crate) fn client_config_builder() -> ConfigBuilder<ClientConfig, WantsVerifier> {
+    ClientConfig::builder_with_provider(crypto_provider())
+        .with_safe_default_protocol_versions()
+        .expect("the built-in aws-lc-rs provider supports the default TLS versions")
+}
 
 /// PEM files backing `wss://`. `client_ca` enables mTLS when set.
 #[derive(Debug, Clone)]
@@ -58,19 +71,25 @@ pub fn load_server_config(
         .map_err(|_| "TLS key file has no PEM private key".to_string())?
         .ok_or_else(|| "TLS key file has no PEM private key".to_string())?;
 
+    let provider = crypto_provider();
+    let builder = ServerConfig::builder_with_provider(Arc::clone(&provider))
+        .with_safe_default_protocol_versions()
+        .map_err(|_| "TLS provider does not support the default TLS versions".to_string())?;
     let builder = match client_ca {
         Some(path) => {
-            let verifier =
-                rustls::server::WebPkiClientVerifier::builder(Arc::new(client_roots(path)?))
-                    .build()
-                    .map_err(|_| {
-                        "TLS client CA is not usable for verifying client certificates".to_string()
-                    })?;
+            let verifier = rustls::server::WebPkiClientVerifier::builder_with_provider(
+                Arc::new(client_roots(path)?),
+                provider,
+            )
+            .build()
+            .map_err(|_| {
+                "TLS client CA is not usable for verifying client certificates".to_string()
+            })?;
             // A client CA means client certificates are mandatory; there is no
             // "verify when offered" mode because that silently accepts anyone.
-            ServerConfig::builder().with_client_cert_verifier(verifier)
+            builder.with_client_cert_verifier(verifier)
         }
-        None => ServerConfig::builder().with_no_client_auth(),
+        None => builder.with_no_client_auth(),
     };
     builder
         .with_single_cert(chain, private_key)

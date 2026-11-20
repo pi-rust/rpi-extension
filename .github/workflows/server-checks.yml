@@ -45,6 +45,10 @@ jobs:
       # native binaries are required.
       - name: Test transports and schema contracts
         run: cargo test --locked -p rpi-server
+      # Simulate workspace feature unification without building every member.
+      # Both crypto backends must work without installing a global provider.
+      - name: Test TLS with both crypto backends enabled
+        run: cargo test --locked -p rpi-server --features rustls/ring
       - name: Check all targets
         run: cargo check --locked -p rpi-server --all-targets
       - name: Clippy
