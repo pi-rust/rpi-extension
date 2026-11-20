@@ -19,10 +19,11 @@ This repository contains the shared native runtime and protocol adapters for rpi
 
 ## Local Web frontend workflow
 
-- Make Web frontend changes directly in the sibling `rpi-package-dev` worktree (`D:/Projects/rpi-package-dev` on this machine), on its `dev/web-hmr` branch. The public `https://work-dev.bigfisharc.cn` Vite server serves `packages/rpi-web/frontend` from that worktree.
-- Before editing, check that worktree's branch and working tree; preserve existing edits. Do not implement frontend changes only in another checkout and leave the live dev worktree behind. Commit and update the feature PR from the dev worktree when ready.
-- Verify changes through the public dev page and HMR, in addition to typecheck and relevant browser tests. Frontend HMR does not update the shared Rust backend.
-- Keep the production frontend, services and installed binaries unchanged unless deployment is explicitly requested.
+- This checkout is the single source for both Web environments; the pre-migration `rpi-package-dev` worktree no longer exists. Topology, ports and service commands are documented in [docs/web-hot-reload.md](docs/web-hot-reload.md).
+- `https://work-dev.bigfisharc.cn` is the Vite dev server with HMR for `packages/rpi-web/frontend` (`launchd cn.bigfish.rpi-web-dev`, port 18087); `https://work.bigfisharc.cn` is the bundle in `packages/rpi-web/assets` served by `rpi --webserver` (`launchd cn.bigfish.rpi-web`, port 18088). Both arrive through the remote Caddy reverse proxy and the `cn.bigfish.rpi-tunnel` SSH tunnel.
+- Edit frontend sources here and verify through the dev page and HMR, plus `npm run typecheck` and the relevant Playwright specs. `npm run build` publishes `packages/rpi-web/assets`; the service re-reads `index.html` per request, so a frontend-only change needs no restart.
+- Frontend HMR never updates the shared Rust backend or the installed extension. Rust changes need `python3 ~/.rpi/mac-web/deploy-web.py` (build, install, idle check, restart, verify).
+- Keep the production service and installed binaries unchanged unless a deploy is explicitly requested.
 
 ## Review and change discipline
 
