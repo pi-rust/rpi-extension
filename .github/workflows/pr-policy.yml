@@ -1,0 +1,36 @@
+name: PR policy
+
+# pull_request_target runs the base-branch definition with the base checkout, so
+# a pull request cannot weaken this gate by editing the workflow or the script.
+on:
+  pull_request_target:
+    types: [opened, edited, reopened, synchronize, ready_for_review]
+
+permissions:
+  contents: read
+  issues: read
+  pull-requests: read
+
+concurrency:
+  group: pr-policy-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  require-issue:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.base.sha }}
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Require an existing issue before review
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          python .github/scripts/pr-policy.py \
+            --repository "$GITHUB_REPOSITORY" \
+            --number "${{ github.event.pull_request.number }}"
