@@ -2899,7 +2899,7 @@ dependencies = [
 
 [[package]]
 name = "rpi-server"
-version = "0.3.11"
+version = "0.3.12"
 dependencies = [
  "async-trait",
  "futures-util",
@@ -2989,7 +2989,7 @@ dependencies = [
 
 [[package]]
 name = "rpi-web"
-version = "0.1.73"
+version = "0.1.74"
 dependencies = [
  "axum",
  "rpi-extcore",

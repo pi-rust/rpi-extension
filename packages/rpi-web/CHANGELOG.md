@@ -2,6 +2,12 @@
 
 ## [Unreleased]
 
+## [0.1.74](https://github.com/pi-rust/rpi-extension/compare/rpi-web-v0.1.73...rpi-web-v0.1.74) - 2026-11-20
+
+### Fixed
+
+- *(web)* restore reclaimed queue messages on stop ([#7](https://github.com/pi-rust/rpi-extension/pull/7))
+
 ### Fixed
 
 - *(web)* keep streamed assistant replies from shrinking the transcript while Markdown reflows ([#371](https://github.com/pi-rust/rpi-package/pull/371))

@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.12](https://github.com/pi-rust/rpi-extension/compare/rpi-server-v0.3.11...rpi-server-v0.3.12) - 2026-11-20
+
+### Fixed
+
+- *(server)* select TLS crypto providers locally ([#10](https://github.com/pi-rust/rpi-extension/pull/10))
+
 ## [0.3.11](https://github.com/pi-rust/rpi-package/compare/rpi-server-v0.3.10...rpi-server-v0.3.11) - 2026-11-06
 
 ### Fixed
