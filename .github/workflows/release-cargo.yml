@@ -141,8 +141,15 @@ jobs:
           root = pathlib.Path.cwd()
           with (root / "packages/rpi-web/Cargo.toml").open("rb") as handle:
               web_version = tomllib.load(handle)["package"]["version"]
-          tag = f"rpi-web-v{web_version}"
-          subprocess.run(["git", "rev-parse", tag], check=True, stdout=subprocess.DEVNULL)
+          # A version PR can already be merged while its release tag does not
+          # exist yet. Compare against the latest existing reachable release,
+          # never invent a tag for the unpublished current version.
+          tag = subprocess.check_output(
+              ["python3", ".github/scripts/select-release-baseline.py",
+               "--package", "rpi-web", "--version", web_version],
+              text=True,
+          ).strip()
+          print(f"Using release comparison tag: {tag}")
 
           destination = pathlib.Path(tempfile.mkdtemp(prefix="release-registry-"))
           archive = subprocess.run(

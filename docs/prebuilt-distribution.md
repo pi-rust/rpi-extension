@@ -179,13 +179,16 @@ triple and the archive slug.
 
 ## Release automation
 
-On a push to `main`, the release workflow prepares versions and changelogs,
-synchronizes the catalog, runs tests and Cargo publishing preflight, and opens
-and squash-merges a PR containing the tested release metadata. It never pushes
+When manually dispatched on `main`, the release workflow prepares versions and
+changelogs, synchronizes the catalog, runs tests and Cargo publishing preflight,
+and opens and squash-merges a PR containing the tested release metadata. It never pushes
 directly to protected `main`. The repository must allow Actions to create PRs;
 the version PR is merged only when branch protection permits it. If approval or
 required checks are added later, merge that PR through the normal review flow
-and rerun the release workflow on `main`.
+and rerun the release workflow on `main`. The comparison checkout uses the newest
+stable `rpi-web-v*` tag reachable from the current commit and no newer than the
+manifest version. A merged but unpublished version therefore compares against
+its previous release; retries do not require creating or moving a version tag.
 
 The workflow then publishes crates, creates per-package tags/Releases, and
 calls the cross-platform build workflow directly. This direct call is needed
