@@ -55,15 +55,58 @@ class DecideTests(unittest.TestCase):
 
 
 class EnforceTests(unittest.TestCase):
+    def pull(self, body, login="writer", association="MEMBER"):
+        return {"pullRequest": {"number": 1, "body": body, "author": {"login": login},
+                                 "authorAssociation": association,
+                                 "closingIssuesReferences": {"nodes": []}}}
+
+    def test_writer_without_issue_passes(self):
+        with mock.patch.object(policy, "call_gh", return_value={"data": {"repository": self.pull("no link")}}), \
+                mock.patch.object(policy, "author_permission", return_value="write"), \
+                mock.patch("builtins.open", mock.mock_open()) as opened, \
+                mock.patch.dict("os.environ", {"GITHUB_STEP_SUMMARY": "summary.md"}):
+            self.assertEqual(policy.enforce("o/r", 1), 0)
+            opened.assert_called_once_with("summary.md", "a", encoding="utf-8")
+
+    def test_admin_and_maintain_are_exempt_and_read_is_not(self):
+        for permission, expected in [("admin", 0), ("maintain", 0), ("write", 0), ("triage", 1), ("read", 1), ("none", 1)]:
+            with mock.patch.object(policy, "call_gh", return_value={"data": {"repository": self.pull("no link", login="someone")}}), \
+                    mock.patch.object(policy, "author_permission", return_value=permission), \
+                    mock.patch("builtins.open", mock.mock_open()), \
+                    mock.patch.dict("os.environ", {}):
+                self.assertEqual(policy.enforce("o/r", 1), expected, permission)
+
+    def test_unreadable_permission_falls_back_to_author_association(self):
+        for association, expected in [("MEMBER", 0), ("OWNER", 0), ("COLLABORATOR", 0), ("NONE", 1), ("CONTRIBUTOR", 1)]:
+            with mock.patch.object(policy, "call_gh", return_value={"data": {"repository": self.pull("no link", association=association)}}), \
+                    mock.patch.object(policy, "author_permission", return_value=None), \
+                    mock.patch("builtins.open", mock.mock_open()), \
+                    mock.patch.dict("os.environ", {}):
+                self.assertEqual(policy.enforce("o/r", 1), expected, association)
+
+    def test_permission_lookup_distinguishes_missing_role_from_api_failure(self):
+        cases = [
+            (subprocess.CompletedProcess([], 0, "write\n", ""), "write"),
+            (subprocess.CompletedProcess([], 1, "", "gh: Not Found (HTTP 404)"), "none"),
+            (subprocess.CompletedProcess([], 1, "", "gh: Resource not accessible by integration (HTTP 403)"), None),
+        ]
+        for result, expected in cases:
+            with mock.patch.object(policy.subprocess, "run", return_value=result):
+                self.assertEqual(policy.author_permission("o/r", "someone"), expected)
+        with mock.patch.object(policy.subprocess, "run", return_value=subprocess.CompletedProcess([], 1, "", "HTTP 502")):
+            with self.assertRaises(RuntimeError):
+                policy.author_permission("o/r", "someone")
+
     def test_fails_without_issue_and_writes_nothing_to_stdout_summary(self):
-        pull = {"pullRequest": {"number": 1, "body": "no link", "closingIssuesReferences": {"nodes": []}}}
-        with mock.patch.object(policy, "call_gh", return_value={"data": {"repository": pull}}):
+        with mock.patch.object(policy, "call_gh", return_value={"data": {"repository": self.pull("no link", login="outsider", association="NONE")}}), \
+                mock.patch.object(policy, "author_permission", return_value="none"):
             self.assertEqual(policy.enforce("o/r", 1), 1)
 
     def test_passes_and_reports_linked_issue(self):
-        pull = {"pullRequest": {"number": 1, "body": "Closes #9", "closingIssuesReferences": {"nodes": []}}}
+        pull = self.pull("Closes #9", login="outsider", association="NONE")
         issue = {"data": {"repository": {"issueOrPullRequest": {"__typename": "Issue", "number": 9, "title": "Add policy", "state": "OPEN"}}}}
-        with mock.patch.object(policy, "call_gh", side_effect=[{"data": {"repository": pull}}, issue]):
+        with mock.patch.object(policy, "call_gh", side_effect=[{"data": {"repository": pull}}, issue]), \
+                mock.patch.object(policy, "author_permission", return_value="none"):
             with mock.patch("builtins.open", mock.mock_open()) as opened, mock.patch.dict("os.environ", {"GITHUB_STEP_SUMMARY": "summary.md"}):
                 self.assertEqual(policy.enforce("o/r", 1), 0)
                 opened.assert_called_once_with("summary.md", "a", encoding="utf-8")

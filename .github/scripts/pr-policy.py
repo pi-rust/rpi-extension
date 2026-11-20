@@ -20,6 +20,8 @@ query($owner: String!, $name: String!, $number: Int!) {
     pullRequest(number: $number) {
       number
       body
+      author { login }
+      authorAssociation
       closingIssuesReferences(first: 20) { nodes { number } }
     }
   }
@@ -36,6 +38,12 @@ query($owner: String!, $name: String!, $number: Int!) {
   }
 }
 """
+
+
+# Roles that already maintain the repository do not need a tracking issue.
+EXEMPT_PERMISSIONS = frozenset({"admin", "maintain", "write"})
+# Used only when the workflow token cannot read collaborator permissions.
+EXEMPT_ASSOCIATIONS = frozenset({"OWNER", "MEMBER", "COLLABORATOR"})
 
 
 def candidates(linked, body):
@@ -76,30 +84,64 @@ def call_gh(query, variables):
     return json.loads(result.stdout)
 
 
+def author_permission(repository, login):
+    """Effective permission of the author, or None when the token cannot read it."""
+    result = subprocess.run(
+        ["gh", "api", f"repos/{repository}/collaborators/{login}/permission", "--jq", ".permission"],
+        capture_output=True, text=True)
+    if result.returncode == 0:
+        return result.stdout.strip() or None
+    stderr = result.stderr
+    if "(HTTP 404)" in stderr or "Not Found" in stderr:
+        return "none"
+    if "(HTTP 403)" in stderr or "HTTP 401" in stderr or "Resource not accessible" in stderr:
+        return None
+    raise RuntimeError(stderr.strip() or "failed to read collaborator permission")
+
+
+def exemption(repository, pull):
+    """Return (exempt, reason) for maintainers; failures never grant exemption."""
+    login = (pull.get("author") or {}).get("login")
+    association = pull.get("authorAssociation") or "NONE"
+    if not login:
+        return False, f"unknown author ({association})"
+    permission = author_permission(repository, login)
+    if permission is not None:
+        return permission in EXEMPT_PERMISSIONS, f"{login} has the {permission} role"
+    return association in EXEMPT_ASSOCIATIONS, f"{login} is {association} (permission unreadable)"
+
+
 def enforce(repository, number):
     owner, name = repository.split("/", 1)
     pull = call_gh(PULL_REQUEST_QUERY, {"owner": owner, "name": name, "number": number})[
         "data"]["repository"]["pullRequest"]
-    linked = [node["number"] for node in pull["closingIssuesReferences"]["nodes"]]
-
-    def resolve(candidate):
-        data = call_gh(ISSUE_QUERY, {"owner": owner, "name": name, "number": candidate})
-        return data["data"]["repository"]["issueOrPullRequest"]
-
-    found, tested = decide(candidates(linked, pull["body"]), resolve)
-    if found is None:
-        detail = "; ".join(tested) if tested else "the description has no issue reference"
-        print(f"::error::Pull request #{number} must reference an existing issue first ({detail}).")
-        print("Open an issue, then add `Closes #<issue>` to the pull request description.")
-        message = f"Blocked: {detail}. Open an issue, then add `Closes #<issue>` to this description."
-    else:
-        message = f"Linked issue #{found['number']}: {found['title']} ({found['state']})"
+    exempt, reason = exemption(repository, pull)
+    if exempt:
+        message = f"Exempt: {reason}; no issue link required."
         print(message)
+        ok = True
+    else:
+        linked = [node["number"] for node in pull["closingIssuesReferences"]["nodes"]]
+
+        def resolve(candidate):
+            data = call_gh(ISSUE_QUERY, {"owner": owner, "name": name, "number": candidate})
+            return data["data"]["repository"]["issueOrPullRequest"]
+
+        found, tested = decide(candidates(linked, pull["body"]), resolve)
+        if found is None:
+            detail = "; ".join(tested) if tested else "the description has no issue reference"
+            print(f"::error::Pull request #{number} must reference an existing issue first ({detail}; {reason}).")
+            print("Open an issue, then add `Closes #<issue>` to the pull request description.")
+            message = f"Blocked: {detail}; {reason}. Open an issue, then add `Closes #<issue>` to this description."
+        else:
+            message = f"Linked issue #{found['number']}: {found['title']} ({found['state']})"
+            print(message)
+        ok = found is not None
     summary = os.environ.get("GITHUB_STEP_SUMMARY")
     if summary:
         with open(summary, "a", encoding="utf-8") as handle:
             handle.write(f"- {message}\n")
-    return 0 if found else 1
+    return 0 if ok else 1
 
 
 def main():
