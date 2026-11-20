@@ -39,3 +39,5 @@ re-running `python3 .github/scripts/sync-release-catalog.py`. 发布标签不可
 Documentation is bilingual: `README.md` (English) and `README.zh-CN.md`
 (简体中文). Keep both in sync when user-facing behavior changes.
 文档为中英双语，面向用户的行为变化时请同步更新两份 README。
+
+<!-- policy probe -->
