@@ -7,29 +7,36 @@ not substitutes for the requested package version.
 
 ## Release workflow
 
-This repository uses **Publish GitHub extensions** (`release-github.yml`) on
-manual dispatch from `main`. It prepares immutable version tags and draft
-releases, reuses `release-packages.yml` for the supported native platforms,
-validates and uploads archives before discovery manifests, then publishes the
-drafts only after success. GitHub's built-in token is sufficient; RustFS/CDN
-mirroring is optional. No duplicate crates.io packages are published.
+Publishing runs **Version and publish crates** (`release-cargo.yml`) by manual
+dispatch on `main`, with the `mode` input defaulting to `dry-run`. release-plz
+compares the workspace with the published crates.io baseline, bumps versions for
+unpublished changes, regenerates changelogs and synchronizes
+`catalog/packages.json`; the workflow then tests the workspace, dry-runs
+`cargo publish --workspace`, merges the prepared metadata through a version pull
+request and publishes the crates with per-package `<package>-v<version>` tags
+and GitHub Releases. The job needs the `CARGO_REGISTRY_TOKEN` secret; `dry-run`
+validates every step without uploading. Versions already on crates.io are
+skipped.
 
-See [the GitHub release guide](github-releases.md) for commands, retries,
-version bumping, optional credentials and Android environment requirements.
-The upstream `release-cargo.yml` is retained for reference but disabled and
-repository-guarded here. It requires release history/baselines that were not
-imported with the main source tree.
+Prebuilt assets are built from the exact release commit for Windows x64, Linux
+GNU x64/ARM64, Linux x64 musl and macOS Intel/Apple Silicon. Each package
+Release receives individual extension archives and an `rpi-extension.json`
+manifest with download URLs, SHA-256 hashes, target triples, library names and
+SDK ABI; `release-assets.yml` also produces the full bundle and standalone
+bridges.
 
-Each package Release receives individual extension archives and an
-`rpi-extension.json` manifest with download URLs, SHA-256 hashes, target triples,
-library names and SDK ABI. `release-assets.yml` / `release-unix.yml` remain
-available for full bundles and standalone bridges; those are separate from
-the per-extension GitHub-only entry point.
+**Publish GitHub extensions** (`release-github.yml`) is the GitHub-only backfill
+entry: it needs no crates.io token, prepares immutable tags and drafts for
+already versioned packages, and publishes drafts only after every supported
+platform succeeds. Do not run it for versions that the crates.io flow is
+releasing in the same batch. See [the GitHub release guide](github-releases.md)
+for that path, retries, optional credentials and Android requirements.
 
 Host developers can implement prebuilt installation using the discovery
-protocol below and its [JSON schema](rpi-extension.schema.json). In this
-repository, use `--github pi-rust/rpi-extension` to override upstream crates.io
-repository metadata. Packages have independent versions.
+protocol below and its [JSON schema](rpi-extension.schema.json). Use
+`--github pi-rust/rpi-extension` when metadata still points at the upstream
+repository, and pin `--version` for a known release. Packages have independent
+versions.
 
 ## Discovery
 

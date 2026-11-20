@@ -105,6 +105,10 @@ def exemption(repository, pull):
     association = pull.get("authorAssociation") or "NONE"
     if not login:
         return False, f"unknown author ({association})"
+    # GitHub Apps reserve the `[bot]` suffix and can only act through workflows,
+    # so the automated release-plz version pull request must not need an issue.
+    if login.endswith("[bot]"):
+        return True, f"{login} is an automation account"
     permission = author_permission(repository, login)
     if permission is not None:
         return permission in EXEMPT_PERMISSIONS, f"{login} has the {permission} role"

@@ -1,8 +1,11 @@
 # GitHub-only extension releases
 
-`pi-rust/rpi-extension` imports the source tree from `pi-rust/rpi-package`.
-It has its own GitHub Releases. It does **not** publish duplicate crates.io
-packages or change the upstream repository.
+`pi-rust/rpi-extension` imports the source tree from `pi-rust/rpi-package`. It
+is the crates.io publisher for these extensions, so the canonical release entry
+is **Version and publish crates** (`release-cargo.yml`). This document covers the
+GitHub-only backfill entry (**Publish GitHub extensions**), which needs no
+crates.io token and produces the same verified prebuilt assets for already
+versioned packages.
 
 ## Publish
 
@@ -32,9 +35,11 @@ gh workflow run release-github.yml --repo pi-rust/rpi-extension --ref main \
    Previously published manifests/assets are preserved.
 
 This workflow needs only GitHub's built-in `GITHUB_TOKEN` with Contents write
-permission. It does not use `CARGO_REGISTRY_TOKEN`. The imported
-`release-cargo.yml` is disabled in GitHub and guarded to run only in the upstream
-repository, even if someone re-enables it here.
+permission. It does not use `CARGO_REGISTRY_TOKEN`. Do not run it for versions
+that **Version and publish crates** is releasing in the same batch: release-plz
+owns those tags. The crates.io flow uses `release-plz`, which is why
+`release-cargo.yml` runs only on this repository and is gated by the `mode`
+input (`dry-run` by default).
 
 To publish changed package code, bump its Cargo version (or the inherited
 workspace version), run `python3 .github/scripts/sync-release-catalog.py`, commit

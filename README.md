@@ -5,15 +5,16 @@
 Rust-native extension packages for the `rpi` agent, built against the stable
 `rpi-plugin-sdk` ABI from `pi-rust`.
 
-This repository imports the `pi-rust/rpi-package` main tree and publishes its
-own GitHub prebuilt extension releases, **not** duplicate crates.io packages.
-Prebuilt archives and `rpi-extension.json` manifests are available under
+This repository imports the `pi-rust/rpi-package` main tree and is the crates.io
+publisher for these extensions, exactly like the upstream repository. Release
+plz bumps versions, updates changelogs and the catalog, then publishes to
+crates.io and creates per-package tags in **Actions → Version and publish
+crates** (dispatch `main`). The `mode` input defaults to `dry-run`, which
+validates the whole path without uploading; choose `publish` to release. It
+requires the `CARGO_REGISTRY_TOKEN` secret. Prebuilt archives and
+`rpi-extension.json` manifests are then attached to
 [Releases](https://github.com/pi-rust/rpi-extension/releases) for six target
-platforms. Publishing is a manual dispatch of
-**Actions → Publish GitHub extensions** on `main`; GitHub's built-in token is
-enough, and no crates.io credentials are involved. The imported
-`release-cargo.yml` is disabled here and guarded to the upstream repository.
-See [the release guide](docs/github-releases.md).
+platforms. See [the release guide](docs/github-releases.md).
 
 The workspace includes tools, workflow extensions, provider integrations and
 client adapters. Each package has its own version and setup guide. The
@@ -146,6 +147,8 @@ host.
 can depend on the compatible minor line with `rpi-extcore = "0.1"`; it requires
 Rust 1.78+ and a compatible native `rpi --mode rpc` executable at runtime. See
 [rpi-extcore](packages/rpi-extcore/README.md), [rpi-httpcore](packages/rpi-httpcore/README.md) and the [architecture contract](docs/architecture/extension-core.md). The new packages are ordinary Rust libraries; existing extension installation and startup commands remain the same.
+
+For frontend work, the local hot-reload topology (dev HMR page, production page, ports, launchd services and the deploy helper) is documented in [the Web hot-reload guide](docs/web-hot-reload.md).
 
 ## MCP server
 
@@ -335,33 +338,33 @@ variable before starting the process.
 
 ## Releases and prebuilt extensions
 
-Releases in this repository are GitHub-only. Nothing is published to crates.io,
-and version numbers are not bumped automatically; package versions stay exactly
-as they are in the imported tree until a maintainer changes them.
+This repository publishes to crates.io. **Actions → Version and publish crates**
+(`workflow_dispatch` on `main`) runs release-plz against the published registry
+baseline: it bumps versions for unpublished changes, regenerates changelogs,
+synchronizes `catalog/packages.json`, tests the workspace, dry-runs
+`cargo publish --workspace`, merges the prepared metadata through a version pull
+request, publishes the crates and creates the `<package>-v<version>` tags and
+GitHub Releases. The workflow then builds the cross-platform assets.
 
-1. Run **Actions → Publish GitHub extensions** on `main` and choose `all` or
-   comma-separated package names.
-2. The workflow validates that every selected package is a catalog extension
-   whose `repository` metadata points at `pi-rust/rpi-extension`, then checks
-   **all** version tags before creating anything. Existing tags must point at the
-   exact source commit and are never moved.
-3. `release-packages.yml` builds Windows x64, Linux GNU x64/ARM64, Linux x64 musl
-   and macOS Intel/Apple Silicon targets, restricted to the platforms each crate
-   declares. Validated archives are uploaded before the
-   `rpi-extension.json` discovery manifest.
-4. Drafts become public only after every supported platform succeeds. A failed
-   build leaves drafts unpublished; retry the same source commit.
+- The `mode` input defaults to `dry-run`, which performs every step except
+  `release-plz release`, so the pipeline is verifiable without uploading.
+- Publishing needs the `CARGO_REGISTRY_TOKEN` repository secret with permission
+  for every crate in the workspace.
+- Versions already on crates.io are skipped; only unpublished changes release.
+- Package tags are created by the release and are immutable.
 
-Version tags are immutable, so changing a released package means bumping its
-Cargo version, running `python3 .github/scripts/sync-release-catalog.py`,
-committing the synchronized catalog and publishing again. Use the optional
-`source_ref` input to retry an existing version from its original commit.
+**Actions → Publish GitHub extensions** remains available as a GitHub-only
+backfill that needs no crates.io token. It validates that each selected catalog
+package declares `repository = https://github.com/pi-rust/rpi-extension`, checks
+all version tags before mutating anything, uploads validated archives before the
+`rpi-extension.json` discovery manifest, and publishes drafts only after every
+supported platform succeeds. Do not run both entries for the same versions.
 
 See the [release workflow and distribution protocol](docs/prebuilt-distribution.md)
 for the publishing rules and the host-side install protocol, the
-[GitHub release guide](docs/github-releases.md) for optional credentials and
-Android signing, and the [JSON schema](docs/rpi-extension.schema.json) for the
-discovery manifest.
+[GitHub release guide](docs/github-releases.md) for the backfill path, optional
+credentials and Android signing, and the [JSON schema](docs/rpi-extension.schema.json)
+for the discovery manifest.
 
 Release tooling checks run on every change to `.github/scripts`,
 `catalog/packages.json` or the release workflows:

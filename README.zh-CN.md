@@ -4,13 +4,14 @@
 
 基于 `pi-rust` 稳定版 `rpi-plugin-sdk` ABI 的 `rpi` 代理扩展包，使用 Rust 原生实现。
 
-本仓库导入了 `pi-rust/rpi-package` 的 main 分支代码树，并发布**自己独立的
-GitHub 预编译扩展 Release**，不向 crates.io 重复发布同名 crate。预编译归档与
-`rpi-extension.json` 清单覆盖六个目标平台，见
-[Releases](https://github.com/pi-rust/rpi-extension/releases)。发布由手动触发
-**Actions → Publish GitHub extensions**（在 `main` 上）完成，仅使用 GitHub 内置
-令牌，不需要 crates.io 凭据。随代码导入的 `release-cargo.yml` 在本仓库已禁用，
-并加了只在上游仓库生效的保护。详见[发布指南](docs/github-releases.md)。
+本仓库导入了 `pi-rust/rpi-package` 的 main 分支代码树，并作为这些扩展的 crates.io
+发布源，行为与上游仓库一致。release-plz 会升版本、更新 changelog 与目录，然后向
+crates.io 发布并创建各包标签，入口是
+**Actions → Version and publish crates**（在 `main` 上手动触发）。`mode` 输入默认
+`dry-run`，只验证全流程而不上传；选 `publish` 才真正发布，并且需要
+`CARGO_REGISTRY_TOKEN` 密钥。预编译归档与 `rpi-extension.json` 清单随后附到
+[Releases](https://github.com/pi-rust/rpi-extension/releases)，覆盖六个目标平台。
+详见[发布指南](docs/github-releases.md)。
 
 工作区包含工具、工作流扩展、模型提供方集成与客户端适配器。每个包都有独立版本
 和安装指南。[包目录](catalog/packages.json)记录了各扩展的安装命令和带版本的预编译
@@ -307,26 +308,25 @@ rpi --im-message-server --im-profile feishu-main
 
 ## 发布与预编译扩展
 
-本仓库的发布只走 GitHub。不会发布到 crates.io，也不会自动提升版本号；除非维护者主动
-修改，包版本与导入时保持一致。
+本仓库会向 crates.io 发布。在 `main` 上手动触发
+**Actions → Version and publish crates** 时，release-plz 以 crates.io 已发布版本为基线：
+为未发布的改动升版本、重写 changelog、同步 `catalog/packages.json`、运行工作区测试与
+`cargo publish --workspace` 干跑，经版本 PR 合入元数据后发布 crate，并创建
+`<package>-v<version>` 标签与 GitHub Release，随后构建跨平台产物。
 
-1. 在 `main` 上运行 **Actions → Publish GitHub extensions**，选择 `all` 或以逗号分隔的
-   包名。
-2. 工作流会先确认每个被选包都是目录中的扩展，且其 `repository` 元数据指向
-   `pi-rust/rpi-extension`，然后在创建任何对象之前检查**全部**版本标签。已存在的标签
-   必须指向同一个源提交，且永远不会被移动。
-3. `release-packages.yml` 构建 Windows x64、Linux GNU x64/ARM64、Linux x64 musl 与
-   macOS Intel/Apple Silicon 目标，并限制在各 crate 声明的平台范围内。校验后的归档先上传，
-   最后才上传 `rpi-extension.json` 发现清单。
-4. 只有当所有受支持平台都成功时，草稿才会公开。构建失败会保留未发布的草稿；重试时请
-   使用同一个源提交。
+- `mode` 输入默认 `dry-run`，除 `release-plz release` 外执行全部步骤，可在不上传的前提下
+  验证整条链路。
+- 真正发布需要 `CARGO_REGISTRY_TOKEN` 仓库密钥，并具备工作区内全部 crate 的发布权限。
+- crates.io 上已存在的版本会被跳过，只有未发布的改动才会发版。
+- 包标签由发布流程创建，且不可变更。
 
-版本标签不可变，因此修改已发布的包需要提升其 Cargo 版本、运行
-`python3 .github/scripts/sync-release-catalog.py`、提交同步后的目录文件并重新发布。
-可用可选的 `source_ref` 输入从原始提交重试同一版本。
+**Actions → Publish GitHub extensions** 作为不需要 crates.io 令牌的纯 GitHub 补发入口保留：
+它校验被选包的 `repository` 元数据指向 `pi-rust/rpi-extension`，在创建任何对象前检查全部版本
+标签，先上传校验后的归档再上传 `rpi-extension.json` 清单，并在所有平台成功后才公开草稿。
+同一批版本不要同时跑两个入口。
 
 发布规则与宿主侧安装协议见
-[发布流程与分发协议](docs/prebuilt-distribution.md)；可选凭据与 Android 签名见
+[发布流程与分发协议](docs/prebuilt-distribution.md)；补发入口、可选凭据与 Android 签名见
 [GitHub 发布指南](docs/github-releases.md)；发现清单的字段定义见
 [JSON schema](docs/rpi-extension.schema.json)。
 

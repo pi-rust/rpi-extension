@@ -84,6 +84,24 @@ class EnforceTests(unittest.TestCase):
                     mock.patch.dict("os.environ", {}):
                 self.assertEqual(policy.enforce("o/r", 1), expected, association)
 
+    def test_bot_authored_release_pull_requests_are_exempt(self):
+        for login in ["github-actions[bot]", "dependabot[bot]", "renovate[bot]"]:
+            with mock.patch.object(policy, "call_gh", return_value={"data": {"repository": self.pull("no link", login=login, association="NONE")}}), \
+                    mock.patch.object(policy, "author_permission") as permission, \
+                    mock.patch.object(policy.subprocess, "run") as run, \
+                    mock.patch("builtins.open", mock.mock_open()), \
+                    mock.patch.dict("os.environ", {}):
+                self.assertEqual(policy.enforce("o/r", 1), 0, login)
+                permission.assert_not_called()
+                run.assert_not_called()
+
+    def test_human_name_containing_bot_is_not_exempt(self):
+        with mock.patch.object(policy, "call_gh", return_value={"data": {"repository": self.pull("no link", login="robotics", association="NONE")}}), \
+                mock.patch.object(policy, "author_permission", return_value="none"), \
+                mock.patch("builtins.open", mock.mock_open()), \
+                mock.patch.dict("os.environ", {}):
+            self.assertEqual(policy.enforce("o/r", 1), 1)
+
     def test_permission_lookup_distinguishes_missing_role_from_api_failure(self):
         cases = [
             (subprocess.CompletedProcess([], 0, "write\n", ""), "write"),
