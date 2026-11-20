@@ -95,6 +95,27 @@ class EnforceTests(unittest.TestCase):
                 permission.assert_not_called()
                 run.assert_not_called()
 
+    def test_graphql_bots_without_rest_suffix_are_exempt(self):
+        for login in ["github-actions", "dependabot", "renovate"]:
+            pull = self.pull("no link", login=login, association="NONE")
+            pull["pullRequest"]["author"]["__typename"] = "Bot"
+            with mock.patch.object(policy, "call_gh", return_value={"data": {"repository": pull}}), \
+                    mock.patch.object(policy, "author_permission") as permission, \
+                    mock.patch("builtins.open", mock.mock_open()):
+                self.assertEqual(policy.enforce("o/r", 1), 0, login)
+                permission.assert_not_called()
+
+    def test_human_with_a_bot_like_login_still_needs_an_issue(self):
+        pull = self.pull("no link", login="github-actions", association="NONE")
+        pull["pullRequest"]["author"]["__typename"] = "User"
+        with mock.patch.object(policy, "call_gh", return_value={"data": {"repository": pull}}), \
+                mock.patch.object(policy, "author_permission", return_value="none"), \
+                mock.patch("builtins.open", mock.mock_open()):
+            self.assertEqual(policy.enforce("o/r", 1), 1)
+
+    def test_query_requests_the_author_type(self):
+        self.assertIn("author { __typename login }", policy.PULL_REQUEST_QUERY)
+
     def test_human_name_containing_bot_is_not_exempt(self):
         with mock.patch.object(policy, "call_gh", return_value={"data": {"repository": self.pull("no link", login="robotics", association="NONE")}}), \
                 mock.patch.object(policy, "author_permission", return_value="none"), \

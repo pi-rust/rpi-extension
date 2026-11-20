@@ -20,7 +20,7 @@ query($owner: String!, $name: String!, $number: Int!) {
     pullRequest(number: $number) {
       number
       body
-      author { login }
+      author { __typename login }
       authorAssociation
       closingIssuesReferences(first: 20) { nodes { number } }
     }
@@ -101,13 +101,14 @@ def author_permission(repository, login):
 
 def exemption(repository, pull):
     """Return (exempt, reason) for maintainers; failures never grant exemption."""
-    login = (pull.get("author") or {}).get("login")
+    author = pull.get("author") or {}
+    login = author.get("login")
     association = pull.get("authorAssociation") or "NONE"
     if not login:
         return False, f"unknown author ({association})"
-    # GitHub Apps reserve the `[bot]` suffix and can only act through workflows,
-    # so the automated release-plz version pull request must not need an issue.
-    if login.endswith("[bot]"):
+    # GraphQL reports Bot.login without REST's reserved `[bot]` suffix.
+    # Use the API's actor type; a human named `github-actions` is not a bot.
+    if author.get("__typename") == "Bot" or login.endswith("[bot]"):
         return True, f"{login} is an automation account"
     permission = author_permission(repository, login)
     if permission is not None:
