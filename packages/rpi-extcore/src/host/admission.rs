@@ -4,6 +4,9 @@
 //! can never race a later write of the same command.
 use super::*;
 #[cfg(test)]
+#[path = "correlated_admission_tests.rs"]
+mod correlated_tests;
+#[cfg(test)]
 #[path = "admission_tests.rs"]
 mod tests;
 
@@ -12,8 +15,18 @@ pub(super) struct ExecutionAdmission {
     current: Option<Intent>,
     native_unsettled: bool,
     native_run: Option<String>,
+    correlated: bool,
+    executions: HashMap<String, Option<String>>,
+    recovery_required: bool,
+}
+#[derive(Clone, Copy)]
+pub(super) struct ExecutionProjection {
+    pub busy: bool,
+    pub settlement: bool,
 }
 struct Intent {
+    kind: String,
+    execution: Option<String>,
     id: String,
     token: String,
     published: bool,
@@ -55,6 +68,8 @@ impl ExecutionTicket {
         }
         let token = uuid::Uuid::new_v4().to_string();
         admission.current = Some(Intent {
+            kind: value["type"].as_str().unwrap().to_string(),
+            execution: None,
             id,
             token: token.clone(),
             published: false,
@@ -106,28 +121,125 @@ fn matches_run(expected: Option<&str>, event: Option<&str>) -> bool {
     }
 }
 impl ExecutionAdmission {
-    pub(super) fn unsettled(&self) -> bool {
-        self.current.is_some() || self.native_unsettled
+    pub(super) fn from_ready(ready: &Value) -> Self {
+        Self {
+            correlated: ready["semantics"]["executionLifecycle"] == "correlated-v1",
+            ..Default::default()
+        }
     }
-    pub(super) fn observe(&mut self, value: &Value) {
-        let run = value["runId"].as_str();
+    pub(super) fn unsettled(&self) -> bool {
+        self.current.is_some()
+            || self.native_unsettled
+            || !self.executions.is_empty()
+            || self.recovery_required
+    }
+    pub(super) fn observe(&mut self, value: &Value) -> Option<ExecutionProjection> {
+        if self.correlated {
+            return Some(self.observe_correlated(value));
+        }
+        self.observe_legacy(value);
+        None
+    }
+    fn observe_correlated(&mut self, value: &Value) -> ExecutionProjection {
+        let execution = value["executionId"].as_str();
+        let request = value["requestId"].as_str();
+        let mut settlement = false;
         match value["type"].as_str() {
-            Some("response") => {
-                let Some(intent) = self
-                    .current
-                    .as_mut()
-                    .filter(|intent| Some(intent.id.as_str()) == value["id"].as_str())
-                else {
-                    return;
-                };
-                if value["success"] == false && !intent.accepted {
-                    self.current = None;
-                } else if value["success"] == true && value["data"]["accepted"] == true {
-                    intent.accepted = true;
-                    self.native_unsettled = true;
-                    self.native_run = intent.run.clone();
+            Some("response") => self.observe_response(value),
+            Some("execution_started") if value["lane"] == "main" => {
+                if let Some(execution) = execution {
+                    let conflicting = self
+                        .executions
+                        .get(execution)
+                        .is_some_and(|owner| owner.as_deref() != request);
+                    let overflow =
+                        self.executions.len() >= 64 && !self.executions.contains_key(execution);
+                    if conflicting || overflow {
+                        // Broken/missing lifecycle frames cannot create an
+                        // unbounded owner table or rebind somebody else's lease.
+                        self.recovery_required = true;
+                    } else {
+                        self.executions
+                            .entry(execution.into())
+                            .or_insert_with(|| request.map(str::to_owned));
+                        if let Some(intent) = self.current.as_mut().filter(|intent| {
+                            intent.published && request == Some(intent.id.as_str())
+                        }) {
+                            intent.execution = Some(execution.into());
+                        }
+                    }
+                } else {
+                    self.recovery_required = true;
                 }
             }
+            Some("execution_released") if value["lane"] == "main" => {
+                if value["recoveryRequired"] == true {
+                    self.recovery_required = true;
+                }
+                // An owned request keeps its local ticket until command cleanup
+                // and agent_settled. Autonomous leases remain until settlement.
+                if request.is_some() && value["recoveryRequired"] == false {
+                    if let Some(id) = execution.filter(|id| {
+                        self.executions
+                            .get(*id)
+                            .is_some_and(|owner| owner.as_deref() == request)
+                    }) {
+                        self.executions.remove(id);
+                    }
+                }
+            }
+            Some("agent_settled") if value["lane"] == "main" => {
+                if let Some(id) = execution.filter(|id| {
+                    self.executions
+                        .get(*id)
+                        .is_some_and(|owner| owner.as_deref() == request)
+                }) {
+                    self.executions.remove(id);
+                    settlement = true;
+                }
+                if self.current.as_ref().is_some_and(|intent| {
+                    intent.accepted
+                        && request == Some(intent.id.as_str())
+                        && intent.execution.as_deref() == execution
+                }) {
+                    self.current = None;
+                    settlement = true;
+                }
+            }
+            _ => {}
+        }
+        ExecutionProjection {
+            busy: self.unsettled(),
+            settlement,
+        }
+    }
+    fn observe_response(&mut self, value: &Value) {
+        let Some(intent) = self
+            .current
+            .as_mut()
+            .filter(|intent| Some(intent.id.as_str()) == value["id"].as_str())
+        else {
+            return;
+        };
+        let skipped_resume = intent.kind == "resume_pending"
+            && value["command"] == "resume_pending"
+            && value["success"] == true
+            && value["data"]["resumed"] == false
+            && value["data"]["accepted"] != true;
+        if !intent.accepted && (value["success"] == false || skipped_resume) {
+            self.current = None;
+        } else if value["success"] == true && value["data"]["accepted"] == true {
+            intent.accepted = true;
+            if !self.correlated {
+                self.native_unsettled = true;
+                self.native_run = intent.run.clone();
+            }
+        }
+    }
+    fn observe_legacy(&mut self, value: &Value) {
+        let run = value["runId"].as_str();
+        match value["type"].as_str() {
+            Some("response") => self.observe_response(value),
             Some("agent_start") => {
                 self.native_unsettled = true;
                 self.native_run = run.map(str::to_owned);
