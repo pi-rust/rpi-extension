@@ -7,10 +7,14 @@ HTTP, UI and ACP adapters must not invent settlement rules.
 ## Native handshake and events
 
 Use strict correlation only when the native ready frame advertises
-`semantics.executionLifecycle: "correlated-v1"`. Old native hosts retain the
-explicit legacy path. Deploy this extcore change together with the corresponding
-pi-rust execution-lifecycle change: old extcore cannot safely consume added
-autonomous settlements on its own.
+`semantics.executionLifecycle: "correlated-v1"`. The launcher opts in by setting
+`RPI_RPC_EXECUTION_LIFECYCLE=correlated-v1` on each child command (never through
+a process-global environment mutation). New native advertises the active
+capability and emits autonomous settlements only with this exact opt-in.
+Old native ignores the environment variable and retains the explicit legacy
+path. Old extcore does not opt in, so new native keeps legacy framing for it
+instead of sending uncorrelated autonomous settlements. Upgrade both sides
+for strict correlation; either mismatched pair retains legacy limitations.
 
 | Identity | Meaning |
 | --- | --- |

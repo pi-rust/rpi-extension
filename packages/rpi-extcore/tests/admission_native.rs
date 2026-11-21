@@ -27,6 +27,11 @@ async fn native_autonomous_execution_and_noop_resume_allow_the_next_prompt() {
     let scenario_host = host.clone();
     let mut scenario = tokio::spawn(async move {
         let host = scenario_host;
+        assert_eq!(
+            host.ready()["semantics"]["executionLifecycle"],
+            "correlated-v1",
+            "the parent must opt in before the child's ready handshake"
+        );
         let resumed = host
             .command("resume_pending", json!({}), Duration::from_secs(5))
             .await
