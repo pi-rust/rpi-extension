@@ -895,7 +895,9 @@ test("legacy status-less snapshot paints but state seeds status before replay an
   expect(host.count(A, "events")).toBe(0);
   await expect(abort(page)).toHaveCount(0);
   metadata.release();
-  await expect(abort(page)).toBeEnabled();
+  // A draft is present, so the running composer offers Send, not Stop.
+  await expect(send(page)).toBeEnabled();
+  await expect(abort(page)).toHaveCount(0);
   await received(host, A, "events");
   expect(
     host.calls
@@ -903,7 +905,7 @@ test("legacy status-less snapshot paints but state seeds status before replay an
       .url.searchParams.get("after"),
   ).toBe("11");
   await hydrated(page, host);
-  await expect(abort(page)).toBeEnabled();
+  await expect(send(page)).toBeEnabled();
 });
 
 test("without get_messages capability initialization waits for state and never requests a snapshot", async ({

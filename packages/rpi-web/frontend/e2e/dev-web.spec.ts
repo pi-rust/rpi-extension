@@ -18221,11 +18221,11 @@ test.describe("retirement", () => {
   });
 });
 
-test("mobile composer sends on Enter and keeps Shift+Enter for newlines", async ({
+test("mobile composer keeps Enter and Shift+Enter as newlines", async ({
   browser,
 }) => {
   let prompts = 0;
-  // A coarse pointer must not disable Enter submission.
+  // A coarse pointer makes Enter a newline; the icon button is the send path.
   const context = await browser.newContext({
     ...devices["iPhone 13"],
     baseURL: process.env.BASE_URL ?? "http://127.0.0.1:4191",
@@ -18248,6 +18248,11 @@ test("mobile composer sends on Enter and keeps Shift+Enter for newlines", async 
   await expect(input).toHaveValue("first line\nsecond line");
   expect(prompts).toBe(0);
   await input.press("Enter");
+  await expect(input).toHaveValue("first line\nsecond line\n");
+  expect(prompts).toBe(0);
+  await mobilePage
+    .getByRole("button", { name: "Send message", exact: true })
+    .click();
   await expect.poll(() => prompts).toBe(1);
   await expect(input).toHaveValue("");
   await context.close();
