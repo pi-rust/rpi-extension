@@ -3840,11 +3840,39 @@ test("streaming thinking does not resize the transcript", async ({ page }) => {
       .locator(".thinking-row-viewport")
       .evaluate((node) => node.clientHeight),
   ).toBe(viewportHeight);
+  const viewport = row.locator(".thinking-row-viewport");
   expect(
-    await row
-      .locator(".thinking-row-viewport")
-      .evaluate((node) => node.scrollHeight > node.clientHeight),
+    await viewport.evaluate(
+      (node) => node.scrollHeight > node.clientHeight,
+    ),
   ).toBe(true);
+  // The visual focus follows newly streamed text to the bottom.
+  await expect
+    .poll(() =>
+      viewport.evaluate(
+        (node) => node.scrollHeight - node.scrollTop - node.clientHeight,
+      ),
+    )
+    .toBeLessThan(24);
+  // A reader scrolling up pauses following; returning to the bottom resumes.
+  await viewport.evaluate((node) => {
+    node.scrollTop = 0;
+    node.dispatchEvent(new Event("scroll", { bubbles: true }));
+  });
+  await expect
+    .poll(() => viewport.evaluate((node) => node.scrollTop))
+    .toBe(0);
+  await viewport.evaluate((node) => {
+    node.scrollTop = node.scrollHeight;
+    node.dispatchEvent(new Event("scroll", { bubbles: true }));
+  });
+  await expect
+    .poll(() =>
+      viewport.evaluate(
+        (node) => node.scrollHeight - node.scrollTop - node.clientHeight,
+      ),
+    )
+    .toBeLessThan(24);
 });
 
 // The indicator is out of flow, so the only thing keeping it off the transcript
