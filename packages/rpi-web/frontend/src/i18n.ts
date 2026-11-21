@@ -27,6 +27,10 @@ const messages = {
     messageSearchResults: "message results",
     searchChats: "Search chats",
     recentChats: "Recent chats",
+    installApp: "Install app",
+    installAppHint:
+      "Open the browser menu and choose Install app. On iOS, open Share and choose Add to Home Screen.",
+    installAppDismiss: "Hide the install prompt",
     chatSearchPlaceholder: "Search chat titles, projects or tags…",
     chatSearchEmpty: "No matching chats.",
     chatSearchMatches: "{count} chats",
@@ -416,6 +420,10 @@ const messages = {
     messageSearchResults: "条消息结果",
     searchChats: "搜索会话",
     recentChats: "最近会话",
+    installApp: "安装到桌面",
+    installAppHint:
+      "在浏览器菜单中选择「安装应用」；iOS 请在分享菜单中选择「添加到主屏幕」，即可像轻应用一样独立打开。",
+    installAppDismiss: "不再提示安装",
     chatSearchPlaceholder: "搜索会话标题、项目或标签…",
     chatSearchEmpty: "没有匹配的会话。",
     chatSearchMatches: "{count} 个会话",
