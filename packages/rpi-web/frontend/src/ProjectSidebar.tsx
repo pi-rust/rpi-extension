@@ -834,6 +834,14 @@ function shortTime(time: number, language: Language) {
   }).format(time);
 }
 
+/**
+ * A chat is "active" while the host still owns a turn: running, starting up or
+ * blocked on an answer. The recent list pins those above finished chats.
+ */
+function recentActive(session: SessionSummary) {
+  return ["running", "starting", "awaiting_input"].includes(session.status);
+}
+
 function useAutoHideScrollbar() {
   const host = useRef<HTMLDivElement>(null);
   const thumb = useRef<HTMLDivElement>(null);
@@ -1395,6 +1403,12 @@ export function ProjectSidebar({
               {[...sessions]
                 .filter((session) => !session.archived && !session.deleting)
                 .sort((a, b) => {
+                  // Live work is what you come back to first, so running
+                  // sessions stay above the completed-turn recency this list
+                  // is otherwise named for. Order inside each tier is stable.
+                  const active =
+                    Number(!recentActive(a)) - Number(!recentActive(b));
+                  if (active) return active;
                   const endedDelta =
                     (b.lastTurnEndedAt ?? 0) - (a.lastTurnEndedAt ?? 0);
                   return endedDelta || b.updatedAt - a.updatedAt;

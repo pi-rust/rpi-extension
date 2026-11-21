@@ -1349,8 +1349,174 @@ test("recent chats sort by last completed turn, not recent activity", async ({
   const titles = page
     .getByRole("region", { name: "Recent chats" })
     .locator(".recent-session-link .session-title");
-  await expect(titles.first()).toHaveAttribute("data-title", "Recent session 2");
+  await expect(titles.first()).toHaveAttribute(
+    "data-title",
+    "Recent session 2",
+  );
   await expect(titles.nth(1)).toHaveAttribute("data-title", "Recent session 1");
+});
+
+test("recent chats pin running sessions above completed-turn recency", async ({
+  page,
+}) => {
+  const rows = [
+    {
+      sessionId: "session-1",
+      title: "Running session",
+      // Oldest finished turn: without the pin this row would sort last.
+      status: "running",
+      lastTurnEndedAt: 1_000,
+      updatedAt: 1_700_000_000_100,
+    },
+    {
+      sessionId: "session-2",
+      title: "Finished session",
+      status: "ready",
+      lastTurnEndedAt: 9_000,
+      updatedAt: 1_700_000_000_101,
+    },
+  ];
+  await mockHost(page);
+  // Register after the shared fixture: the newest handler wins, so these rows
+  // (not its generated ones) drive the recent list.
+  await page.route("**/api/v1/sessions", async (route: Route) => {
+    if (route.request().method() !== "GET") return route.continue();
+    return route.fulfill({
+      status: 200,
+      json: {
+        sessions: rows.map((row) => ({
+          projectId: "project-a",
+          tags: [],
+          createdAt: 1_700_000_000_000,
+          lastSeq: 4,
+          error: null,
+          relation: null,
+          parentSessionId: null,
+          forkEntryId: null,
+          latestSettlement: null,
+          pinned: false,
+          archived: false,
+          ...row,
+        })),
+      },
+    });
+  });
+  await page.goto("/");
+  const titles = page
+    .getByRole("region", { name: "Recent chats" })
+    .locator(".recent-session-link .session-title");
+  await expect(titles.first()).toHaveAttribute("data-title", "Running session");
+  await expect(titles.nth(1)).toHaveAttribute("data-title", "Finished session");
+});
+
+test("the workspace exposes an installable manifest and icons", async ({
+  page,
+  request,
+}) => {
+  const manifest = await request.get("/manifest.webmanifest");
+  expect(manifest.status()).toBe(200);
+  expect(manifest.headers()["content-type"]).toContain(
+    "application/manifest+json",
+  );
+  const body = (await manifest.json()) as {
+    display: string;
+    start_url: string;
+    scope: string;
+    icons: Array<{ src: string; sizes: string; type: string }>;
+  };
+  expect(body.display).toBe("standalone");
+  expect(body.start_url).toBe("/");
+  expect(body.scope).toBe("/");
+  expect(body.icons.map((icon) => icon.sizes)).toEqual(
+    expect.arrayContaining(["192x192", "512x512"]),
+  );
+  for (const icon of body.icons) {
+    const response = await request.get(icon.src);
+    expect(response.status(), icon.src).toBe(200);
+    expect(response.headers()["content-type"], icon.src).toContain("image/png");
+  }
+  // The page must reference the manifest, or the browser never reads it.
+  const html = await (await page.goto("/")).text();
+  expect(html).toContain('rel="manifest"');
+});
+
+test("install entry opens the browser prompt and hides once installed", async ({
+  page,
+}) => {
+  await mockHost(page);
+  await page.goto("/");
+  const install = page.getByRole("button", {
+    name: "Install app",
+    exact: true,
+  });
+  await expect(install).toHaveCount(0);
+  await page.evaluate(() => {
+    const event = new Event("beforeinstallprompt") as Event & {
+      prompt: () => Promise<void>;
+      userChoice: Promise<{ outcome: string; platform: string }>;
+    };
+    const scope = window as unknown as { __installPrompted: boolean };
+    scope.__installPrompted = false;
+    event.prompt = async () => {
+      scope.__installPrompted = true;
+    };
+    event.userChoice = Promise.resolve({
+      outcome: "accepted",
+      platform: "web",
+    });
+    window.dispatchEvent(event);
+  });
+  await expect(install).toBeVisible();
+  await page.screenshot({
+    path: test.info().outputPath("install-entry.png"),
+  });
+  await install.click();
+  await expect
+    .poll(() =>
+      page.evaluate(
+        () =>
+          (window as unknown as { __installPrompted: boolean })
+            .__installPrompted,
+      ),
+    )
+    .toBe(true);
+  // An accepted install retires the entry without waiting for a reload.
+  await expect(install).toHaveCount(0);
+});
+
+test("the install entry can be dismissed and stays hidden", async ({
+  page,
+}) => {
+  await mockHost(page);
+  await page.goto("/");
+  await page.evaluate(() => {
+    const event = new Event("beforeinstallprompt") as Event & {
+      prompt: () => Promise<void>;
+      userChoice: Promise<{ outcome: string; platform: string }>;
+    };
+    event.prompt = async () => {};
+    event.userChoice = Promise.resolve({
+      outcome: "dismissed",
+      platform: "web",
+    });
+    window.dispatchEvent(event);
+  });
+  const dismiss = page.getByRole("button", {
+    name: "Hide the install prompt",
+    exact: true,
+  });
+  await expect(dismiss).toBeVisible();
+  await dismiss.click();
+  await expect(dismiss).toHaveCount(0);
+  expect(
+    await page.evaluate(() =>
+      localStorage.getItem("rpi-web-install-dismissed"),
+    ),
+  ).toBe("1");
+  await page.reload({ waitUntil: "domcontentloaded" });
+  await expect(
+    page.getByRole("button", { name: "Install app", exact: true }),
+  ).toHaveCount(0);
 });
 
 test("details jump is right-aligned in the slim metrics strip (#306)", async ({

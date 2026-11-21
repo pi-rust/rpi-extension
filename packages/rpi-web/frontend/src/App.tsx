@@ -24,6 +24,7 @@ import {
   Code2,
   Copy,
   Database,
+  Download,
   Files,
   Gauge,
   GitBranch,
@@ -50,6 +51,7 @@ import {
   VolumeX,
   X,
 } from "lucide-react";
+import { useInstallApp } from "./installApp";
 import { MarkdownBody } from "./MarkdownBody";
 import { ShellCommand } from "./ShellCommand";
 import { SessionAnswerBadge, SessionIssueBadge } from "./SessionIssueBadge";
@@ -757,6 +759,8 @@ export default function App() {
   const [deletePending, setDeletePending] = useState(false);
   const deleteInFlight = useRef(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
+  const install = useInstallApp();
+  const [installHint, setInstallHint] = useState(false);
   const [toolNameMode, setToolNameMode] = useState<ToolNameMode>(() => {
     try {
       return localStorage.getItem(TOOL_NAME_MODE_KEY) === "mapped"
@@ -5371,6 +5375,38 @@ export default function App() {
               onMetadata={updateSessionMetadata}
             />
             <div className="sidebar-bottom slim-bottom">
+              {install.available && (
+                <div className="slim-install">
+                  <button
+                    type="button"
+                    className="slim-settings slim-install-button"
+                    title={t("installApp")}
+                    onClick={() => {
+                      // A captured browser prompt installs directly; iOS and
+                      // browsers without that event get the manual route.
+                      if (install.canPrompt) void install.promptInstall();
+                      else setInstallHint((open) => !open);
+                    }}
+                  >
+                    <Download size={14} />
+                    <span>{t("installApp")}</span>
+                  </button>
+                  <button
+                    type="button"
+                    className="slim-install-dismiss"
+                    aria-label={t("installAppDismiss")}
+                    title={t("installAppDismiss")}
+                    onClick={install.dismiss}
+                  >
+                    <X size={12} />
+                  </button>
+                  {installHint && (
+                    <p className="slim-install-hint" role="status">
+                      {t("installAppHint")}
+                    </p>
+                  )}
+                </div>
+              )}
               <button
                 type="button"
                 className="slim-settings"

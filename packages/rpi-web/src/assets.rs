@@ -29,6 +29,7 @@ fn response(name: &str) -> Response {
         Some("svg") => "image/svg+xml",
         Some("png") => "image/png",
         Some("woff2") => "font/woff2",
+        Some("webmanifest") => "application/manifest+json",
         _ => "application/octet-stream",
     };
     ([(header::CONTENT_TYPE, mime)], *bytes).into_response()
@@ -42,9 +43,52 @@ pub async fn favicon() -> Response {
     response("favicon.svg")
 }
 
+/// Embedded copy of a root-level bundle file (`manifest.webmanifest`, icons).
+/// The caller supplies the mime because these are not `assets/` responses.
+pub fn named(name: &str, mime: &'static str) -> Response {
+    let key = format!("assets/{name}");
+    match FILES.iter().find(|(path, _)| *path == key) {
+        Some((_, bytes)) => ([(header::CONTENT_TYPE, mime)], *bytes).into_response(),
+        None => StatusCode::NOT_FOUND.into_response(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn root_bundle_files_are_named_not_guessed() {
+        assert_eq!(
+            named("manifest-icon-32.png", "image/png").status(),
+            StatusCode::NOT_FOUND,
+            "an undeclared name must not resolve through the inventory"
+        );
+        // A rebuilt bundle carries `public/`; a checkout that never built the
+        // frontend legitimately has no manifest to embed.
+        if !FILES
+            .iter()
+            .any(|(path, _)| *path == "assets/manifest.webmanifest")
+        {
+            return;
+        }
+        let manifest = named("manifest.webmanifest", "application/manifest+json");
+        assert_eq!(manifest.status(), StatusCode::OK);
+        assert_eq!(
+            manifest.headers()[header::CONTENT_TYPE],
+            "application/manifest+json"
+        );
+        // The manifest's declared icons must ship with the same bundle.
+        for icon in [
+            "manifest-icon-192.png",
+            "manifest-icon-512.png",
+            "manifest-icon-maskable.png",
+        ] {
+            let response = named(icon, "image/png");
+            assert_eq!(response.status(), StatusCode::OK, "{icon}");
+            assert_eq!(response.headers()[header::CONTENT_TYPE], "image/png");
+        }
+    }
+
     #[test]
     fn frontend_is_complete_and_paths_cannot_escape_the_inventory() {
         assert!(index_html().starts_with("<!doctype html>"));

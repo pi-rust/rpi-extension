@@ -4,7 +4,7 @@
 
 rpi-web is a browser workspace for the native `rpi` coding agent. It provides a project and session sidebar, streaming conversations, tool interactions, Markdown rendering, file previews, and Git diffs. Tool cards show elapsed execution time while commands run and keep the final duration after completion, reload, and service restart. The interface supports English and Simplified Chinese, with light and dark themes. **Settings → Appearance → System / 设置 → 外观 → 随系统** follows OS day/night changes immediately without reloading chat or clearing drafts; new users default to System. Existing explicit light/dark preferences remain unchanged. The sidebar logo also shows the running build as a small `vX.Y.Z` pill. It prefers the `version` reported by `GET /api/v1/capabilities` — the service that is actually running — and falls back to the version baked into the bundle at build time, so a stale dev server or an older host still renders something truthful. Language, appearance, tool names and the manual chat refresh live in **Settings**; the sidebar footer has a single Settings entry, and the setup no longer shows a fake account identity or a refresh icon.
 
-The sidebar keeps one entry point per action: **New session**, **Search chats / 搜索会话** (Ctrl / Cmd + K, matching session titles, project names and tags across projects) and **Recent chats / 最近会话**, an inline list capped at **ten** rows that the heading collapses and restores with one click (kept inline because a floating copy duplicated the tree row for row). Archived sessions are a filter on the same project tree. Hidden row actions (`+`, `…`) keep `pointer-events: none` while invisible and reveal on hover or `:focus-visible`, so a click can no longer pin or trigger a control that is not visible.
+The sidebar keeps one entry point per action: **New session**, **Search chats / 搜索会话** (Ctrl / Cmd + K, matching session titles, project names and tags across projects) and **Recent chats / 最近会话**, an inline list capped at **ten** rows that the heading collapses and restores with one click (kept inline because a floating copy duplicated the tree row for row). Running, starting and answer-blocked sessions pin to the top of that list so live work is never pushed below finished chats by the completed-turn order. Archived sessions are a filter on the same project tree. Hidden row actions (`+`, `…`) keep `pointer-events: none` while invisible and reveal on hover or `:focus-visible`, so a click can no longer pin or trigger a control that is not visible.
 
 The right-hand rail is one exclusive panel: **Execution trace**, **Project files**, or **Runtime and context**. Runtime and context holds runtime settings plus the read-only diagnostics (resources, queue, history, provider auth and statistics) that used to be a separate inspector; it is reachable from the **details** jump in the composer and from the runtime entry at the top of the model menu. The composer keeps cache hit and context always visible and drops the always-on Shift+Enter tutorial. **Message search / 搜索消息** remains available with Ctrl / Cmd + F. The right-side project files/changes panel starts collapsed at every screen width, including after a page reload; use the toolbar's **Toggle project files / 切换项目文件面板** button to open or close it when needed.
 
@@ -178,6 +178,29 @@ flowchart TD
 Use **View source / 查看源码** to inspect or copy the exact source, and click the diagram (or press Enter) for the existing fit/original-size image viewer. Diagrams follow light/dark themes and fit narrow screens. The bundled Mermaid library loads only when needed; no CDN is used. This is frontend-only and needs no new backend route. Mermaid 12 targets modern browsers (Safari 17.4+); frontend builds require Node 22.12+.
 
 Unfinished streamed syntax automatically recovers when valid text arrives. Invalid/unsupported diagrams preserve source instead of breaking chat. Rendering is limited to 20,000 source characters, 300 newline/semicolon-separated segments, 150 edges and 16,384px per generated dimension. Only flowcharts and sequences are enabled initially. Source-owned initialization/frontmatter, shape metadata (`@{...}`), HTML other than `<br>`, image resources and custom CSS (`style`, `classDef`, `linkStyle`) are deliberately rejected before rendering. Generated SVGs are displayed in browser image mode, not injected as application HTML; graph links/callbacks are not interactive. Unsupported features remain readable/copyable as source.
+
+## Install as a desktop app
+
+The page is installable as a standalone window. It links
+`/manifest.webmanifest` (`display: standalone`, `start_url`/`scope` `/`) with
+192px, 512px and maskable icons at `/manifest-icon-192.png`,
+`/manifest-icon-512.png` and `/manifest-icon-maskable.png`; `index.html` also
+declares an Apple touch icon. Those four files live in the bundle root
+(`frontend/public/`), so the extension serves them through dedicated routes
+rather than the `/assets` mount — Vite copies `public/` into the bundle root,
+which is not reachable as `/…` otherwise. Development uses the same URLs
+because Vite serves `public/` at the root.
+
+The sidebar footer shows **Install app / 安装到桌面** only while installation is
+actually possible: a captured `beforeinstallprompt`, or an iOS/iPadOS browser,
+where the entry explains the Share-sheet **Add to Home Screen** route instead of
+a prompt that cannot exist. Accepting the browser prompt retires the entry, and
+**Hide the install prompt / 不再提示安装** stores `rpi-web-install-dismissed` in
+`localStorage`. Launches that are already standalone (`display-mode:
+standalone`, or `navigator.standalone`) never show it. There is no service
+worker: installation relies on the manifest alone, so nothing is cached for
+offline use and a deploy is always fetched from the server.
+
 
 ## Installation
 

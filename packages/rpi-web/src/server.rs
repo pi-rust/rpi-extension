@@ -71,6 +71,13 @@ pub(crate) async fn run_until(
         .route("/", get(index))
         .nest_service("/assets", files)
         .route("/favicon.svg", get(favicon))
+        // `public/` files land in the bundle root, and the installed-app
+        // metadata is linked from `index.html` at `/`, so it needs its own
+        // route instead of the `/assets` mount.
+        .route("/manifest.webmanifest", get(manifest))
+        .route("/manifest-icon-192.png", get(manifest_icon_192))
+        .route("/manifest-icon-512.png", get(manifest_icon_512))
+        .route("/manifest-icon-maskable.png", get(manifest_icon_maskable))
         .with_state(FrontendState {
             config: Arc::new(config.clone()),
         });
@@ -138,6 +145,38 @@ async fn index(State(state): State<FrontendState>) -> axum::response::Response {
         Html(html),
     )
         .into_response()
+}
+
+/// A root-level bundle file (`public/`): served from the external assets
+/// directory when there is one, otherwise from the embedded inventory.
+async fn bundle_file(
+    state: &FrontendState,
+    name: &str,
+    mime: &'static str,
+) -> axum::response::Response {
+    match tokio::fs::read(asset_root(&state.config).join(name)).await {
+        Ok(bytes) => ([(header::CONTENT_TYPE, mime)], bytes).into_response(),
+        Err(_) if state.config.assets.is_none() => crate::assets::named(name, mime),
+        Err(_) => StatusCode::NOT_FOUND.into_response(),
+    }
+}
+
+async fn manifest(State(state): State<FrontendState>) -> axum::response::Response {
+    bundle_file(&state, "manifest.webmanifest", "application/manifest+json").await
+}
+
+// Explicit routes, not a path parameter: the icon set is fixed by the manifest,
+// so no requested name is ever turned into a bundle lookup.
+async fn manifest_icon_192(State(state): State<FrontendState>) -> axum::response::Response {
+    bundle_file(&state, "manifest-icon-192.png", "image/png").await
+}
+
+async fn manifest_icon_512(State(state): State<FrontendState>) -> axum::response::Response {
+    bundle_file(&state, "manifest-icon-512.png", "image/png").await
+}
+
+async fn manifest_icon_maskable(State(state): State<FrontendState>) -> axum::response::Response {
+    bundle_file(&state, "manifest-icon-maskable.png", "image/png").await
 }
 
 async fn favicon(State(state): State<FrontendState>) -> axum::response::Response {
