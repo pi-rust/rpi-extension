@@ -3412,6 +3412,16 @@ export default function App() {
     }
   }
 
+  // Some clipboard providers expose a pasted path as a File whose name is the
+  // path itself. `file://` URLs and paths whose first segment is `file` are
+  // references, not uploadable documents: the upload endpoint always rejects
+  // them. Real file names such as `file.txt` are unaffected.
+  function isPathLikePastedFile(file: File): boolean {
+    const name = file.name.trim();
+    if (/^file:\/\//i.test(name)) return true;
+    return /^file(?:[\\/]|$)/i.test(name);
+  }
+
   async function uploadFiles(files: FileList | File[] | null) {
     const batch = Array.from(files ?? []);
     const scope = uploadScope.current;
@@ -6295,7 +6305,32 @@ export default function App() {
                         if (file) files.push(file);
                       }
                     }
-                    if (!files.length) return; // Keep native text paste/selection.
+                    // A pasted `file://` URL or local path is text, not an
+                    // upload. Prefer the browser's native text paste so the
+                    // current selection is replaced normally; providers that
+                    // expose only a path File get an explicit text insert.
+                    if (!files.length) return;
+                    const pathFiles = files.filter(isPathLikePastedFile);
+                    if (pathFiles.length) {
+                      const text = clipboard.getData("text/plain");
+                      if (!text) {
+                        event.preventDefault();
+                        const insert = pathFiles
+                          .map((file) => file.name)
+                          .join("\n");
+                        const start = event.currentTarget.selectionStart;
+                        const end = event.currentTarget.selectionEnd;
+                        updateDraft(
+                          draft.slice(0, start) + insert + draft.slice(end),
+                          sessionId,
+                        );
+                      }
+                      const realFiles = files.filter(
+                        (file) => !isPathLikePastedFile(file),
+                      );
+                      if (realFiles.length) void uploadFiles(realFiles);
+                      return;
+                    }
                     event.preventDefault();
                     void uploadFiles(files);
                   }}

@@ -2628,6 +2628,32 @@ test.describe("clipboard attachment upload", () => {
     );
   });
 
+  for (const path of ["file:///tmp/note.md", "file/notes.txt"]) {
+    test(`pastes a path starting with file (${path}) as text`, async ({
+      page,
+    }) => {
+      await mockHost(page);
+      const names = await uploadMock(page);
+      await ready(page);
+      // Some clipboard providers expose the path as a file with no text/plain.
+      expect(await pasteFiles(page, [document(path)])).toBe(true);
+      await expect(page.locator(".composer textarea")).toHaveValue(
+        `Please inspect${path}`,
+      );
+      await expect(page.locator(".composer-attachment")).toHaveCount(0);
+      expect(names).toEqual([]);
+    });
+  }
+
+  test("still uploads a real document named file.txt", async ({ page }) => {
+    await mockHost(page);
+    const names = await uploadMock(page);
+    await ready(page);
+    expect(await pasteFiles(page, [document("file.txt")])).toBe(true);
+    await expect(page.locator(".composer-attachment")).toHaveCount(1);
+    expect(names).toEqual(["file.txt"]);
+  });
+
   test("keeps native text paste and selection replacement without any upload", async ({
     page,
   }) => {
