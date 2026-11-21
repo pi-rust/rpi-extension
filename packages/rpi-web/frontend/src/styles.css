@@ -3710,6 +3710,35 @@ details[open] > summary:before {
 .slash-item .muted {
   font-size: 11px;
 }
+
+/* Mobile: rows wrap instead of squeezing onto one line, and the palette
+   scrolls with a bounded height instead of pushing the composer off-screen. */
+@media (max-width: 767px) {
+  .slash-menu {
+    max-height: min(44dvh, 340px);
+    overflow-y: auto;
+    overscroll-behavior: contain;
+  }
+  .slash-item {
+    flex-wrap: wrap;
+    gap: 3px 8px;
+    min-width: 0;
+    padding: 8px 10px;
+  }
+  .slash-item code {
+    flex: 0 1 auto;
+    min-width: 0;
+    overflow-wrap: anywhere;
+  }
+  .slash-item .muted {
+    flex: 1 1 100%;
+    min-width: 0;
+    overflow-wrap: anywhere;
+  }
+  .slash-item:active:not(:disabled) {
+    background: var(--hover);
+  }
+}
 .transcript-note {
   white-space: pre-line;
 }
