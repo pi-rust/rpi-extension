@@ -28,6 +28,8 @@ const messages = {
     searchChats: "Search chats",
     recentChats: "Recent chats",
     installApp: "Install app",
+    hostVersion: "host {version}",
+    hostVersionTitle: "Native rpi host version {version}",
     installAppHint:
       "Open the browser menu and choose Install app. On iOS, open Share and choose Add to Home Screen.",
     installAppDismiss: "Hide the install prompt",
@@ -423,6 +425,8 @@ const messages = {
     searchChats: "搜索会话",
     recentChats: "最近会话",
     installApp: "安装到桌面",
+    hostVersion: "宿主 {version}",
+    hostVersionTitle: "原生 rpi 宿主版本 {version}",
     installAppHint:
       "在浏览器菜单中选择「安装应用」；iOS 请在分享菜单中选择「添加到主屏幕」，即可像轻应用一样独立打开。",
     installAppDismiss: "不再提示安装",

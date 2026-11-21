@@ -148,6 +148,8 @@ pub struct Service {
     retirement_workers: Arc<tokio::sync::Semaphore>,
     closing: Arc<std::sync::atomic::AtomicBool>,
     resource_storage_failed: Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
+    /// Native host version, probed once from `<rpi_bin> --version`.
+    host_version: Arc<tokio::sync::OnceCell<Option<String>>>,
 }
 impl Service {
     pub fn new(
@@ -191,8 +193,22 @@ impl Service {
             resource_storage_failed: Arc::new(std::sync::Mutex::new(
                 std::collections::HashSet::new(),
             )),
+            host_version: Arc::new(tokio::sync::OnceCell::new()),
         }))
     }
+    /// The native host's own version.
+    ///
+    /// The RPC `ready` frame carries no version, and a client cannot tell an
+    /// old host from an old extension without one, so the configured binary is
+    /// probed once per service process. A missing or failing binary is cached
+    /// as `None`; callers then simply omit the field.
+    pub async fn host_version(&self) -> Option<String> {
+        self.host_version
+            .get_or_init(|| async { probe_host_version(&self.config.rpi_bin).await })
+            .await
+            .clone()
+    }
+
     pub async fn live_session(&self, id: &str) -> Option<Arc<HostSession>> {
         self.sessions.read().await.get(id).cloned()
     }
@@ -1618,6 +1634,40 @@ pub fn replay_gap(after: Option<u64>, first: Option<u64>, latest: u64) -> bool {
     })
 }
 
+/// A version probe must answer quickly: a hung or scripted binary cannot stall
+/// the capabilities response longer than this.
+const HOST_VERSION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+async fn probe_host_version(bin: &std::path::Path) -> Option<String> {
+    let output = tokio::time::timeout(
+        HOST_VERSION_TIMEOUT,
+        tokio::process::Command::new(bin).arg("--version").output(),
+    )
+    .await
+    .ok()?
+    .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    parse_host_version(&String::from_utf8_lossy(&output.stdout))
+}
+
+/// `rpi 0.24.0` becomes `0.24.0`. Only the first non-empty line counts, and the
+/// token has to start with a digit, so a banner or an error never looks like a
+/// version.
+fn parse_host_version(stdout: &str) -> Option<String> {
+    let line = stdout
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())?;
+    let token = line.split_whitespace().next_back()?.trim_start_matches('v');
+    token
+        .chars()
+        .next()
+        .filter(|first| first.is_ascii_digit())
+        .map(|_| token.to_string())
+}
+
 #[cfg(test)]
 impl Service {
     pub(crate) async fn test_register_host(&self, id: &str, host: Arc<HostSession>) {
@@ -1628,6 +1678,46 @@ impl Service {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn host_version_parses_the_native_banner() {
+        assert_eq!(
+            parse_host_version("rpi 0.24.0\n"),
+            Some("0.24.0".to_string())
+        );
+        assert_eq!(
+            parse_host_version("rpi v0.24.0"),
+            Some("0.24.0".to_string())
+        );
+        assert_eq!(
+            parse_host_version("\n  rpi 1.2.3  \nsecond line"),
+            Some("1.2.3".to_string())
+        );
+        // A banner, an error or an empty answer must never become a version.
+        for rejected in ["", "rpi", "error: unknown flag --version", "  "] {
+            assert_eq!(parse_host_version(rejected), None, "{rejected:?}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn host_version_probes_the_binary_and_ignores_failures() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = std::env::temp_dir().join(format!("rpi-host-version-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let script = |name: &str, body: &str| {
+            let path = root.join(name);
+            std::fs::write(&path, body).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+            path
+        };
+        let good = script("rpi-good", "#!/bin/sh\nprintf 'rpi 9.9.9\\n'\n");
+        assert_eq!(probe_host_version(&good).await, Some("9.9.9".to_string()));
+        let failing = script("rpi-failing", "#!/bin/sh\nexit 3\n");
+        assert_eq!(probe_host_version(&failing).await, None);
+        assert_eq!(probe_host_version(&root.join("missing")).await, None);
+        let _ = std::fs::remove_dir_all(&root);
+    }
 
     #[tokio::test]
     async fn settlement_updates_last_turn_end_and_recent_order() {
