@@ -2267,7 +2267,9 @@ details[open] > summary:before {
 .select-menu-option {
   text-align: left;
 }
-.select-menu-option.highlighted,
+.select-menu-option.highlighted {
+  background: var(--hover);
+}
 @media (hover: hover) {
   .select-menu-option:hover:not(:disabled) {
     background: var(--hover);
@@ -3116,12 +3118,6 @@ details[open] > summary:before {
     color: var(--text);
     text-align: left;
   }
-  @media (hover: hover) {
-    .mobile-session-option:hover {
-      border-color: var(--line);
-      background: var(--soft);
-    }
-  }
   .mobile-session-option.selected {
     border-color: var(--line);
     background: var(--soft);
@@ -3387,6 +3383,15 @@ details[open] > summary:before {
   }
   .session-row {
     min-height: 54px;
+  }
+}
+
+/* Touch taps must not stick the hover highlight inside the mobile session
+   switcher; pointer devices inside the narrow viewport keep the hover. */
+@media (max-width: 767px) and (hover: hover) {
+  .mobile-session-option:hover {
+    border-color: var(--line);
+    background: var(--soft);
   }
 }
 @media (prefers-reduced-motion: reduce) {
