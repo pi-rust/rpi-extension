@@ -1308,23 +1308,23 @@ pub async fn list_sessions(state: &Service, query: SessionListQuery) -> Value {
                 .and_then(|snapshot| snapshot.latest_settlement.clone()),
         }));
     }
+    // Sort by the last settled turn. A session that never settled a run
+    // (fresh, or aborted before any settle) still competes by its latest
+    // activity, so a brand-new session sits on top instead of falling behind
+    // every tracked one.
     summaries.sort_by(|a, b| {
-        let a_ended = a["lastTurnEndedAt"].as_u64().unwrap_or(0);
-        let b_ended = b["lastTurnEndedAt"].as_u64().unwrap_or(0);
-        b_ended
-            .cmp(&a_ended)
-            .then_with(|| {
-                b["updatedAt"]
-                    .as_u64()
-                    .unwrap_or_default()
-                    .cmp(&a["updatedAt"].as_u64().unwrap_or_default())
-            })
-            .then_with(|| {
-                a["sessionId"]
-                    .as_str()
-                    .unwrap_or_default()
-                    .cmp(b["sessionId"].as_str().unwrap_or_default())
-            })
+        let key = |entry: &Value| {
+            entry["lastTurnEndedAt"]
+                .as_u64()
+                .unwrap_or_else(|| entry["updatedAt"].as_u64().unwrap_or_default())
+        };
+        let (a_key, b_key) = (key(a), key(b));
+        b_key.cmp(&a_key).then_with(|| {
+            a["sessionId"]
+                .as_str()
+                .unwrap_or_default()
+                .cmp(b["sessionId"].as_str().unwrap_or_default())
+        })
     });
     json!({"sessions": summaries})
 }
