@@ -2,7 +2,7 @@ use serde_json::{json, Value};
 mod admission;
 mod child;
 mod resources;
-use admission::{ExecutionAdmission, ExecutionTicket};
+use admission::{ExecutionAdmission, ExecutionProjection, ExecutionTicket};
 pub(crate) use resources::ResourceFence;
 use std::{
     collections::{HashMap, VecDeque},
@@ -841,7 +841,7 @@ impl HostSession {
         let history: Arc<Mutex<VecDeque<BufferedEvent>>> = Arc::new(Mutex::new(VecDeque::new()));
         let seq = Arc::new(AtomicU64::new(0));
         let runtime = Arc::new(HostRuntime {
-            execution: Arc::new(StdMutex::new(ExecutionAdmission::default())),
+            execution: Arc::new(StdMutex::new(ExecutionAdmission::from_ready(&ready))),
             raw_events: raw_events.clone(),
             events: events.clone(),
             pending: pending.clone(),
@@ -924,7 +924,7 @@ impl HostSession {
                 {
                     break;
                 }
-                runtime
+                let execution_projection = runtime
                     .execution
                     .lock()
                     .expect("execution admission")
@@ -945,12 +945,13 @@ impl HostSession {
                             Some("prompt" | "compact" | "resume_pending")
                         )
                     {
-                        publish(
+                        publish_with_execution(
                             &events_reader,
                             &history_reader,
                             &state_reader,
                             &seq_reader,
                             json!({"type":"operation_accepted", "command":value["command"]}),
+                            execution_projection,
                         )
                         .await;
                     }
@@ -969,12 +970,13 @@ impl HostSession {
                         .unwrap()
                         .event(&mut value);
                     let _ = raw_events.send(value.clone());
-                    publish(
+                    publish_with_execution(
                         &events_reader,
                         &history_reader,
                         &state_reader,
                         &seq_reader,
                         value,
+                        execution_projection,
                     )
                     .await;
                 }
@@ -1103,6 +1105,9 @@ impl HostSession {
         self.notify(command).await?;
         let mut run = crate::run::PromptRun::new(events, cancellation, id, kind, lease);
         run.tracker.require_message_ids(self.supports_message_ids());
+        run.tracker.require_execution_identity(
+            self.ready["semantics"]["executionLifecycle"] == "correlated-v1",
+        );
         Ok(run)
     }
     pub async fn abort_run(&self) -> Result<(), String> {
@@ -1196,6 +1201,7 @@ impl HostSession {
         let (commands, outbound) = mpsc::channel(32);
         let pending: Pending = Arc::new(StdMutex::new(HashMap::new()));
         let (raw_events, _) = broadcast::channel(capacity);
+        let execution = ExecutionAdmission::from_ready(&ready);
         let session = Arc::new(Self {
             child_owner: None,
             worker: Arc::new(Mutex::new(None)),
@@ -1215,7 +1221,7 @@ impl HostSession {
             usage_gate: Mutex::new(()),
             configuration_owner: Mutex::new(std::sync::Weak::new()),
             runtime: Arc::new(HostRuntime {
-                execution: Arc::new(StdMutex::new(ExecutionAdmission::default())),
+                execution: Arc::new(StdMutex::new(execution)),
                 raw_events,
                 events: broadcast::channel(capacity).0,
                 pending,
@@ -1777,25 +1783,37 @@ impl TestEvents {
     /// Fixture equivalent of a non-response frame passing through native projection.
     pub async fn send_projected(&self, value: Value) {
         assert_ne!(value["type"], "response");
-        let _ = self.send(value.clone());
-        publish(
+        let (_, execution) = self.send_observed(value.clone());
+        publish_with_execution(
             &self.0.runtime.events,
             &self.0.runtime.history,
             &self.0.runtime.state,
             &self.0.runtime.seq,
             value,
+            execution,
         )
         .await;
     }
 
     pub fn send(&self, value: Value) -> Result<usize, broadcast::error::SendError<Value>> {
+        self.send_observed(value).0
+    }
+
+    fn send_observed(
+        &self,
+        value: Value,
+    ) -> (
+        Result<usize, broadcast::error::SendError<Value>>,
+        Option<ExecutionProjection>,
+    ) {
         if self.0.runtime.route_external(&value).is_err()
             || self.0.runtime.route_file_io(&value).is_err()
         {
             self.0.runtime.fail_closed();
-            return Err(broadcast::error::SendError(value));
+            return (Err(broadcast::error::SendError(value)), None);
         }
-        self.0
+        let execution = self
+            .0
             .runtime
             .execution
             .lock()
@@ -1809,10 +1827,11 @@ impl TestEvents {
                 }
             }
         }
-        match self.0.runtime.raw_events.send(value) {
+        let result = match self.0.runtime.raw_events.send(value) {
             Err(_) if delivered => Ok(0),
             result => result,
-        }
+        };
+        (result, execution)
     }
 }
 
@@ -1823,7 +1842,18 @@ async fn publish(
     history: &Arc<Mutex<VecDeque<BufferedEvent>>>,
     state: &Arc<RwLock<HostState>>,
     seq: &AtomicU64,
+    value: Value,
+) {
+    publish_with_execution(events, history, state, seq, value, None).await;
+}
+
+async fn publish_with_execution(
+    events: &broadcast::Sender<BufferedEvent>,
+    history: &Arc<Mutex<VecDeque<BufferedEvent>>>,
+    state: &Arc<RwLock<HostState>>,
+    seq: &AtomicU64,
     mut value: Value,
+    execution: Option<ExecutionProjection>,
 ) {
     let next = seq.fetch_add(1, Ordering::SeqCst) + 1;
     {
@@ -1833,7 +1863,7 @@ async fn publish(
         state.last_seq = next;
         state.updated_at = now_ms();
         match kind {
-            "agent_start" | "operation_accepted" => {
+            "agent_start" | "operation_accepted" if execution.is_none() => {
                 state.status = "running".into();
                 state.resource_unsettled = true;
             }
@@ -1857,10 +1887,16 @@ async fn publish(
                     state.status = "running".into();
                 }
             }
-            "agent_settled" => {
-                state.status = "ready".into();
-                state.resource_unsettled = false;
-                state.pending_dialogs.clear();
+            "agent_settled" if execution.map_or(true, |p| p.settlement) => {
+                if execution.map_or(true, |p| !p.busy) {
+                    state.status = "ready".into();
+                    state.resource_unsettled = false;
+                    // Correlated hosts close dialogs explicitly. A command's
+                    // completion must not cancel an unrelated plugin question.
+                    if execution.is_none() {
+                        state.pending_dialogs.clear();
+                    }
+                }
                 state.latest_settlement = Some(value.clone());
                 state.last_error = value
                     .get("error")
@@ -1889,6 +1925,17 @@ async fn publish(
             }
             _ => {}
         }
+        if let Some(execution) = execution.filter(|_| kind != "host_closed") {
+            state.resource_unsettled = execution.busy;
+            state.status = if !state.pending_dialogs.is_empty() {
+                "awaiting_input"
+            } else if execution.busy {
+                "running"
+            } else {
+                "ready"
+            }
+            .into();
+        }
     }
     let buffered = BufferedEvent { seq: next, value };
     {
@@ -1909,6 +1956,7 @@ mod tests {
     include!("external_tools_host_tests.rs");
     include!("host_file_io_tests.rs");
     include!("host_retirement_tests.rs");
+    include!("host_execution_tests.rs");
 
     #[tokio::test]
     async fn child_binding_identity_uses_launch_metadata_not_a_ready_wire_field() {
