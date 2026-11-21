@@ -30,14 +30,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (filter contract, paging, branch reload, persist-before-commit, duplicate
   window, footer lifecycle, renderer fall-through).
 - `RPI_OPTCHAT_STORE_DIR` moves the profile store out of the project directory.
-- An entry renderer (`optchat`) that turns `optchat-entry` and `optchat-node`
-  into one transcript row each (`OptChat <kind> · <head>`,
-  `OptChat summary <l>+<i> · <head>`), leaving other types to their own renderers.
+- An entry renderer (`optchat`) that claims internal memory entries; other
+  types are left to their own renderers.
 - The view shape is saved as `optchat-view`, so `/optchat fit` and model-written
   lines survive a resume; a shape that no longer tiles the window is refolded.
 
 ### Changed
 
+- Internal entries now return `{"display":false}` through the entry renderer
+  instead of duplicating messages and summaries in the TUI. This needs a host
+  implementing explicit entry visibility; older hosts or sessions without the
+  plugin may still show raw entries. Storage format, branch memory and
+  `zoom`/`search`/`view` are unchanged.
 - The log keeps a 20000-message window with absolute ids instead of refusing new
   messages at the cap, so a printed summary keeps naming the same message.
 - Cached memory is validated against the branch's newest message, so
