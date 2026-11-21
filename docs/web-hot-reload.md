@@ -1,9 +1,31 @@
 # Local Web hot-reload environment (macOS host)
 
-`https://work-dev.bigfisharc.cn` (HMR) and `https://work.bigfisharc.cn`
-(production build) both run from **this checkout**. There is no separate dev
-worktree any more: the pre-migration `rpi-package-dev` checkout was removed when
-the sources moved to `rpi-extension`.
+`https://work-dev.bigfisharc.cn` (HMR) serves an **isolated development
+worktree**; `https://work.bigfisharc.cn` (production) serves the `main`
+checkout. Keeping them apart means unmerged work can never reach the production
+page, and the main checkout stays clean for other sessions and for merging.
+
+## Checkouts
+
+| role | path | branch | served by |
+| --- | --- | --- | --- |
+| dev | `/Users/bigfish/work/rpi-projects/rpi-extension-dev` (git worktree of this repository) | `dev/web-hmr` | Vite HMR on `:18087` |
+| prod | `/Users/bigfish/work/rpi-projects/rpi-extension` | `main` | `rpi --webserver` on `:18088`, bundle from `packages/rpi-web/assets` |
+
+The backend (its `project`, sessions and both API routes) always belongs to the
+main checkout, so a dev-page session reads the same project sessions as
+production unless you pick the worktree explicitly in the sidebar.
+
+Create or repair the worktree:
+
+```bash
+cd /Users/bigfish/work/rpi-projects/rpi-extension
+git worktree add -b dev/web-hmr ../rpi-extension-dev origin/main
+cd ../rpi-extension-dev/packages/rpi-web/frontend && npm ci
+```
+
+The Vite service (`cn.bigfish.rpi-web-dev`) runs from the worktree; update its
+`ProgramArguments` and `WorkingDirectory` only if the worktree moves.
 
 ## Topology
 
@@ -36,35 +58,48 @@ endpoint on port 443, and proxies `/api` to `127.0.0.1:18088` for direct
 | launchd label | program | port | log |
 | --- | --- | --- | --- |
 | `cn.bigfish.rpi-web` | `python3 ~/.rpi/mac-web/run-web.py` → `rpi --local-only --extension … --webserver=~/.rpi/mac-web/web.json` | 18088 | `~/.rpi/mac-web/logs/cn.bigfish.rpi-web.log` |
-| `cn.bigfish.rpi-web-dev` | `node …/rpi-extension/packages/rpi-web/frontend/node_modules/vite/bin/vite.js --host 0.0.0.0 --port 18087 --strictPort` | 18087 | `~/.rpi/mac-web/logs/cn.bigfish.rpi-web-dev.log` |
+| `cn.bigfish.rpi-web-dev` | `node …/rpi-extension-dev/packages/rpi-web/frontend/node_modules/vite/bin/vite.js --host 0.0.0.0 --port 18087 --strictPort` | 18087 | `~/.rpi/mac-web/logs/cn.bigfish.rpi-web-dev.log` |
 | `cn.bigfish.rpi-tunnel` | `ssh -N -R 28088:127.0.0.1:18088 -R 28087:127.0.0.1:18087 root@139.196.85.175` | — | `~/.rpi/mac-web/logs/cn.bigfish.rpi-tunnel.log` |
 
-`~/.rpi/mac-web/web.json` is the service configuration: `project` points at this
-checkout, `assets` at `packages/rpi-web/assets`, sessions/registry live under
-`~/.rpi/mac-web` and survive restarts.
+`~/.rpi/mac-web/web.json` is the service configuration: `project` points at the
+main checkout, `assets` at its `packages/rpi-web/assets`, sessions/registry live
+under `~/.rpi/mac-web` and survive restarts. The dev worktree is intentionally
+absent from this file — it only feeds Vite.
 
 ## Daily workflow
 
-Frontend only (HMR):
+Develop in the worktree. The launchd Vite service already serves it with HMR on
+`:18087`:
 
 ```bash
-cd packages/rpi-web/frontend
-npm ci            # first time only; the launchd service runs Vite on :18087 already
+cd /Users/bigfish/work/rpi-projects/rpi-extension-dev/packages/rpi-web/frontend
 npm run typecheck
 npx playwright test --config=playwright.config.ts -g "<spec name>"
 ```
+
+Edit files in the worktree; the dev page hot-updates. Commit, push the branch and
+open the pull request from the worktree. Do not edit frontend sources in the main
+checkout for everyday work: it is the production build source and other sessions
+merge there.
 
 Do not start a second `npm run dev`: the config pins `strictPort: 18087`, so it
 fails while the launchd service owns the port. Stop the service
 (`launchctl bootout gui/$(id -u)/cn.bigfish.rpi-web-dev`) only if you need a
 foreground server.
 
-Edit files in this checkout; the dev page hot-updates. `npm run build` (Vite →
-`packages/rpi-web/assets`) publishes the production bundle, which
-`rpi --webserver` re-reads on every `GET /`, so **no restart is needed** for a
-frontend-only change.
+Publishing a merged frontend change to production:
 
-Rust/backend or extension change:
+```bash
+cd /Users/bigfish/work/rpi-projects/rpi-extension
+git switch main && git pull --ff-only
+python3 ~/.rpi/mac-web/deploy-web.py --frontend   # bundle into packages/rpi-web/assets
+```
+
+`rpi --webserver` re-reads `assets/index.html` on every `GET /`, so a
+frontend-only change needs no restart.
+
+Rust/backend or extension change (merge to `main` first — the deploy helper
+builds the main checkout):
 
 ```bash
 # frontend + release build + install + idle check + restart + verify
@@ -72,7 +107,12 @@ python3 ~/.rpi/mac-web/deploy-web.py
 python3 ~/.rpi/mac-web/deploy-web.py --rust          # frontend assets already built
 python3 ~/.rpi/mac-web/deploy-web.py --restart-only  # no build, just restart
 python3 ~/.rpi/mac-web/deploy-web.py --frontend      # build bundle, no restart
+# deliberate branch test only: build another checkout, e.g. the dev worktree
+python3 ~/.rpi/mac-web/deploy-web.py --project ../rpi-extension-dev
 ```
+
+`--project` makes the production service load an entry that is not on `main`;
+use it to try a branch end to end, then redeploy from `main`.
 
 `deploy-web.py` waits for sessions to go quiet before restarting (override with
 `--force`), reinstalls `librpi_web_extension-v<Cargo version>.dylib` into

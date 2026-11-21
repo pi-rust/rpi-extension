@@ -19,10 +19,11 @@ This repository contains the shared native runtime and protocol adapters for rpi
 
 ## Local Web frontend workflow
 
-- This checkout is the single source for both Web environments; the pre-migration `rpi-package-dev` worktree no longer exists. Topology, ports and service commands are documented in [docs/web-hot-reload.md](docs/web-hot-reload.md).
-- `https://work-dev.bigfisharc.cn` is the Vite dev server with HMR for `packages/rpi-web/frontend` (`launchd cn.bigfish.rpi-web-dev`, port 18087); `https://work.bigfisharc.cn` is the bundle in `packages/rpi-web/assets` served by `rpi --webserver` (`launchd cn.bigfish.rpi-web`, port 18088). Both arrive through the remote Caddy reverse proxy and the `cn.bigfish.rpi-tunnel` SSH tunnel.
-- Edit frontend sources here and verify through the dev page and HMR, plus `npm run typecheck` and the relevant Playwright specs. `npm run build` publishes `packages/rpi-web/assets`; the service re-reads `index.html` per request, so a frontend-only change needs no restart.
-- Frontend HMR never updates the shared Rust backend or the installed extension. Rust changes need `python3 ~/.rpi/mac-web/deploy-web.py` (build, install, idle check, restart, verify).
+- Do day-to-day Web work in the sibling `rpi-extension-dev` git worktree (`/Users/bigfish/work/rpi-projects/rpi-extension-dev`, branch `dev/web-hmr`), not in this `main` checkout: `main` is the production build source and other sessions merge there. Topology, ports, worktree recreation and deploy commands are documented in [docs/web-hot-reload.md](docs/web-hot-reload.md).
+- `https://work-dev.bigfisharc.cn` is the Vite HMR server serving the worktree's `packages/rpi-web/frontend` (`launchd cn.bigfish.rpi-web-dev`, port 18087). `https://work.bigfisharc.cn` is this checkout's bundle in `packages/rpi-web/assets` served by `rpi --webserver` (`launchd cn.bigfish.rpi-web`, port 18088). Both arrive through the remote Caddy reverse proxy and the `cn.bigfish.rpi-tunnel` SSH tunnel.
+- Verify worktree changes through the dev page and HMR, plus `npm run typecheck` and the relevant Playwright specs, then commit and open the pull request from the worktree.
+- Publish a merged frontend change from this checkout with `python3 ~/.rpi/mac-web/deploy-web.py --frontend`; the service re-reads `index.html` per request, so a frontend-only change needs no restart.
+- Frontend HMR never updates the shared Rust backend or the installed extension. Rust changes need `python3 ~/.rpi/mac-web/deploy-web.py` from this checkout after the merge (build, install, idle check, restart, verify).
 - Keep the production service and installed binaries unchanged unless a deploy is explicitly requested.
 
 ## Review and change discipline

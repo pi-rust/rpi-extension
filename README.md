@@ -148,6 +148,8 @@ can depend on the compatible minor line with `rpi-extcore = "0.1"`; it requires
 Rust 1.78+ and a compatible native `rpi --mode rpc` executable at runtime. See
 [rpi-extcore](packages/rpi-extcore/README.md), [rpi-httpcore](packages/rpi-httpcore/README.md) and the [architecture contract](docs/architecture/extension-core.md). The new packages are ordinary Rust libraries; existing extension installation and startup commands remain the same.
 
+For frontend work, the local hot-reload topology (development worktree, production checkout, ports, launchd services and the deploy helper) is documented in [the Web hot-reload guide](docs/web-hot-reload.md).
+
 For frontend work, the local hot-reload topology (dev HMR page, production page, ports, launchd services and the deploy helper) is documented in [the Web hot-reload guide](docs/web-hot-reload.md).
 
 ## MCP server
