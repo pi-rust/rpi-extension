@@ -7105,20 +7105,7 @@ const RowView = memo(function RowView({
     // height while the assistant message is streaming; the completed block
     // keeps the existing disclosure behavior.
     if (thinkingStreaming)
-      return (
-        <div className="thinking-row thinking-row-streaming">
-          <div className="thinking-row-heading">
-            <Sparkles size={13} /> {t("thinking")}
-          </div>
-          <div className="thinking-row-viewport">
-            <MarkdownBody
-              text={row.text}
-              language={language}
-              streaming={thinkingStreaming}
-            />
-          </div>
-        </div>
-      );
+      return <StreamingThinkingRow text={row.text} language={language} t={t} />;
     return (
       <details className="thinking-row">
         <summary>
@@ -7145,6 +7132,44 @@ const RowView = memo(function RowView({
     />
   );
 });
+
+function StreamingThinkingRow({
+  text,
+  language,
+  t,
+}: {
+  text: string;
+  language: Language;
+  t: (key: MessageKey) => string;
+}) {
+  const viewportRef = useRef<HTMLDivElement>(null);
+  const followingRef = useRef(true);
+  // New streamed text lands at the bottom. Follow it unless the reader
+  // deliberately scrolled up; returning to the bottom resumes following.
+  useLayoutEffect(() => {
+    const node = viewportRef.current;
+    if (!node || !followingRef.current) return;
+    node.scrollTop = node.scrollHeight;
+  }, [text]);
+  return (
+    <div className="thinking-row thinking-row-streaming">
+      <div className="thinking-row-heading">
+        <Sparkles size={13} /> {t("thinking")}
+      </div>
+      <div
+        ref={viewportRef}
+        className="thinking-row-viewport"
+        onScroll={(event) => {
+          const node = event.currentTarget;
+          followingRef.current =
+            node.scrollHeight - node.scrollTop - node.clientHeight < 24;
+        }}
+      >
+        <MarkdownBody text={text} language={language} streaming />
+      </div>
+    </div>
+  );
+}
 
 function ToolRowView({
   row,
