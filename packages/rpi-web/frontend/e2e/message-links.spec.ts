@@ -1380,6 +1380,58 @@ test("an ambiguous nested path offers the matching files", async ({ page }) => {
   expect(mock.unexpected).toEqual([]);
 });
 
+const htmlDoc = [
+  "<!doctype html>",
+  "<html><head><title>Demo</title>",
+  "<style>h1 { color: rgb(0, 128, 0); }</style></head>",
+  '<body><h1>HTML 预览</h1><p id="out">static</p>',
+  '<script>document.getElementById("out").textContent = "script ran";</script>',
+  "</body></html>",
+].join("\n");
+
+for (const width of [1280, 390])
+  test(`html preview renders in an opaque-origin sandbox at ${width}px`, async ({
+    page,
+  }) => {
+    await page.setViewportSize({ width, height: 844 });
+    const mock = await host(page, "[Demo](docs/demo.html)", project.path);
+    mock.files["docs/demo.html"] = htmlDoc;
+    await page.goto("/", { waitUntil: "domcontentloaded" });
+    const dialog = preview(page);
+    await page.getByRole("button", { name: "Demo", exact: true }).click();
+    const frame = dialog.locator("iframe.file-preview-html-frame");
+    await expect(frame).toBeVisible();
+    // Scripts render, but the frame must never get same-origin access.
+    await expect(frame).toHaveAttribute("sandbox", "allow-scripts");
+    const inside = dialog.frameLocator("iframe.file-preview-html-frame");
+    await expect(inside.locator("h1")).toHaveText("HTML 预览");
+    await expect(inside.locator("#out")).toHaveText("script ran");
+    expect(await inside.locator("body").evaluate(() => location.origin)).toBe(
+      "null",
+    );
+    await expect(dialog.locator(".file-preview-code")).toHaveCount(0);
+    await expect(dialog.locator(".file-preview-html-note")).toBeVisible();
+    await page.screenshot({
+      path: test.info().outputPath(`html-preview-${width}.png`),
+    });
+    // The reading view can always fall back to the numbered source.
+    await dialog
+      .getByRole("button", { name: "View source", exact: true })
+      .click();
+    await expect(dialog.locator(".file-preview-code")).toContainText(
+      "<!doctype html>",
+    );
+    await expect(frame).toHaveCount(0);
+    await dialog
+      .getByRole("button", { name: "Rendered view", exact: true })
+      .click();
+    await expect(frame).toBeVisible();
+    expect(mock.reads).toEqual([
+      { project: project.id, path: "docs/demo.html", root: null },
+    ]);
+    expect(mock.unexpected).toEqual([]);
+  });
+
 test("workbook parsing keeps formats, dates and every sheet", async () => {
   const book = await readWorkbook(new Uint8Array(sheetBytes));
   expect(book.sheets.map((sheet) => sheet.name)).toEqual(["预算", "备注"]);

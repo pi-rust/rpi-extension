@@ -31,6 +31,14 @@ function isMarkdownPath(path: string) {
 }
 
 /**
+ * HTML documents get a rendered view in a sandboxed frame. `.htm` is the legacy
+ * twin; nothing else is treated as markup, so generated SVG/XML stays source.
+ */
+function isHtmlPath(path: string) {
+  return /\.html?$/i.test(path);
+}
+
+/**
  * Browsers render PDF themselves and `.xlsx` sheets are parsed in the page;
  * legacy binaries and Word/PowerPoint are handed to a desktop app.
  */
@@ -111,6 +119,7 @@ export function FilePreview({
   const image = isProjectImagePath(targetPath);
   const markdown = isMarkdownPath(targetPath);
   const documentType = image ? null : documentKind(targetPath);
+  const html = !image && !documentType && isHtmlPath(targetPath);
   const [documentUrl, setDocumentUrl] = useState<string | null>(null);
   const [workbook, setWorkbook] = useState<WorkbookPreview | null>(null);
   const [activeSheet, setActiveSheet] = useState(0);
@@ -173,7 +182,7 @@ export function FilePreview({
   }
   // A line deep link is only visible in the numbered source, so it wins over
   // the rendered reading view the first time the preview opens.
-  const [source, setSource] = useState(!markdown || !!file.line);
+  const [source, setSource] = useState((!markdown && !html) || !!file.line);
   const [fullscreen, setFullscreen] = useState(false);
   useEffect(() => {
     setTargetPath(file.path);
@@ -203,7 +212,7 @@ export function FilePreview({
     setActiveSheet(0);
     setError("");
     setCopied("");
-    setSource(!markdown || !!file.line);
+    setSource((!markdown && !html) || !!file.line);
     const timer = window.setTimeout(() => {
       void (async () => {
         try {
@@ -307,6 +316,7 @@ export function FilePreview({
     image,
     documentType,
     markdown,
+    html,
     file.line,
     attempt,
   ]);
@@ -335,6 +345,11 @@ export function FilePreview({
               .replace(/>/g, "&gt;"),
       );
   }, [content, file.path]);
+  /** Only documents that actually carry scripts get the sandbox notice. */
+  const htmlScripts = useMemo(
+    () => html && content !== null && /<\s*script\b/i.test(content),
+    [html, content],
+  );
   useEffect(() => {
     if (content !== null)
       targetRef.current?.scrollIntoView({ block: "center" });
@@ -405,7 +420,7 @@ export function FilePreview({
               <FileCode2 size={15} aria-hidden="true" />
             </button>
           )}
-          {markdown && (
+          {(markdown || html) && (
             <button
               type="button"
               className="file-preview-icon"
@@ -654,6 +669,27 @@ export function FilePreview({
         <p className="file-preview-status" role="status">
           {zh ? "正在加载…" : "Loading…"}
         </p>
+      ) : html && !source ? (
+        // `sandbox="allow-scripts"` without `allow-same-origin` gives the frame
+        // an opaque origin: inline scripts still render charts, but they cannot
+        // read the workspace session, localStorage drafts or the API.
+        <div className="file-preview-html">
+          <iframe
+            className="file-preview-html-frame"
+            title={zh ? "HTML 预览" : "HTML preview"}
+            sandbox="allow-scripts"
+            referrerPolicy="no-referrer"
+            allow=""
+            srcDoc={content}
+          />
+          {htmlScripts && (
+            <p className="file-preview-html-note">
+              {zh
+                ? "脚本在不透明源沙箱中运行，无法读取登录态或工作区接口。"
+                : "Scripts run in a sandboxed frame with an opaque origin: no session cookies and no workspace API."}
+            </p>
+          )}
+        </div>
       ) : markdown && !source ? (
         <div className="file-preview-markdown" tabIndex={0}>
           <ProjectImageContext.Provider value={project}>
