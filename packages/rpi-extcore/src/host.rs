@@ -761,6 +761,10 @@ impl HostSession {
         timings.set_session(session_id);
         let mut command = crate::process::background_command(&options.executable);
         command.arg("--mode").arg("rpc");
+        // Declare support per child, never via a process-global environment
+        // mutation. Old native ignores this and advertises legacy semantics;
+        // new native emits correlated autonomous settlements only on opt-in.
+        command.env("RPI_RPC_EXECUTION_LIFECYCLE", "correlated-v1");
         if let Some(file) = &resource_file {
             command.arg(file.flag).arg(&file.path);
         }
