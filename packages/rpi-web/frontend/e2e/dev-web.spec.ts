@@ -1945,13 +1945,8 @@ test("a message typed during a run queues as a follow-up without a kind selector
 test.describe("touch composer", () => {
   test.use({ hasTouch: true });
 
-  for (const sendVia of [
-    "Enter",
-    "insertLineBreak",
-    "insertParagraph",
-    "button",
-  ]) {
-    test(`a running task queues from a touch keyboard via ${sendVia}`, async ({
+  for (const sendVia of ["Enter", "insertLineBreak", "insertParagraph"]) {
+    test(`touch ${sendVia} inserts a newline while a task is running`, async ({
       page,
     }) => {
       await mockHost(page);
@@ -1981,18 +1976,21 @@ test.describe("touch composer", () => {
       const input = page.getByRole("textbox", {
         name: "Send a prompt, or type / for commands…",
       });
-      const queueButton = page.getByRole("button", {
-        name: "Queue",
+      const sendButton = page.getByRole("button", {
+        name: "Send message",
         exact: true,
       });
-      // Nothing queued yet: only the stop action is offered.
+      // Nothing typed: only the stop action is offered.
       await expect(
         page.getByRole("button", { name: "Abort", exact: true }),
       ).toBeEnabled();
-      await expect(queueButton).toHaveCount(0);
-      await expect(input).toHaveAttribute("enterkeyhint", "send");
+      await expect(sendButton).toHaveCount(0);
+      await expect(input).not.toHaveAttribute("enterkeyhint", "send");
       await input.fill("继续补充需求");
-      await expect(queueButton).toBeVisible();
+      await expect(sendButton).toBeVisible();
+      await expect(
+        page.getByRole("button", { name: "Abort", exact: true }),
+      ).toHaveCount(0);
       // Shift+Enter and IME confirmation must not submit, even on touch devices.
       await input.press("Shift+Enter");
       await expect(input).toHaveValue("继续补充需求\n");
@@ -2018,10 +2016,8 @@ test.describe("touch composer", () => {
       await input.fill("继续补充需求");
       if (sendVia === "Enter") {
         await input.press("Enter");
-      } else if (sendVia === "button") {
-        await queueButton.click();
       } else {
-        // Soft keyboards can send only beforeinput, with no keydown event.
+        // Soft keyboards inject newlines without an Enter keydown.
         const allowed = await input.evaluate(
           (element, inputType) =>
             element.dispatchEvent(
@@ -2033,13 +2029,23 @@ test.describe("touch composer", () => {
             ),
           sendVia,
         );
-        expect(allowed).toBe(false);
+        expect(allowed).toBe(true);
       }
+      // Enter is a newline on touch, so nothing is queued. The synthetic
+      // beforeinput cases only check that the default is not prevented;
+      // dispatching them does not perform the browser's native insertion.
+      if (sendVia === "Enter") await expect(input).toHaveValue("继续补充需求\n");
+      await expect.poll(() => queued).toEqual([]);
+      // The main button is the explicit send entry point.
+      await sendButton.click();
       await expect
         .poll(() => queued)
         .toEqual([{ message: "继续补充需求", deliverAs: "followUp" }]);
       await expect(input).toHaveValue("");
-      await expect(queueButton).toHaveCount(0);
+      await expect(sendButton).toHaveCount(0);
+      await expect(
+        page.getByRole("button", { name: "Abort", exact: true }),
+      ).toBeEnabled();
     });
   }
 });
