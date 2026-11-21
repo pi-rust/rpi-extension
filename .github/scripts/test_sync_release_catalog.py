@@ -19,7 +19,7 @@ class SyncReleaseCatalogTests(unittest.TestCase):
             catalog = root / "catalog/packages.json"
             catalog.write_text(json.dumps([
                 {"name": "provider", "install": "rpi package link deepseek --path packages/provider", "prebuilt_manifest": "stale"},
-                {"name": "published", "install": "rpi install published --path packages/published --github old/upstream", "description": "Keep this catalog description."},
+                {"name": "published", "install": "rpi install published --path packages/published --github old/upstream", "nameZh": "发布包", "nameEn": "Published package", "descriptionZh": "保留目录中的中文描述。", "descriptionEn": "Keep this catalog description.", "description": "Keep this catalog description."},
                 {"name": "prebuilt-only", "install": "rpi install prebuilt-only --path packages/prebuilt-only --github old/upstream"},
             ]), encoding="utf-8")
             metadata = {"packages": [
@@ -42,10 +42,27 @@ class SyncReleaseCatalogTests(unittest.TestCase):
             self.assertEqual(source["install"], "rpi package link deepseek --path packages/provider")
             self.assertNotIn("prebuilt_manifest", source)
             self.assertEqual(published["description"], "Keep this catalog description.")
+            self.assertEqual(published["nameZh"], "发布包")
+            self.assertEqual(published["nameEn"], "Published package")
+            self.assertEqual(published["descriptionZh"], "保留目录中的中文描述。")
+            self.assertEqual(published["descriptionEn"], published["description"])
             self.assertEqual(published["prebuilt_manifest"], "https://github.com/example/packages/releases/download/published-v1.2.3/rpi-extension.json")
             self.assertEqual(prebuilt["prebuilt_manifest"], "https://github.com/example/packages/releases/download/prebuilt-only-v0.1.0/rpi-extension.json")
             self.assertEqual(published["install"], "rpi install published --github example/packages")
             self.assertEqual(prebuilt["install"], "rpi install prebuilt-only --github example/packages")
+
+    def test_all_catalog_cards_have_bilingual_names_and_descriptions(self):
+        path = SCRIPT.parents[2] / "catalog/packages.json"
+        entries = json.loads(path.read_text(encoding="utf-8"))
+        for entry in entries:
+            for field in ["nameZh", "nameEn", "descriptionZh", "descriptionEn"]:
+                with self.subTest(package=entry["name"], field=field):
+                    self.assertIsInstance(entry.get(field), str)
+                    self.assertTrue(entry[field].strip())
+            with self.subTest(package=entry["name"]):
+                self.assertRegex(entry["descriptionZh"], r"[\u3400-\u9fff]")
+                self.assertNotEqual(entry["descriptionZh"], entry["descriptionEn"])
+                self.assertEqual(entry["description"], entry["descriptionEn"])
 
     def test_catalog_install_sources_do_not_mix_and_card_descriptions_exist(self):
         path = SCRIPT.parents[2] / "catalog/packages.json"
