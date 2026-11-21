@@ -20,9 +20,9 @@ port keeps OptChat's memory and exposes it to the host instead:
   so another session can attach it, and Claude Code / ChatGPT / JSONL / text
   history can be imported;
 - the model reads it with the `zoom` and `search` tools;
-- the user reads it with `/optchat view`, `/optchat zoom`, `/optchat search`, and
-  hosts that dispatch entry renderers show each logged message inline as
-  `OptChat <kind> · <head>`;
+- the user reads it with `/optchat view`, `/optchat zoom` and `/optchat search`;
+  internal entries use the entry-renderer response `{"display":false}` so a
+  supporting TUI does not duplicate the ordinary transcript;
 - `register_before_agent_start` appends one short pointer line to the system
   prompt so the model knows the memory exists.
 
@@ -147,9 +147,16 @@ a `/optchat fit` or a model-written layout stable across a resume.
 - **No background agents or UI panels.** rpi already provides child agents
   (`rpi-subagents`, `rpi-orchestrator`) and renders commands as messages; the
   footer count is published through `SetStatus`.
-- **Inline rows need a host that dispatches entry renderers.** The plugin
-  registers one (`OptChat <kind> · <head>`), but a host that does not invoke it
-  simply renders the raw entry, and `/optchat view` remains the full view.
+- **Silent internal entries need host support.** The entry renderer claims
+  `optchat-entry`, `optchat-node`, `optchat-view`, `optchat-profile` and
+  `optchat-config` with `rc == 0` and `{"display":false}`. A supporting TUI adds
+  neither a duplicate row nor a spacer or raw-text fallback, including for
+  previously saved entries; no data migration is needed. Older hosts that do
+  not honor this response, or sessions without the plugin loaded, may still
+  display raw entries such as `optchat-entry: ...`. This is a TUI display
+  contract, not a storage/privacy rule or a new live-entry event. Memory still
+  follows the session branch; `/optchat view`, `zoom`/`search`, and the footer
+  remain available. RPC/print modes do not call entry renderers.
 - **Tool activity depends on host event dispatch.** rpi 0.24.0 dispatches
   `tool_execution_start`/`tool_execution_end` to plugins during interactive and
   `--mode rpc` runs, but not in `--print` runs; user and reply capture still
@@ -192,7 +199,8 @@ tiling, paging with stable ids, UTF-8-safe clipping, search paging), the
 compaction child (a stub executable that answers, fails, or times out), the
 profile store (name safety, locked concurrent append/read, malformed lines), the importers
 (Claude, ChatGPT mapping order, generic JSONL, text), the entry renderer
-(entry and summary envelopes, foreign types declined) and the command/schema
+(explicit hiding of internal entries including legacy message data and null
+metadata, foreign types declined) and the command/schema
 surface. End-to-end checks against a running host are described in the pull
 request: `/optchat note` writes `optchat-entry` entries, a second process
 resuming the session hydrates them, the `search` tool executes through the ABI,
