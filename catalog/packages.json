@@ -45,6 +45,7 @@
   },
   {
     "name": "rpi-codemode",
+    "description": "Run bounded native JavaScript programs against the tools active in the current invocation.",
     "version": "0.1.16",
     "type": "extension",
     "tool": "codemode",
@@ -72,7 +73,7 @@
     "tool": "/btw (independent read-only side questions)",
     "inspiredBy": "Out-of-band assistant questions",
     "sourceDownloadsPerMonth": null,
-    "install": "rpi install rpi-btw --path packages/rpi-btw --github pi-rust/rpi-extension",
+    "install": "rpi install rpi-btw --github pi-rust/rpi-extension",
     "repository": "https://github.com/pi-rust/rpi-extension",
     "prebuilt_manifest": "https://github.com/pi-rust/rpi-extension/releases/download/rpi-btw-v0.1.2/rpi-extension.json"
   },
@@ -287,6 +288,7 @@
   },
   {
     "name": "rpi-edit-diagnostics",
+    "description": "Edit files with exact text matching and copyable, compiler-style diagnostics when a match fails.",
     "version": "0.1.3",
     "type": "extension",
     "tool": "edit",

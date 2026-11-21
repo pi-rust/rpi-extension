@@ -2,7 +2,6 @@
 
 import json
 import pathlib
-import re
 import subprocess
 
 metadata = json.loads(subprocess.check_output([
@@ -31,6 +30,7 @@ for entry in catalog:
         repository = package["repository"].removesuffix(".git").rstrip("/")
         prefix = "https://github.com/"
         if repository.startswith(prefix):
-            install = re.sub(r"\s+--github\s+\S+", "", entry["install"])
-            entry["install"] = f"{install} --github {repository[len(prefix):]}"
+            # Rebuild the discovery command instead of retaining a legacy local
+            # --path source alongside --github. Source-only links skip this block.
+            entry["install"] = f"rpi install {package['name']} --github {repository[len(prefix):]}"
 path.write_text(json.dumps(catalog, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
