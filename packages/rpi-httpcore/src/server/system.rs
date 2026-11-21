@@ -22,6 +22,12 @@ pub(super) async fn capabilities(State(state): State<AppState>) -> Json<Value> {
     if let Some(version) = state.service_version {
         value["version"] = json!(version);
     }
+    // The native host has no version in its `ready` frame, so the service
+    // probes the configured binary once (bounded, cached) and reports it here.
+    // A missing or older host just omits the field.
+    if let Some(version) = state.backend.host_version().await {
+        value["hostVersion"] = json!(version);
+    }
     value["sessionIdleTimeoutSeconds"] = match state.session_idle_timeout_seconds {
         Some(seconds) => json!(seconds),
         None => Value::Null,

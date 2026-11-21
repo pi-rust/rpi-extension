@@ -1666,6 +1666,7 @@ export default function App() {
     (status === "awaiting_input" ? "waitingForAnswer" : status) as MessageKey,
   );
   const current = sessions.find((session) => session.sessionId === sessionId);
+  const hostVersion = capabilities?.hostVersion?.trim() ?? "";
   const sidebarSessions = useMemo(
     () =>
       sessions.map((entry) =>
@@ -5338,6 +5339,14 @@ export default function App() {
                   }
                 >
                   v{displayedVersion(capabilities)}
+                </span>
+              )}
+              {hostVersion && (
+                <span
+                  className="brand-version brand-host-version"
+                  title={t("hostVersionTitle", { version: hostVersion })}
+                >
+                  {t("hostVersion", { version: hostVersion })}
                 </span>
               )}
               <button

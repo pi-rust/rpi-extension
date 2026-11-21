@@ -1,6 +1,11 @@
 export interface Capabilities {
   /** Installed build reported by the host; absent on older services. */
   version?: string;
+  /**
+   * Native `rpi` host version the service probed from its configured binary.
+   * Absent when an older service does not report it or the probe failed.
+   */
+  hostVersion?: string;
   protocol: string;
   piCompatibilityTarget?: string;
   supportedCommands: string[];

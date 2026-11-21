@@ -1519,6 +1519,33 @@ test("the install entry can be dismissed and stays hidden", async ({
   ).toHaveCount(0);
 });
 
+test("the sidebar reports the native host version beside the build", async ({
+  page,
+}) => {
+  await mockHost(page);
+  // Newest handler wins: this overrides the shared capabilities fixture.
+  await page.route("**/api/v1/capabilities", (route) =>
+    route.fulfill({ json: { ...capabilities, hostVersion: "0.24.0" } }),
+  );
+  await page.goto("/");
+  const host = page.locator(".brand-host-version");
+  await expect(host).toHaveText("host 0.24.0");
+  await expect(host).toHaveAttribute("title", "Native rpi host version 0.24.0");
+  await expect(page.locator(".brand-version").first()).toHaveText("v9.9.9");
+  await page.screenshot({
+    path: test.info().outputPath("host-version.png"),
+  });
+});
+
+test("an older service with no host version keeps a single build pill", async ({
+  page,
+}) => {
+  await mockHost(page);
+  await page.goto("/");
+  await expect(page.locator(".brand-version").first()).toHaveText("v9.9.9");
+  await expect(page.locator(".brand-host-version")).toHaveCount(0);
+});
+
 test("details jump is right-aligned in the slim metrics strip (#306)", async ({
   page,
 }) => {
