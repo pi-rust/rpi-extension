@@ -1695,6 +1695,11 @@ export default function App() {
   }, [busy, refreshProjectRoots]);
   const composerAbort =
     busy && supported.has("abort") && !loadingSession && !connectionFailed;
+  // While a run is active the main button is Stop for an empty composer and
+  // Send for a draft: touch keyboards use Enter for a newline, so the icon is
+  // the only way to queue a follow-up from the same field.
+  const composerDraftReady = draft.trim().length > 0 || attachments.length > 0;
+  const composerRunningSend = composerAbort && composerDraftReady;
   const composerContinue =
     !busy &&
     status !== "closed" &&
@@ -3686,30 +3691,6 @@ export default function App() {
       }
     }
   }
-
-  // Some soft keyboards emit beforeinput without an Enter keydown. Listen to
-  // the native event: React's synthetic before-input normalization can omit
-  // inputType. Rebind after renders to use the current draft/session and to
-  // handle the textarea mounting after authentication.
-  useEffect(() => {
-    const input = composerInputRef.current;
-    if (!input) return;
-    const onBeforeInput = (event: InputEvent) => {
-      if (
-        !window.matchMedia("(pointer: coarse)").matches ||
-        !["insertLineBreak", "insertParagraph"].includes(event.inputType) ||
-        event.isComposing ||
-        composerComposing.current ||
-        composerShiftEnter.current ||
-        !event.cancelable
-      )
-        return;
-      event.preventDefault();
-      void submit();
-    };
-    input.addEventListener("beforeinput", onBeforeInput);
-    return () => input.removeEventListener("beforeinput", onBeforeInput);
-  });
 
   async function resumePending() {
     if (
@@ -6417,7 +6398,6 @@ export default function App() {
                   onChange={(event) => {
                     updateDraft(event.target.value, sessionId);
                   }}
-                  enterKeyHint="send"
                   onCompositionStart={() => {
                     composerComposing.current = true;
                   }}
@@ -6434,15 +6414,18 @@ export default function App() {
                   onKeyDown={(event) => {
                     composerShiftEnter.current = event.shiftKey;
                     if (
-                      event.key === "Enter" &&
-                      !event.shiftKey &&
-                      !composerComposing.current &&
-                      !event.nativeEvent.isComposing &&
-                      event.nativeEvent.keyCode !== 229
+                      event.key !== "Enter" ||
+                      event.shiftKey ||
+                      // Touch keyboards have no Shift; Enter inserts a newline.
+                      isMobileViewport() ||
+                      composerComposing.current ||
+                      event.nativeEvent.isComposing ||
+                      event.nativeEvent.keyCode === 229
                     ) {
-                      event.preventDefault();
-                      void submit();
+                      return;
                     }
+                    event.preventDefault();
+                    void submit();
                   }}
                   placeholder={t("sendPlaceholder")}
                   disabled={!sessionId}
@@ -6507,52 +6490,45 @@ export default function App() {
                     )}
                   </div>
                   <div className="composer-controls">
-                    {composerAbort &&
-                      supported.has("queue_message") &&
-                      !queueEditId &&
-                      (draft.trim().length > 0 || attachments.length > 0) && (
-                        // Touch keyboards keep Enter as a newline, so a run in
-                        // progress needs an explicit way to queue the message.
-                        <button
-                          type="submit"
-                          className="send-button composer-action-queue"
-                          aria-label={t("queue")}
-                          title={t("queue")}
-                          disabled={sending || uploading}
-                        >
-                          <ArrowUp size={17} aria-hidden="true" />
-                        </button>
-                      )}
                     <button
-                      type={composerAbort ? "button" : "submit"}
-                      className={`send-button${composerAbort ? " composer-action-stop" : composerContinue ? " composer-action-continue" : ""}`}
+                      type={composerRunningSend ? "submit" : composerAbort ? "button" : "submit"}
+                      className={`send-button${composerAbort && !composerRunningSend ? " composer-action-stop" : composerContinue ? " composer-action-continue" : ""}`}
                       aria-label={
-                        composerAbort
-                          ? t("abort")
-                          : composerContinue
-                            ? t("continue")
-                            : t("send")
+                        composerRunningSend
+                          ? t("send")
+                          : composerAbort
+                            ? t("abort")
+                            : composerContinue
+                              ? t("continue")
+                              : t("send")
                       }
                       title={
-                        composerAbort
-                          ? t("abort")
-                          : composerContinue
-                            ? t("continue")
-                            : t("send")
+                        composerRunningSend
+                          ? t("send")
+                          : composerAbort
+                            ? t("abort")
+                            : composerContinue
+                              ? t("continue")
+                              : t("send")
                       }
                       disabled={
                         (!localSlash && (loadingSession || connectionFailed)) ||
                         (!composerAbort &&
                           ((!composerContinue &&
+                            !composerRunningSend &&
                             !draft.trim() &&
                             attachments.length === 0) ||
                             !sessionId ||
                             sending ||
                             uploading))
                       }
-                      onClick={composerAbort ? () => void abort() : undefined}
+                      onClick={
+                        composerAbort && !composerRunningSend
+                          ? () => void abort()
+                          : undefined
+                      }
                     >
-                      {composerAbort ? (
+                      {composerAbort && !composerRunningSend ? (
                         <span className="stop-indicator" aria-hidden="true" />
                       ) : composerContinue ? (
                         <Play size={17} aria-hidden="true" />
