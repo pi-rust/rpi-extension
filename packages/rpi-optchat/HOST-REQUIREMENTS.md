@@ -11,7 +11,7 @@ Status, verified against `pi-rust`:
 | 1. session-tree lifecycle dispatch | shipped on `origin/feat/session-tree-lifecycle` (`30eac36`), consumed here |
 | 2. `GetExecutionContext` in the SDK | shipped: declared at `rpi-plugin-sdk` 0.25.0; this workspace still pins `=0.3.20`, so the numeric id stays until that pin moves |
 | 3. print-mode tool events | open |
-| 4. entry-renderer contract | shipped on the same branch, consumed here |
+| 4. entry-renderer contract | payload shipped on the same branch; explicit `display:false` needs an updated host build (see below) |
 | 5. project-scoped store | open |
 
 The plugin keeps its fallbacks for 1 and 2, because an installed host may predate
@@ -122,8 +122,21 @@ plugin asking for entries after its own last sequence is the same class of read)
 Accepted: the SDK now states the envelope (`{"customType":"...","data":...}`) and
 the accepted replies (`{"text","markdown"}` or `{"lines":[...]}`), and the TUI
 passes `customType`/`data` through `extension_entry_component`. The plugin
-registers `optchat_entry_renderer` for `optchat-entry` and `optchat-node`; the
-text below is the original request.
+registers `optchat_entry_renderer` for its internal entry types. It now returns
+`rc == 0` with `{"display":false}` for `optchat-entry`, `optchat-node`,
+`optchat-view`, `optchat-profile` and `optchat-config` rather than projecting a
+second transcript. The host must distinguish **unhandled**, **rendered** and
+**hidden**: hidden claims the entry, stops renderer dispatch and adds neither a
+component, spacer nor raw-text fallback. Only boolean `false` hides, taking
+precedence over `text`/`lines`; non-zero status remains unhandled. This is an
+additive JSON contract, not a plugin ABI or persisted-data change.
+
+Compatibility: the original payload contract does not guarantee explicit
+hiding. A host predating `display:false`, or a session without the plugin loaded,
+may still show raw entries. No minimum released host version is asserted here;
+use a host build implementing explicit visibility. The change does not add
+live-entry events or affect RPC/print output, storage, branch semantics or
+`zoom`/`search`/`view`. The text below is the original payload-contract request.
 
 `register_entry_renderer` is declared as
 

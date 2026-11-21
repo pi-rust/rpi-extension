@@ -1499,39 +1499,25 @@ fn optchat_command(input, out, data) {
 }
 
 // ---------------------------------------------------------------------------
-// Inline transcript rendering
+// Internal-entry visibility
 // ---------------------------------------------------------------------------
 
-// Render OptChat's custom entries when a host supplies the entry-renderer
-// capability. Raw entries and summary nodes stay recognizable in the TUI while
-// `optchat-view`/`optchat-profile` metadata remains silent.
+// These entries persist memory, not an additional copy of the transcript.
+// Explicitly claim them as hidden; declining would trigger the host's raw-text
+// fallback. This also covers existing entry data without a storage migration.
 rpi_plugin_sdk::string_handler! {
 fn optchat_entry_renderer(input, out, _data) {
     let envelope: Value = serde_json::from_str(input).unwrap_or(Value::Null);
     let Some(custom_type) = envelope.get("customType").and_then(Value::as_str) else {
         return 1;
     };
-    let Some(data) = envelope.get("data") else {
+    if !matches!(
+        custom_type,
+        ENTRY_TYPE | compact::NODE_TYPE | VIEW_TYPE | PROFILE_TYPE | compact::CONFIG_TYPE
+    ) {
         return 1;
-    };
-    let text = match custom_type {
-        ENTRY_TYPE => {
-            let Ok(entry) = serde_json::from_value::<memory::Entry>(data.clone()) else {
-                return 1;
-            };
-            format!("OptChat {} · {}", entry.kind.as_str(), clip(&entry.text, 320))
-        }
-        compact::NODE_TYPE => {
-            let Some(text) = data.get("text").and_then(Value::as_str) else {
-                return 1;
-            };
-            let level = data.get("l").and_then(Value::as_u64).unwrap_or_default();
-            let index = data.get("i").and_then(Value::as_u64).unwrap_or_default();
-            format!("OptChat summary {level}+{index} · {}", clip(text, 320))
-        }
-        _ => return 1,
-    };
-    out.write(json!({"text": text}).to_string());
+    }
+    out.write(json!({"display": false}).to_string());
     0
 }
 }
@@ -1688,7 +1674,7 @@ mod tests {
     }
 
     #[test]
-    fn entry_renderer_formats_optchat_entries_and_ignores_other_types() {
+    fn entry_renderer_hides_internal_entries_and_ignores_other_types() {
         let render = |value: Value| {
             let mut out = StbString::empty();
             let rc = optchat_entry_renderer(
@@ -1700,13 +1686,33 @@ mod tests {
             free_string(out);
             (rc, text)
         };
-        let (rc, text) = render(json!({
-            "customType": compact::NODE_TYPE,
-            "data": {"l": 2, "i": 3, "text": "bounded summary"}
-        }));
+        for custom_type in [
+            ENTRY_TYPE,
+            compact::NODE_TYPE,
+            VIEW_TYPE,
+            PROFILE_TYPE,
+            compact::CONFIG_TYPE,
+        ] {
+            // Visibility is independent of data shape: old records and null
+            // metadata must not fall through to the host's raw-text fallback.
+            for data in [json!({"text": "internal text"}), Value::Null] {
+                let (rc, text) = render(json!({"customType": custom_type, "data": data}));
+                assert_eq!(rc, 0, "{custom_type}");
+                assert_eq!(
+                    serde_json::from_str::<Value>(&text).unwrap(),
+                    json!({"display": false})
+                );
+            }
+        }
+        let (rc, text) = render(json!({"customType": ENTRY_TYPE}));
         assert_eq!(rc, 0);
-        assert!(text.contains("OptChat summary 2+3"), "{text}");
-        assert!(text.contains("bounded summary"), "{text}");
+        assert_eq!(
+            serde_json::from_str::<Value>(&text).unwrap(),
+            json!({"display": false})
+        );
+        let (rc, text) = render(Value::Null);
+        assert_eq!(rc, 1);
+        assert!(text.is_empty());
 
         let (rc, text) = render(json!({
             "customType": "unrelated-entry",
@@ -1717,7 +1723,7 @@ mod tests {
     }
 
     #[test]
-    fn entry_renderer_formats_a_memory_entry() {
+    fn entry_renderer_hides_a_legacy_memory_entry() {
         let entry = memory::Entry {
             i: 4,
             kind: Kind::Note,
@@ -1741,8 +1747,11 @@ mod tests {
         );
         let rendered = out.to_string_lossy();
         free_string(out);
-        assert!(rendered.contains("OptChat note"), "{rendered}");
-        assert!(rendered.contains("a durable note"), "{rendered}");
+        assert_eq!(
+            serde_json::from_str::<Value>(&rendered).unwrap(),
+            json!({"display": false})
+        );
+        assert!(!rendered.contains("a durable note"));
     }
     #[test]
     fn tool_schemas_advertise_canonical_arguments_without_host_context() {
