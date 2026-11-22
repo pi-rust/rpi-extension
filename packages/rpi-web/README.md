@@ -418,6 +418,15 @@ finish. The button becomes **Stop reading / 停止朗读** the moment it is pres
 the current chunk and drops the remainder. **Read new replies aloud /
 自动朗读新回复** in Settings uses the same chunked path.
 
+Playback goes through **one** shared audio element instead of one per chunk.
+Gesture-gated browsers (Safari) refuse `play()` outside a gesture with
+`NotAllowedError`, so the first pointer/key/touch interaction on the page plays
+a 50 ms silent clip to unlock that element, and every later chunk reuses it;
+pressing Read aloud also unlocks synchronously inside the click. If a policy
+still blocks playback (for example a freshly loaded page with auto-read before
+any interaction), the transcript shows **click the page once, then press Read
+aloud again** rather than a failure banner, and pending synthesis is dropped.
+
 ### Message-linked image previews
 
 Click a project file link in a message to open a read-only preview. Raster image
