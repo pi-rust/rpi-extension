@@ -2232,6 +2232,105 @@ test.describe("huawei browser that reports a fine pointer", () => {
   });
 });
 
+test("a steering send shows a sending spinner until the queue accepts it", async ({
+  page,
+}) => {
+  await mockHost(page);
+  let release!: () => void;
+  const gate = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  const queued: Array<{ message: string; deliverAs: string }> = [];
+  await page.route(`**/api/v1/sessions/${sessionId}/events**`, async (route) =>
+    route.fulfill({
+      contentType: "text/event-stream",
+      body: 'id: 5\nevent: agent_start\ndata: {"type":"agent_start"}\n\n',
+    }),
+  );
+  await page.route(
+    `**/api/v1/sessions/${sessionId}/commands`,
+    async (route) => {
+      const body = route.request().postDataJSON();
+      if (body.type !== "queue_message") return route.fallback();
+      queued.push({ message: body.message, deliverAs: body.deliverAs });
+      await gate;
+      return route.fulfill({
+        json: response({ accepted: true, entryId: "steered" }, body.type),
+      });
+    },
+  );
+  await page.goto("/");
+  await expect(
+    page.getByRole("button", { name: "Abort", exact: true }),
+  ).toBeEnabled();
+  const sendButton = page.getByRole("button", {
+    name: "Send message",
+    exact: true,
+  });
+  const input = page.getByRole("textbox", {
+    name: "Send a prompt, or type / for commands…",
+  });
+  await input.fill("Change course now");
+  await sendButton.click();
+  // While the queueing request is in flight the button acknowledges the click
+  // with a spinning "Sending…" state instead of flipping straight to Stop.
+  const sendingButton = page.getByRole("button", { name: "Sending…" });
+  await expect(sendingButton).toBeVisible();
+  await expect(sendingButton).toBeDisabled();
+  await expect(sendingButton.locator("svg.spin")).toBeVisible();
+  await expect(
+    page.getByRole("button", { name: "Abort", exact: true }),
+  ).toHaveCount(0);
+  // The draft is already cleared, so a second send cannot double-queue.
+  await expect(input).toHaveValue("");
+  release();
+  // Once accepted the queued chip takes over and Stop returns.
+  await expect
+    .poll(() => queued)
+    .toEqual([{ message: "Change course now", deliverAs: "followUp" }]);
+  await expect(sendingButton).toHaveCount(0);
+  await expect(
+    page.getByRole("button", { name: "Abort", exact: true }),
+  ).toBeEnabled();
+});
+
+test("an idle prompt send never shows the steering spinner", async ({
+  page,
+}) => {
+  await mockHost(page);
+  let release!: () => void;
+  const gate = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  await page.route(
+    `**/api/v1/sessions/${sessionId}/commands`,
+    async (route) => {
+      const body = route.request().postDataJSON();
+      if (body.type !== "prompt") return route.fallback();
+      await gate;
+      return route.fulfill({ json: response({ accepted: true }, body.type) });
+    },
+  );
+  await page.goto("/");
+  const sendButton = page.getByRole("button", {
+    name: "Send message",
+    exact: true,
+  });
+  const input = page.getByRole("textbox", {
+    name: "Send a prompt, or type / for commands…",
+  });
+  await input.fill("Regular prompt");
+  await sendButton.click();
+  // Idle sessions keep the existing affordances while the prompt is in
+  // flight; only steering sends use the spinner acknowledgement.
+  await expect(page.getByRole("button", { name: "Sending…" })).toHaveCount(0);
+  release();
+  // The accepted prompt starts a run, so Stop comes back as usual.
+  await expect(
+    page.getByRole("button", { name: "Abort", exact: true }),
+  ).toBeEnabled();
+});
+
 test.describe("touch composer", () => {
   test.use({ hasTouch: true });
 
