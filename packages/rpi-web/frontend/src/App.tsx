@@ -215,6 +215,22 @@ function loadDrafts(): Map<string, string> {
   }
 }
 
+/**
+ * 50 ms of silence: enough for a gesture-initiated play to unlock the shared
+ * audio element without making a sound.
+ */
+const SILENT_AUDIO =
+  "data:audio/wav;base64,UklGRrQBAABXQVZFZm10IBAAAAABAAEAQB8AAEAfAAABAAgAZGF0YZABAACAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICA";
+
+/** `play()` outside a gesture is rejected by autoplay policies. */
+function isAutoplayBlocked(cause: unknown) {
+  if (!(cause instanceof DOMException)) return false;
+  return (
+    cause.name === "NotAllowedError" ||
+    /user gesture|not allowed by the user agent|autoplay/i.test(cause.message)
+  );
+}
+
 function saveDrafts(drafts: Map<string, string>) {
   try {
     if (drafts.size === 0) {
@@ -1507,46 +1523,84 @@ export default function App() {
   const ttsAudio = useRef<HTMLAudioElement | null>(null);
   const ttsUrl = useRef<string | null>(null);
   const ttsAbort = useRef<AbortController | null>(null);
+  const ttsUnlocked = useRef(false);
   const autoReadLast = useRef("");
   const autoReadSettlement = useRef(0);
+  /**
+   * Browsers that require a gesture (Safari) allow later programmatic playback
+   * once one element has been started inside a gesture; a silent clip is enough
+   * and the element is then reused for every chunk. A fresh element per chunk
+   * would be blocked with "play() can only be initiated by a user gesture".
+   */
+  const unlockAudio = useCallback(() => {
+    if (ttsUnlocked.current) return;
+    const audio = ttsAudio.current ?? new Audio();
+    ttsAudio.current = audio;
+    audio.src = SILENT_AUDIO;
+    void audio
+      .play()
+      .then(() => {
+        audio.pause();
+        ttsUnlocked.current = true;
+      })
+      .catch(() => {
+        // Blocked: keep the element so the next gesture can try again.
+      });
+  }, []);
+  useEffect(() => {
+    const gestures: Array<keyof WindowEventMap> = [
+      "pointerdown",
+      "keydown",
+      "touchstart",
+    ];
+    for (const gesture of gestures)
+      window.addEventListener(gesture, unlockAudio, {
+        capture: true,
+        passive: true,
+      });
+    return () => {
+      for (const gesture of gestures)
+        window.removeEventListener(gesture, unlockAudio, { capture: true });
+    };
+  }, [unlockAudio]);
   const stopReading = useCallback(() => {
     ttsAbort.current?.abort();
     ttsAbort.current = null;
+    // Keep the element: it may already be unlocked, and a new one would need
+    // another gesture on Safari.
     ttsAudio.current?.pause();
-    ttsAudio.current = null;
     if (ttsUrl.current) URL.revokeObjectURL(ttsUrl.current);
     ttsUrl.current = null;
     setReadingRowId(null);
   }, []);
   /**
-   * Play one synthesized chunk and resolve when it ends or the run is
-   * cancelled. Every chunk owns its object URL, so memory is released as soon
-   * as the browser is done with it.
+   * Play one synthesized chunk on the shared element and resolve when it ends
+   * or the run is cancelled. Each chunk's object URL is revoked when it ends.
    */
   const playSpeech = useCallback(
     (blob: Blob, signal: AbortSignal) =>
       new Promise<void>((resolve, reject) => {
         const url = URL.createObjectURL(blob);
-        const audio = new Audio(url);
-        ttsUrl.current = url;
+        const audio = ttsAudio.current ?? new Audio();
         ttsAudio.current = audio;
-        const cancel = () => {
-          audio.pause();
-          settle();
-        };
+        ttsUrl.current = url;
         const settle = (error?: unknown) => {
           audio.onended = null;
           audio.onerror = null;
           signal.removeEventListener("abort", cancel);
-          if (ttsAudio.current === audio) ttsAudio.current = null;
           if (ttsUrl.current === url) ttsUrl.current = null;
           URL.revokeObjectURL(url);
           if (error) reject(error);
           else resolve();
         };
+        const cancel = () => {
+          audio.pause();
+          settle();
+        };
         audio.onended = () => settle();
         audio.onerror = () => settle(new Error("audio playback failed"));
         signal.addEventListener("abort", cancel, { once: true });
+        audio.src = url;
         void audio.play().catch(settle);
       }),
     [],
@@ -1557,6 +1611,9 @@ export default function App() {
         stopReading();
         return;
       }
+      // Runs synchronously inside the click, so the shared element is unlocked
+      // before the first synthesized chunk needs to play.
+      unlockAudio();
       stopReading();
       // Only prose is spoken, and only a sentence or two per request: the first
       // chunk can start playing while later chunks are still being synthesized.
@@ -1584,12 +1641,16 @@ export default function App() {
           if (controller.signal.aborted) return;
         }
       } catch (cause) {
-        if (!controller.signal.aborted) setError(errorText(cause));
+        if (controller.signal.aborted) return;
+        // Autoplay policies are not a failure: say what to do next.
+        if (isAutoplayBlocked(cause))
+          note(translate(language, "autoplayBlocked"));
+        else setError(errorText(cause));
       } finally {
         if (ttsAbort.current === controller) stopReading();
       }
     },
-    [language, note, playSpeech, readingRowId, stopReading],
+    [language, note, playSpeech, readingRowId, stopReading, unlockAudio],
   );
   useEffect(() => {
     try {

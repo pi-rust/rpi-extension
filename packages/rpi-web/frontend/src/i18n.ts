@@ -150,6 +150,8 @@ const messages = {
     readAloud: "Read aloud",
     stopReading: "Stop reading",
     nothingToRead: "Nothing to read aloud in this reply",
+    autoplayBlocked:
+      "The browser blocked audio playback. Click the page once, then press Read aloud again.",
     autoRead: "Read new replies aloud",
     copyCode: "Copy code",
     mermaidViewSource: "View source",
@@ -546,6 +548,7 @@ const messages = {
     readAloud: "朗读",
     stopReading: "停止朗读",
     nothingToRead: "这条回复没有可朗读的内容",
+    autoplayBlocked: "浏览器阻止了音频自动播放：先点一下页面，再点朗读即可。",
     autoRead: "自动朗读新回复",
     copyCode: "复制代码",
     mermaidViewSource: "查看源码",

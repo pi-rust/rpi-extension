@@ -1620,6 +1620,13 @@ test("read aloud speaks prose chunks in order and stops with the button", async 
   const joined = spoken.join("\n");
   expect(joined).not.toContain("example.com");
   expect(joined).toContain("第二段提到 链接。");
+  // One shared element carries every chunk: a new element per chunk would be
+  // blocked by gesture-gated browsers ("play() ... user gesture").
+  expect(
+    await page.evaluate(
+      () => (window as unknown as { __audios: unknown[] }).__audios.length,
+    ),
+  ).toBe(1);
   // Stopping freezes the queue even if the browser reports another end.
   await page.getByRole("button", { name: "Stop reading", exact: true }).click();
   const stopped = spoken.length;
@@ -1637,6 +1644,61 @@ test("read aloud speaks prose chunks in order and stops with the button", async 
   await expect(
     page.getByRole("button", { name: "Read aloud", exact: true }),
   ).toBeVisible();
+});
+
+test("blocked autoplay explains the gesture instead of failing", async ({
+  page,
+}) => {
+  // Reproduce the gesture-gated browser: every play() is rejected.
+  await page.addInitScript(() => {
+    class BlockedAudio {
+      onended: (() => void) | null = null;
+      onerror: (() => void) | null = null;
+      src = "";
+      play() {
+        return Promise.reject(
+          new DOMException(
+            "play() can only be initiated by a user gesture.",
+            "NotAllowedError",
+          ),
+        );
+      }
+      pause() {}
+    }
+    window.Audio = BlockedAudio as unknown as typeof Audio;
+  });
+  const spoken: string[] = [];
+  await mockHost(page, {
+    snapshotMessages: [
+      {
+        entryId: "message-3",
+        role: "assistant",
+        content: [{ type: "text", text: "第一段说明。" }],
+        timestamp: 1_700_000_000_000,
+      },
+    ],
+  });
+  await page.route("**/api/v1/tts", async (route) => {
+    spoken.push("chunk");
+    return route.fulfill({
+      status: 200,
+      contentType: "audio/mpeg",
+      body: "chunk",
+    });
+  });
+  await page.goto("/");
+  await page.getByRole("button", { name: "Read aloud", exact: true }).click();
+  // A policy rejection is guidance, not a red failure banner.
+  await expect(
+    page
+      .locator(".transcript-note")
+      .filter({ hasText: "The browser blocked audio playback" }),
+  ).toBeVisible();
+  await expect(page.getByRole("alert")).toHaveCount(0);
+  await expect(
+    page.getByRole("button", { name: "Read aloud", exact: true }),
+  ).toBeVisible();
+  expect(spoken.length).toBe(1);
 });
 
 test("details jump is right-aligned in the slim metrics strip (#306)", async ({
