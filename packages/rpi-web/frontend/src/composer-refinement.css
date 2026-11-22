@@ -171,16 +171,12 @@
   border-top: 0;
   padding: 4px 14px 2px;
 }
-/* Steering send in flight (see desktop.css): keep the Send look while the
-   queued chip has not appeared yet, overriding the grey disabled state. */
-.workspace .send-button.composer-action-sending {
-  background: var(--text);
-  color: var(--bg);
+/* "Send now" delivered confirmation (see desktop.css). */
+.workspace .queue-send-now.queue-send-now-sent {
+  color: var(--green);
 }
-.workspace .send-button.composer-action-sending:disabled {
-  background: var(--text);
-  color: var(--bg);
-  opacity: 0.85;
+.workspace .panel-heading-actions .queue-send-now-sent-check {
+  color: var(--green);
 }
 
 /* The pending queue lives directly above the composer and can be folded into a

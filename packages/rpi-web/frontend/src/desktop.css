@@ -1108,22 +1108,13 @@
     opacity: 1;
   }
 }
-/* Steering send in flight: same Send color while the queued chip has not
-   appeared yet; disabled so a fast second click cannot abort or double-send. */
-.workspace .send-button.composer-action-sending {
-  background: var(--text);
-  color: var(--bg);
+/* "Send now" delivered confirmation: the entry's button flashes a green
+   check once the run prints the message, then returns to the play icon. */
+.queue-send-now.queue-send-now-sent {
+  color: var(--green);
 }
-.workspace .send-button.composer-action-sending:disabled {
-  background: var(--text);
-  color: var(--bg);
-  opacity: 0.85;
-}
-@media (hover: hover) {
-  .workspace .send-button.composer-action-sending:hover:not(:disabled) {
-    background: var(--text);
-    opacity: 0.85;
-  }
+.panel-heading-actions .queue-send-now-sent-check {
+  color: var(--green);
 }
 .start-project-chat {
   margin: 15px auto 0;
