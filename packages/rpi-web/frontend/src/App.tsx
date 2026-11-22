@@ -5123,7 +5123,7 @@ export default function App() {
                         type="button"
                         className={`icon-button queue-send-now${
                           sendNowSent?.entryId === item.entryId &&
-                          sendNowSent.sessionId === sessionId
+                          sendNowSent?.sessionId === sessionId
                             ? " queue-send-now-sent"
                             : ""
                         }`}
@@ -5133,16 +5133,16 @@ export default function App() {
                         disabled={
                           queueRunning ||
                           (sendNowPending?.entryId === item.entryId &&
-                            sendNowPending.sessionId === sessionId) ||
+                            sendNowPending?.sessionId === sessionId) ||
                           (sendNowSent?.entryId === item.entryId &&
-                            sendNowSent.sessionId === sessionId)
+                            sendNowSent?.sessionId === sessionId)
                         }
                       >
                         {sendNowPending?.entryId === item.entryId &&
-                        sendNowPending.sessionId === sessionId ? (
+                        sendNowPending?.sessionId === sessionId ? (
                           <Loader2 size={13} className="spin" />
                         ) : sendNowSent?.entryId === item.entryId &&
-                          sendNowSent.sessionId === sessionId ? (
+                          sendNowSent?.sessionId === sessionId ? (
                           <Check size={13} />
                         ) : queueRunning ? (
                           <Loader2 size={13} className="spin" />
@@ -6542,7 +6542,7 @@ export default function App() {
                                   type="button"
                                   className={`icon-button queue-send-now${
                                     sendNowSent?.entryId === item.entryId &&
-                                    sendNowSent.sessionId === sessionId
+                                    sendNowSent?.sessionId === sessionId
                                       ? " queue-send-now-sent"
                                       : ""
                                   }`}
@@ -6554,16 +6554,17 @@ export default function App() {
                                   disabled={
                                     queueRunning ||
                                     (sendNowPending?.entryId === item.entryId &&
-                                      sendNowPending.sessionId === sessionId) ||
+                                      sendNowPending?.sessionId ===
+                                        sessionId) ||
                                     (sendNowSent?.entryId === item.entryId &&
-                                      sendNowSent.sessionId === sessionId)
+                                      sendNowSent?.sessionId === sessionId)
                                   }
                                 >
                                   {sendNowPending?.entryId === item.entryId &&
-                                  sendNowPending.sessionId === sessionId ? (
+                                  sendNowPending?.sessionId === sessionId ? (
                                     <Loader2 size={13} className="spin" />
                                   ) : sendNowSent?.entryId === item.entryId &&
-                                    sendNowSent.sessionId === sessionId ? (
+                                    sendNowSent?.sessionId === sessionId ? (
                                     <Check size={13} />
                                   ) : queueRunning ? (
                                     <Loader2 size={13} className="spin" />
