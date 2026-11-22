@@ -1532,20 +1532,19 @@ export default function App() {
    * and the element is then reused for every chunk. A fresh element per chunk
    * would be blocked with "play() can only be initiated by a user gesture".
    */
-  const unlockAudio = useCallback(() => {
+  const unlockAudio = useCallback(async () => {
     if (ttsUnlocked.current) return;
     const audio = ttsAudio.current ?? new Audio();
     ttsAudio.current = audio;
     audio.src = SILENT_AUDIO;
-    void audio
-      .play()
-      .then(() => {
-        audio.pause();
-        ttsUnlocked.current = true;
-      })
-      .catch(() => {
-        // Blocked: keep the element so the next gesture can try again.
-      });
+    try {
+      await audio.play();
+      ttsUnlocked.current = true;
+      // Retract only the silent clip: a real chunk may have taken the element.
+      if (audio.src === SILENT_AUDIO) audio.pause();
+    } catch {
+      // Blocked: keep the element so the next gesture can try again.
+    }
   }, []);
   useEffect(() => {
     const gestures: Array<keyof WindowEventMap> = [
@@ -1567,8 +1566,10 @@ export default function App() {
     ttsAbort.current?.abort();
     ttsAbort.current = null;
     // Keep the element: it may already be unlocked, and a new one would need
-    // another gesture on Safari.
-    ttsAudio.current?.pause();
+    // another gesture on Safari. Never pause the silent unlock clip either —
+    // that aborts its own play() and can undo the unlock.
+    const audio = ttsAudio.current;
+    if (audio && audio.src !== SILENT_AUDIO) audio.pause();
     if (ttsUrl.current) URL.revokeObjectURL(ttsUrl.current);
     ttsUrl.current = null;
     setReadingRowId(null);
@@ -1611,10 +1612,11 @@ export default function App() {
         stopReading();
         return;
       }
-      // Runs synchronously inside the click, so the shared element is unlocked
-      // before the first synthesized chunk needs to play.
-      unlockAudio();
+      // Stop first: pausing the element in the same tick would cancel the
+      // gesture-initiated silent play that unlocks it.
       stopReading();
+      // Started synchronously inside the click; awaited before the first chunk.
+      const unlocked = unlockAudio();
       // Only prose is spoken, and only a sentence or two per request: the first
       // chunk can start playing while later chunks are still being synthesized.
       const chunks = splitForSpeech(speakableText(text));
@@ -1628,15 +1630,37 @@ export default function App() {
       setReadingRowId(rowId);
       const voice =
         language === "zh" ? "zh-CN-XiaoxiaoNeural" : "en-US-AriaNeural";
-      const fetchChunk = (index: number) =>
-        api.tts(chunks[index], voice, controller.signal);
+      // Edge synthesis fails intermittently; one short retry keeps a long
+      // reading from dying on a single blip. Client errors are not retried.
+      const fetchChunk = async (index: number) => {
+        for (let attempt = 0; ; attempt += 1) {
+          try {
+            return await api.tts(chunks[index], voice, controller.signal);
+          } catch (cause) {
+            const retryable =
+              !(cause instanceof ApiError) || cause.status >= 500;
+            if (controller.signal.aborted || !retryable || attempt >= 1)
+              throw cause;
+            await new Promise((resolve) => window.setTimeout(resolve, 400));
+            if (controller.signal.aborted) throw cause;
+          }
+        }
+      };
       let next = fetchChunk(0);
       try {
         for (let index = 0; index < chunks.length; index += 1) {
           const blob = await next;
           if (controller.signal.aborted) return;
-          // Keep one chunk of synthesis ahead of playback.
-          if (index + 1 < chunks.length) next = fetchChunk(index + 1);
+          // Keep one chunk of synthesis ahead of playback. A prefetch that
+          // nobody awaits (stop) must not surface as an unhandled rejection.
+          if (index + 1 < chunks.length) {
+            next = fetchChunk(index + 1);
+            void next.catch(() => {});
+          }
+          // A gesture-gated browser must have finished the silent unlock before
+          // the first chunk asks to play.
+          await unlocked;
+          if (controller.signal.aborted) return;
           await playSpeech(blob, controller.signal);
           if (controller.signal.aborted) return;
         }

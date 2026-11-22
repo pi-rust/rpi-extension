@@ -68,24 +68,33 @@ test("a reply with only code has nothing to say", () => {
 });
 
 test("speech is split into sentence-sized requests in order", () => {
-  const paragraphs = [
-    "第一段。第二句话！第三句话？",
-    "Second paragraph. It has two sentences.",
-    "没有标点的一长段文字".repeat(60),
-  ];
-  const chunks = splitForSpeech(paragraphs.join("\n\n"));
+  const first = "第一段有第一句话。第二句话紧跟着！第三句话用来收尾？";
+  const second = "Second paragraph. It has two sentences of its own.";
+  const long = "没有标点的一长段文字".repeat(60);
+  const chunks = splitForSpeech([first, second, long].join("\n\n"));
   expect(chunks.length).toBeGreaterThan(3);
   for (const chunk of chunks) {
     expect(chunk.length).toBeGreaterThan(0);
     expect(chunk.length).toBeLessThanOrEqual(MAX_SPEECH_CHARS);
   }
-  // Paragraphs never share a request.
-  expect(chunks[0]).toBe("第一段。第二句话！第三句话？");
-  expect(chunks[1]).toBe("Second paragraph. It has two sentences.");
+  // Paragraphs never share a request, and order is preserved.
+  expect(chunks[0]).toBe(first);
+  expect(chunks[1]).toBe(second);
   // Concatenated chunks preserve the original words.
   expect(chunks.join("").replace(/\s/g, "")).toContain(
     "没有标点的一长段文字".repeat(5),
   );
+});
+
+test("a short fragment joins its neighbour instead of its own request", () => {
+  // A two-character paragraph used to become its own synthesis request, which
+  // is both clipped speech and the least reliable request shape.
+  const first = `${"第一段完整而且足够长的正文".repeat(3)}。`;
+  const last = `${"第三段完整而且足够长的正文".repeat(3)}。`;
+  const chunks = splitForSpeech([first, "原因", last].join("\n\n"));
+  expect(chunks).toHaveLength(2);
+  expect(chunks[0]).toBe(`${first}原因`);
+  expect(chunks[1]).toBe(last);
 });
 
 test("a sentence longer than the limit is cut on a clause boundary", () => {

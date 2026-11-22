@@ -409,11 +409,16 @@ request.
 
 Long replies are read in sentence-sized requests (`MAX_SPEECH_CHARS = 320` in
 `frontend/src/speech.ts`, packed on paragraph and sentence boundaries, with
-over-long sentences cut on clause marks or spaces). Each chunk is one
-`POST /api/v1/tts` call and plays as soon as it is synthesized; the next chunk
-is requested while the current one plays, so a long answer starts after one
-chunk instead of after the whole reply. Chunk object URLs are revoked as they
-finish. The button becomes **Stop reading / 停止朗读** the moment it is pressed
+over-long sentences cut on clause marks or spaces). Fragments shorter than
+`MIN_SPEECH_CHARS = 24` are folded into a neighbour: a two-character paragraph
+like `原因` is clipped speech and one of the least reliable synthesis requests.
+Each chunk is one `POST /api/v1/tts` call and plays as soon as it is
+synthesized; the next chunk is requested while the current one plays, so a long
+answer starts after one chunk instead of after the whole reply. A chunk that
+fails with a server/network error is retried once after 400 ms, so a transient
+synthesis blip does not end the reading; client errors are not retried. Chunk
+object URLs are revoked as they finish, and the service logs the synthesizer's
+reason when a chunk still fails. The button becomes **Stop reading / 停止朗读** the moment it is pressed
 (not when the first audio arrives); stopping aborts pending synthesis, pauses
 the current chunk and drops the remainder. **Read new replies aloud /
 自动朗读新回复** in Settings uses the same chunked path.
