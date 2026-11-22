@@ -836,6 +836,10 @@ export default function App() {
     900,
   );
   const [sending, setSending] = useState(false);
+  // True while the in-flight submission is a queueing one (steer into the
+  // running task or a queued edit re-delivery); drives the composer button's
+  // "sending" feedback.
+  const [queueing, setQueueing] = useState(false);
   const sendingRef = useRef(false);
   const sendingRevision = useRef(0);
   const localMessageSeq = useRef(0);
@@ -1837,6 +1841,12 @@ export default function App() {
   // the only way to queue a follow-up from the same field.
   const composerDraftReady = draft.trim().length > 0 || attachments.length > 0;
   const composerRunningSend = composerAbort && composerDraftReady;
+  // A steering send clears the draft immediately, so the running button would
+  // flip straight back to the bare Stop square with no acknowledgement of the
+  // click. While the queueing request is in flight show a spinner instead;
+  // once it lands the queued chip takes over and Stop stays the safe default.
+  const composerSteerPending =
+    composerAbort && sending && queueing && !composerDraftReady;
   const composerContinue =
     !busy &&
     status !== "closed" &&
@@ -2737,6 +2747,7 @@ export default function App() {
     sendingRevision.current++;
     sendingRef.current = false;
     setSending(false);
+    setQueueing(false);
     setLevels([]);
     setSeen(0);
     setError(initialSelectionError.current);
@@ -3751,6 +3762,7 @@ export default function App() {
     };
     sendingRef.current = true;
     setSending(true);
+    setQueueing(shouldQueue);
     updateDraft("");
     setError("");
     setInterrupted(false);
@@ -3820,6 +3832,7 @@ export default function App() {
       if (submission === sendingRevision.current) {
         sendingRef.current = false;
         setSending(false);
+        setQueueing(false);
       }
     }
   }
@@ -6639,24 +6652,28 @@ export default function App() {
                       // makes long-press-for-newline impossible. The button and
                       // the desktop Enter handler both call `submit()` instead.
                       type="button"
-                      className={`send-button${composerAbort && !composerRunningSend ? " composer-action-stop" : composerContinue ? " composer-action-continue" : ""}`}
+                      className={`send-button${composerSteerPending ? " composer-action-sending" : composerAbort && !composerRunningSend ? " composer-action-stop" : composerContinue ? " composer-action-continue" : ""}`}
                       aria-label={
-                        composerRunningSend
-                          ? t("send")
-                          : composerAbort
-                            ? t("abort")
-                            : composerContinue
-                              ? t("continue")
-                              : t("send")
+                        composerSteerPending
+                          ? t("sending")
+                          : composerRunningSend
+                            ? t("send")
+                            : composerAbort
+                              ? t("abort")
+                              : composerContinue
+                                ? t("continue")
+                                : t("send")
                       }
                       title={
-                        composerRunningSend
-                          ? t("send")
-                          : composerAbort
-                            ? t("abort")
-                            : composerContinue
-                              ? t("continue")
-                              : t("send")
+                        composerSteerPending
+                          ? t("sending")
+                          : composerRunningSend
+                            ? t("send")
+                            : composerAbort
+                              ? t("abort")
+                              : composerContinue
+                                ? t("continue")
+                                : t("send")
                       }
                       disabled={
                         (!localSlash && (loadingSession || connectionFailed)) ||
@@ -6667,7 +6684,8 @@ export default function App() {
                             attachments.length === 0) ||
                             !sessionId ||
                             sending ||
-                            uploading))
+                            uploading)) ||
+                        composerSteerPending
                       }
                       onClick={
                         composerAbort && !composerRunningSend
@@ -6675,7 +6693,13 @@ export default function App() {
                           : () => void submit()
                       }
                     >
-                      {composerAbort && !composerRunningSend ? (
+                      {composerSteerPending ? (
+                        <Loader2
+                          className="spin"
+                          size={17}
+                          aria-hidden="true"
+                        />
+                      ) : composerAbort && !composerRunningSend ? (
                         <span className="stop-indicator" aria-hidden="true" />
                       ) : composerContinue ? (
                         <Play size={17} aria-hidden="true" />

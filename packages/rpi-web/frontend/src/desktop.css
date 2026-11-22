@@ -1108,6 +1108,23 @@
     opacity: 1;
   }
 }
+/* Steering send in flight: same Send color while the queued chip has not
+   appeared yet; disabled so a fast second click cannot abort or double-send. */
+.workspace .send-button.composer-action-sending {
+  background: var(--text);
+  color: var(--bg);
+}
+.workspace .send-button.composer-action-sending:disabled {
+  background: var(--text);
+  color: var(--bg);
+  opacity: 0.85;
+}
+@media (hover: hover) {
+  .workspace .send-button.composer-action-sending:hover:not(:disabled) {
+    background: var(--text);
+    opacity: 0.85;
+  }
+}
 .start-project-chat {
   margin: 15px auto 0;
   font-size: 11px;
