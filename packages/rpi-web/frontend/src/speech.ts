@@ -10,6 +10,13 @@
 export const MAX_SPEECH_CHARS = 320;
 
 /**
+ * Very short utterances sound clipped and are the least reliable synthesis
+ * requests, so a fragment like "原因" joins its neighbour instead of becoming a
+ * request of its own.
+ */
+export const MIN_SPEECH_CHARS = 24;
+
+/**
  * Strip Markdown so only speakable prose remains.
  *
  * Code (fenced or inline), images, bare URLs, HTML, table pipes and list/heading
@@ -113,7 +120,28 @@ export function splitForSpeech(
     flush();
   }
   flush();
-  return chunks;
+  return mergeShortChunks(chunks, maxChars);
+}
+
+/** Fold fragments under `MIN_SPEECH_CHARS` into a neighbour, staying bounded. */
+function mergeShortChunks(chunks: string[], maxChars: number): string[] {
+  const merged: string[] = [];
+  for (const chunk of chunks) {
+    const previous = merged[merged.length - 1];
+    if (previous === undefined) {
+      merged.push(chunk);
+      continue;
+    }
+    const short =
+      previous.length < MIN_SPEECH_CHARS || chunk.length < MIN_SPEECH_CHARS;
+    const combined = `${previous}${joinSeparator(previous, chunk)}${chunk}`;
+    // Only merge a fragment when the result still fits one request; a short
+    // lone chunk is left alone rather than merged past the limit.
+    if (short && combined.length <= maxChars)
+      merged[merged.length - 1] = combined;
+    else merged.push(chunk);
+  }
+  return merged;
 }
 
 /** Latin text needs a space between sentences; CJK punctuation already pauses. */

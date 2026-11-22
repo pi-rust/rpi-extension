@@ -1546,24 +1546,11 @@ test("an older service with no host version keeps a single build pill", async ({
   await expect(page.locator(".brand-host-version")).toHaveCount(0);
 });
 
-test("read aloud speaks prose chunks in order and stops with the button", async ({
-  page,
-}) => {
-  const reply = [
-    "第一段说明。",
-    "",
-    "```ts",
-    "const answer = 42;",
-    "```",
-    "",
-    "第二段提到 [链接](https://example.com/docs)。",
-    "",
-    "第三段继续。",
-    "",
-    "第四段结束。",
-  ].join("\n");
-  // No media decoding in the test browser: a fake element records itself and
-  // lets the test drive chunk boundaries by calling `onended` itself.
+/**
+ * No media decoding in the test browser: a fake element records itself and the
+ * test drives chunk boundaries by calling `onended` itself.
+ */
+async function installFakeAudio(page: Page) {
   await page.addInitScript(() => {
     const scope = window as unknown as { __audios: FakeAudio[] };
     scope.__audios = [];
@@ -1580,6 +1567,40 @@ test("read aloud speaks prose chunks in order and stops with the button", async 
     }
     window.Audio = FakeAudio as unknown as typeof Audio;
   });
+}
+
+/** Finish the chunk that is currently "playing" so the loop asks for the next. */
+async function endCurrentChunk(page: Page) {
+  await page.evaluate(() =>
+    (
+      window as unknown as {
+        __audios: Array<{ onended?: (() => void) | null }>;
+      }
+    ).__audios
+      .at(-1)
+      ?.onended?.(),
+  );
+}
+
+test("read aloud speaks prose chunks in order and stops with the button", async ({
+  page,
+}) => {
+  // Every paragraph is long enough to stay its own request: fragments are
+  // merged by `splitForSpeech`, which this test must not rely on.
+  const reply = [
+    "第一段说明这条回复会被分成多段朗读，第一段到这里结束。",
+    "",
+    "```ts",
+    "const answer = 42;",
+    "```",
+    "",
+    "第二段提到 [链接](https://example.com/docs)，这一段也不会被省略。",
+    "",
+    "第三段继续补充一些内容，让每个分段的长度都超过最小请求阈值。",
+    "",
+    "第四段结束，这里再补一句话，保证这一段也足够长。",
+  ].join("\n");
+  await installFakeAudio(page);
   const spoken: string[] = [];
   await mockHost(page, {
     snapshotMessages: [
@@ -1613,13 +1634,13 @@ test("read aloud speaks prose chunks in order and stops with the button", async 
   ).toBeVisible();
   await expect.poll(() => spoken.length).toBeGreaterThanOrEqual(2);
   // The first request is prose only: no fenced code, links or URLs.
-  expect(spoken[0]).toContain("第一段说明");
+  expect(spoken[0]).toContain("第一段说明这条回复");
   expect(spoken[0]).not.toContain("const answer");
   expect(spoken[0]).not.toContain("```");
   expect(spoken[0].length).toBeLessThan(reply.length);
   const joined = spoken.join("\n");
   expect(joined).not.toContain("example.com");
-  expect(joined).toContain("第二段提到 链接。");
+  expect(joined).toContain("第二段提到 链接，这一段也不会被省略。");
   // One shared element carries every chunk: a new element per chunk would be
   // blocked by gesture-gated browsers ("play() ... user gesture").
   expect(
@@ -1644,6 +1665,58 @@ test("read aloud speaks prose chunks in order and stops with the button", async 
   await expect(
     page.getByRole("button", { name: "Read aloud", exact: true }),
   ).toBeVisible();
+});
+
+test("a transient synthesis failure is retried instead of ending the reading", async ({
+  page,
+}) => {
+  await installFakeAudio(page);
+  const reply = [
+    `${"第一段完整而且足够长的正文。".repeat(2)}`,
+    "",
+    `${"第二段完整而且足够长的正文。".repeat(2)}`,
+    "",
+    `${"第三段完整而且足够长的正文。".repeat(2)}`,
+  ].join("\n");
+  const bodies: string[] = [];
+  let attempts = 0;
+  await mockHost(page, {
+    snapshotMessages: [
+      {
+        entryId: "message-3",
+        role: "assistant",
+        content: [{ type: "text", text: reply }],
+        timestamp: 1_700_000_000_000,
+      },
+    ],
+  });
+  await page.route("**/api/v1/tts", async (route) => {
+    attempts += 1;
+    bodies.push((route.request().postDataJSON() as { text: string }).text);
+    // The second chunk fails once, then succeeds on the retry.
+    if (attempts === 2)
+      return route.fulfill({
+        status: 502,
+        json: { error: "TTS synthesis failed" },
+      });
+    return route.fulfill({
+      status: 200,
+      contentType: "audio/mpeg",
+      body: "chunk",
+    });
+  });
+  await page.goto("/");
+  await page.getByRole("button", { name: "Read aloud", exact: true }).click();
+  // The prefetched chunk failed and was re-requested with the same text.
+  await expect.poll(() => attempts).toBe(3);
+  expect(bodies[1]).toBe(bodies[2]);
+  // A recovered blip is not a failure: reading stays active and no banner shows.
+  await expect(
+    page.getByRole("button", { name: "Stop reading", exact: true }),
+  ).toBeVisible();
+  await expect(page.getByRole("alert")).toHaveCount(0);
+  await endCurrentChunk(page);
+  await expect.poll(() => attempts).toBe(4);
 });
 
 test("blocked autoplay explains the gesture instead of failing", async ({
