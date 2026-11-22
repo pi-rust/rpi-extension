@@ -765,7 +765,7 @@ test("Windows authored URLs survive Markdown URL safety and preview without OS n
     });
   });
   await page.reload({ waitUntil: "domcontentloaded" });
-  await page.getByRole("button", { name: "Windows", exact: true }).click();
+  // The preview's `?file=` link survives the reload and reopens by itself.
   await expect(preview(page).locator(".file-preview-path")).toContainText(
     "D:\\Work\\项目\\src\\a.ts",
   );
@@ -1431,6 +1431,82 @@ for (const width of [1280, 390])
     ]);
     expect(mock.unexpected).toEqual([]);
   });
+
+test("preview dialogs are addressable and stack in the URL", async ({
+  page,
+}) => {
+  const mock = await host(page, "[Docs](docs/notes.md)", project.path);
+  mock.files["docs/notes.md"] = ["# 需求文档", "", "[Next](sub/next.md)"].join(
+    "\n",
+  );
+  mock.files["docs/sub/next.md"] = "# 子页面";
+  await page.goto("/", { waitUntil: "domcontentloaded" });
+  const search = () => page.evaluate(() => location.search);
+  const stacked = () =>
+    page.getByRole("dialog", { name: "File preview", exact: true });
+  await page.getByRole("button", { name: "Docs", exact: true }).click();
+  await expect(
+    stacked().first().locator(".file-preview-markdown"),
+  ).toBeVisible();
+  // The open dialog names its file in the address bar.
+  await expect
+    .poll(async () => new URLSearchParams(await search()).get("file"))
+    .toBe("docs/notes.md");
+  // A relative link inside the rendered file opens its sibling, and the URL
+  // follows the top-most dialog.
+  await page.getByRole("button", { name: "Next", exact: true }).click();
+  await expect(stacked()).toHaveCount(2);
+  const nested = stacked().last();
+  await expect(nested.locator(".file-preview-path")).toContainText(
+    "/workspace/links/docs/sub/next.md",
+  );
+  await expect
+    .poll(async () => new URLSearchParams(await search()).get("file"))
+    .toBe("docs/sub/next.md");
+  // Escape closes only the top dialog and restores the parent's link; closing
+  // the parent then clears it.
+  await page.keyboard.press("Escape");
+  await expect(stacked()).toHaveCount(1);
+  await expect
+    .poll(async () => new URLSearchParams(await search()).get("file"))
+    .toBe("docs/notes.md");
+  await stacked()
+    .first()
+    .getByRole("button", { name: "Close", exact: true })
+    .click();
+  await expect(stacked()).toHaveCount(0);
+  await expect
+    .poll(async () => new URLSearchParams(await search()).get("file"))
+    .toBeNull();
+  expect(mock.unexpected).toEqual([]);
+});
+
+test("a file deep link reopens its preview", async ({ page }) => {
+  const mock = await host(page, "[Docs](docs/notes.md)", project.path);
+  mock.files["docs/notes.md"] = "# 深度链接";
+  await page.goto("/?session=links-session&file=docs%2Fnotes.md", {
+    waitUntil: "domcontentloaded",
+  });
+  const dialog = preview(page);
+  await expect(dialog).toBeVisible();
+  await expect(dialog.locator(".file-preview-markdown h1")).toHaveText(
+    "深度链接",
+  );
+  await expect(dialog.locator(".file-preview-path")).toContainText(
+    "/workspace/links/docs/notes.md",
+  );
+  expect(mock.reads.map((read) => read.path)).toContain("docs/notes.md");
+  // Closing a dialog that came from the URL clears the parameters, so a reload
+  // does not resurrect it.
+  await dialog.getByRole("button", { name: "Close", exact: true }).click();
+  await expect
+    .poll(() =>
+      page.evaluate(() => new URLSearchParams(location.search).get("file")),
+    )
+    .toBeNull();
+  await page.reload({ waitUntil: "domcontentloaded" });
+  await expect(preview(page)).toHaveCount(0);
+});
 
 test("workbook parsing keeps formats, dates and every sheet", async () => {
   const book = await readWorkbook(new Uint8Array(sheetBytes));

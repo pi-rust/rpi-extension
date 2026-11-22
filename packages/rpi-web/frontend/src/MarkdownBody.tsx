@@ -19,6 +19,7 @@ import { translate, type Language } from "./i18n";
 import { ZoomableImage } from "./ZoomableImage";
 import { MermaidBlock } from "./MermaidBlock";
 import { ProjectImageContext, projectImageSource } from "./projectImages";
+import { ProjectBaseContext } from "./projectBase";
 import { FilePreview } from "./FilePreview";
 import {
   browserLink,
@@ -130,6 +131,9 @@ export const MarkdownBody = memo(function MarkdownBody({
   streaming?: boolean;
 }) {
   const project = useContext(ProjectImageContext);
+  // A rendered file resolves relative links against its own directory; chat
+  // messages have no base and keep project-root semantics.
+  const base = useContext(ProjectBaseContext);
   const [preview, setPreview] = useState<{
     owner: string;
     file: ProjectFileLink;
@@ -155,7 +159,7 @@ export const MarkdownBody = memo(function MarkdownBody({
   const components = useMemo<Components>(
     () => ({
       a: ({ href, children, title }) => {
-        const file = href ? projectFileLink(href, project) : null;
+        const file = href ? projectFileLink(href, project, base) : null;
         if (file)
           return (
             <button
@@ -191,7 +195,7 @@ export const MarkdownBody = memo(function MarkdownBody({
       },
       code: ({ node, children, className }) => {
         const file = !node?.properties["data-block-code"]
-          ? inlineFileLink(codeText(children), project)
+          ? inlineFileLink(codeText(children), project, base)
           : null;
         return file ? (
           <button
@@ -236,7 +240,7 @@ export const MarkdownBody = memo(function MarkdownBody({
         );
       },
     }),
-    [language, project, owner],
+    [base, language, project, owner],
   );
 
   return (
@@ -249,7 +253,7 @@ export const MarkdownBody = memo(function MarkdownBody({
           if (node.tagName === "a" && key === "href") {
             // Native drive paths must be classified before defaultUrlTransform,
             // which treats a drive letter as an unknown protocol.
-            return projectFileLink(url, project) ||
+            return projectFileLink(url, project, base) ||
               browserLink(url) ||
               url.startsWith("#")
               ? url
@@ -257,7 +261,7 @@ export const MarkdownBody = memo(function MarkdownBody({
           }
           return imageUrlTransform(
             node.tagName === "img" && key === "src"
-              ? projectImageSource(url, project)
+              ? projectImageSource(url, project, base)
               : url,
             key,
             node,

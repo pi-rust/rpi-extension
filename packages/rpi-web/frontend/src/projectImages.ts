@@ -1,5 +1,6 @@
 import { createContext } from "react";
 import type { Project } from "./api";
+import type { ProjectBase } from "./projectBase";
 import {
   hiddenProjectComponent,
   isSiblingProjectPath,
@@ -11,11 +12,30 @@ export const ProjectImageContext = createContext<Project | undefined>(
   undefined,
 );
 
+/** Resolve `.`/`..` against a directory; `null` when it escapes the root. */
+function resolveUnderBase(dir: string, path: string): string | null {
+  const parts = dir.split("/").filter((part) => part && part !== ".");
+  for (const part of path.split("/")) {
+    if (!part || part === ".") continue;
+    if (part === "..") {
+      if (!parts.length) return null;
+      parts.pop();
+      continue;
+    }
+    parts.push(part);
+  }
+  return parts.length ? parts.join("/") : null;
+}
+
 export function isProjectImagePath(path: string): boolean {
   return /\.(?:png|jpe?g|gif|webp|bmp)$/i.test(path);
 }
 
-export function projectImageSource(source: string, project?: Project): string {
+export function projectImageSource(
+  source: string,
+  project?: Project,
+  base?: ProjectBase,
+): string {
   if (!project || !source || /^(?:data:|\/\/)/i.test(source)) return source;
   let path = source;
   if (/^https?:\/\//i.test(path)) {
@@ -58,6 +78,14 @@ export function projectImageSource(source: string, project?: Project): string {
     path = decodeURIComponent(path);
   } catch {
     return "";
+  }
+  // Inside a rendered file, `./chart.png` means next to that file. The caller's
+  // base wins over the project root and keeps the worktree identity.
+  if (base && !path.startsWith("/") && !/^[a-z]:[\\/]/i.test(path)) {
+    const resolved = resolveUnderBase(base.dir, path);
+    if (!resolved) return "";
+    path = resolved;
+    root = base.root;
   }
   path = path.replace(/^\//, "").replace(/^(?:\.\/)+/, "");
   if (/[\\:\0]/.test(path) || path.split("/").some((part) => part === ".."))
