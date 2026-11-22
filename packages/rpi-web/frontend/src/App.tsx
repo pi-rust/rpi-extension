@@ -843,35 +843,6 @@ export default function App() {
     900,
   );
   const [sending, setSending] = useState(false);
-  // True while the in-flight HTTP submission is a queueing one (steer into
-  // the running task or a queued edit re-delivery); drives the composer
-  // button's "sending" feedback until the request itself settles.
-  const [queueing, setQueueing] = useState(false);
-  // A steering message is only "sent" when the host delivers it and the
-  // user message is printed into the conversation, not when the queue
-  // accepts it. Track the pending delivery per session + text so the
-  // composer can keep acknowledging (spinner, still abortable) until the
-  // message_start event arrives, the queue read no longer lists the entry,
-  // or a stop/abort reclaims it.
-  const [steerPending, setSteerPending] = useState<{
-    sessionId: string;
-    text: string;
-    queuedAt: number;
-  } | null>(null);
-  // Mirror of steerPending for event callbacks that must match without
-  // re-rendering first (SSE delivery, queue reconciliation).
-  const steerPendingRef = useRef<{
-    sessionId: string;
-    text: string;
-    queuedAt: number;
-  } | null>(null);
-  // Brief "delivered" confirmation: a green check flashes in the composer
-  // button once the steering message is actually sent (printed into the
-  // conversation), then the button returns to the plain Stop square.
-  const [steerSent, setSteerSent] = useState<{ sessionId: string } | null>(
-    null,
-  );
-  const steerSentTimer = useRef<number | null>(null);
   const sendingRef = useRef(false);
   const sendingRevision = useRef(0);
   const localMessageSeq = useRef(0);
@@ -998,6 +969,29 @@ export default function App() {
   const [queueItems, setQueueItems] = useState<QueueItem[]>([]);
   const [queueOpen, setQueueOpen] = useState(true);
   const [queueRunning, setQueueRunning] = useState(false);
+  // "Send now" acknowledgement, scoped to the queue panel's per-entry send
+  // button (not the composer button): after the HTTP round trip the message
+  // is only sent once the run delivers it, so the entry's button keeps its
+  // spinner until the user message is printed (or the queue read stops
+  // listing the entry), then flashes a check for a moment.
+  const [sendNowPending, setSendNowPending] = useState<{
+    sessionId: string;
+    entryId: string;
+    text: string;
+    queuedAt: number;
+  } | null>(null);
+  // Mirror for event callbacks that must match without re-rendering first.
+  const sendNowPendingRef = useRef<{
+    sessionId: string;
+    entryId: string;
+    text: string;
+    queuedAt: number;
+  } | null>(null);
+  const [sendNowSent, setSendNowSent] = useState<{
+    sessionId: string;
+    entryId: string;
+  } | null>(null);
+  const sendNowSentTimer = useRef<number | null>(null);
   const pendingQueueItems = queueItems.filter((item) =>
     isEditableQueueItem(item),
   );
@@ -1867,23 +1861,23 @@ export default function App() {
     previouslyBusy.current = busy;
   }, [busy, refreshProjectRoots]);
   // Keep the mirror in sync after every render so callbacks reading
-  // steerPendingRef.current see the latest pending entry.
-  steerPendingRef.current = steerPending;
-  const markSteerSent = useCallback((sessionId: string) => {
-    setSteerPending(null);
-    steerPendingRef.current = null;
-    setSteerSent({ sessionId });
-    if (steerSentTimer.current !== null)
-      window.clearTimeout(steerSentTimer.current);
-    steerSentTimer.current = window.setTimeout(() => {
-      steerSentTimer.current = null;
-      setSteerSent(null);
+  // sendNowPendingRef.current see the latest pending entry.
+  sendNowPendingRef.current = sendNowPending;
+  const markSendNowSent = useCallback((sessionId: string, entryId: string) => {
+    setSendNowPending(null);
+    sendNowPendingRef.current = null;
+    setSendNowSent({ sessionId, entryId });
+    if (sendNowSentTimer.current !== null)
+      window.clearTimeout(sendNowSentTimer.current);
+    sendNowSentTimer.current = window.setTimeout(() => {
+      sendNowSentTimer.current = null;
+      setSendNowSent(null);
     }, 1600);
   }, []);
   useEffect(
     () => () => {
-      if (steerSentTimer.current !== null)
-        window.clearTimeout(steerSentTimer.current);
+      if (sendNowSentTimer.current !== null)
+        window.clearTimeout(sendNowSentTimer.current);
     },
     [],
   );
@@ -1894,32 +1888,6 @@ export default function App() {
   // the only way to queue a follow-up from the same field.
   const composerDraftReady = draft.trim().length > 0 || attachments.length > 0;
   const composerRunningSend = composerAbort && composerDraftReady;
-  // A steering send clears the draft immediately, so the running button would
-  // flip straight back to the bare Stop square with no acknowledgement of the
-  // click. Two phases keep the acknowledgement honest:
-  // 1. queueing — the enqueue request is in flight; show the spinner and
-  //    disable the button so a fast second click cannot abort or double-send.
-  // 2. steerPending — the queue accepted the message but the run has not
-  //    delivered it yet (no user message printed); keep the spinner and stay
-  //    on Abort: with an empty composer a click is a stop, never a send.
-  // It clears when the message_start event prints the user message, the
-  // queue read stops listing the entry, or a stop reclaims the draft.
-  const composerSteerWaiting =
-    composerAbort &&
-    !queueing &&
-    steerPending?.sessionId === sessionId &&
-    !composerDraftReady &&
-    !queueEditId;
-  const composerSteerPending =
-    composerAbort && sending && queueing && !composerDraftReady;
-  // Delivered confirmation: show a green check for a moment after the
-  // steering message is printed into the conversation, then fall back to
-  // the plain Stop square.
-  const composerSteerSent =
-    composerAbort &&
-    steerSent?.sessionId === sessionId &&
-    !composerDraftReady &&
-    !queueEditId;
   const composerContinue =
     !busy &&
     status !== "closed" &&
@@ -2219,14 +2187,12 @@ export default function App() {
                   )
                 : previous,
             );
-            // The steering acknowledgement ends here: the message is printed
-            // into the conversation, which is what "sent" means. The check
-            // confirmation is keyed to the session being viewed.
-            if (
-              steerPendingRef.current &&
-              steerPendingRef.current.text.trim() === text.trim()
-            )
-              markSteerSent(steerPendingRef.current.sessionId);
+            // The host just delivered this queued message: the send-now
+            // acknowledgement for it succeeds here (the message is printed
+            // into the conversation, which is what "sent" means).
+            const sentNow = sendNowPendingRef.current;
+            if (sentNow && sentNow.text.trim() === text.trim())
+              markSendNowSent(sentNow.sessionId, sentNow.entryId);
             const prefix = `u${seq}`;
             currentUser.current = prefix;
             const initial = rowsFromUser(event.message, prefix);
@@ -2832,10 +2798,9 @@ export default function App() {
     sendingRevision.current++;
     sendingRef.current = false;
     setSending(false);
-    setQueueing(false);
-    setSteerPending(null);
-    steerPendingRef.current = null;
-    setSteerSent(null);
+    setSendNowPending(null);
+    sendNowPendingRef.current = null;
+    setSendNowSent(null);
     setLevels([]);
     setSeen(0);
     setError(initialSelectionError.current);
@@ -3274,26 +3239,24 @@ export default function App() {
             ? previous.filter(isEditableQueueItem)
             : items,
         );
-        // A queued steering message disappears from the host's list exactly
-        // when it is delivered to the run. If the message_start event was
-        // missed (tool-batch steering can emit no user event at this client),
-        // the queue read is the recovery signal that ends the acknowledgement
-        // and flashes the sent check. The grace period keeps a read that
-        // raced the enqueue (and can still lag the fresh entry) from ending
-        // the acknowledgement early.
-        const mirrored = steerPendingRef.current;
+        // A "send now" entry disappears from the host's list exactly when it
+        // is delivered to the run. If the message_start event was missed, the
+        // queue read is the recovery signal that ends the wait and flashes
+        // the sent check; the grace period keeps a read that raced the
+        // enqueue from ending the acknowledgement before the host lists it.
+        const pendingNow = sendNowPendingRef.current;
         if (
-          mirrored &&
-          mirrored.sessionId === id &&
-          Date.now() - mirrored.queuedAt > 2_000 &&
+          pendingNow &&
+          pendingNow.sessionId === id &&
+          Date.now() - pendingNow.queuedAt > 2_000 &&
           !queueSubmission.current.has(id) &&
           !items.some(
             (item) =>
-              (item.text ?? "").trim() === mirrored.text.trim() &&
+              (item.text ?? "").trim() === pendingNow.text.trim() &&
               item.status === "queued",
           )
         )
-          markSteerSent(mirrored.sessionId);
+          markSendNowSent(pendingNow.sessionId, pendingNow.entryId);
       } catch (cause) {
         // A revoked session must log out exactly like any other read.
         if (cause instanceof ApiError && cause.status === 401) {
@@ -3870,7 +3833,6 @@ export default function App() {
     };
     sendingRef.current = true;
     setSending(true);
-    setQueueing(shouldQueue);
     updateDraft("");
     setError("");
     setInterrupted(false);
@@ -3888,10 +3850,6 @@ export default function App() {
     try {
       if (shouldQueue) {
         if (!supported.has("queue_message")) throw new Error(t("runBusy"));
-        // Hold the in-flight-enqueue marker so a concurrent queue read treats
-        // this session like the panel's own send: the host's list may lag the
-        // optimistic row until the command returns.
-        queueSubmission.current.add(targetSession);
         if (editingQueueId)
           await api.cancelQueued(targetSession, editingQueueId);
         const queued = await api.queueMessage(
@@ -3909,14 +3867,6 @@ export default function App() {
               status: "queued",
             },
           ]);
-          // The queue has accepted the message, but it is only sent once the
-          // run delivers it and the user message is printed. Keep tracking it
-          // so the composer acknowledgement outlives the HTTP round trip.
-          setSteerPending({
-            sessionId: targetSession,
-            text: submissionMessage,
-            queuedAt: Date.now(),
-          });
           setQueueEditId(null);
           void refreshDiagnostics(targetSession);
         }
@@ -3949,11 +3899,9 @@ export default function App() {
         setError(errorText(cause));
       }
     } finally {
-      queueSubmission.current.delete(targetSession);
       if (submission === sendingRevision.current) {
         sendingRef.current = false;
         setSending(false);
-        setQueueing(false);
       }
     }
   }
@@ -4338,6 +4286,14 @@ export default function App() {
             ]
           : []),
       ]);
+      // The HTTP round trip only accepted the message; keep this entry's
+      // button spinning until the run delivers it and the message is printed.
+      setSendNowPending({
+        sessionId: targetSession,
+        entryId: item.entryId,
+        text: item.text.trim(),
+        queuedAt: Date.now(),
+      });
       if (!running)
         await commandData(targetSession, "prompt", {
           message: item.text.trim(),
@@ -4353,6 +4309,8 @@ export default function App() {
       );
       setRunActive(priorActive);
       setError(errorText(cause));
+      setSendNowPending(null);
+      sendNowPendingRef.current = null;
       await refreshDiagnostics(targetSession);
     } finally {
       queueRunSubmission.current.delete(targetSession);
@@ -4602,11 +4560,11 @@ export default function App() {
       // messages back (`steer` + `followUp`). Dropping that reply is what made
       // staged input disappear after a stop, so put it back in the composer.
       const reclaimed = [...(result.steer ?? []), ...(result.followUp ?? [])];
-      // A stop drains the native queue; a pending steering acknowledgement has
-      // nothing left to wait for (the reclaim puts the text back in the draft).
-      setSteerPending(null);
-      steerPendingRef.current = null;
-      setSteerSent(null);
+      // A stop drains the native queue: a pending send-now acknowledgement has
+      // nothing left to wait for.
+      setSendNowPending(null);
+      sendNowPendingRef.current = null;
+      setSendNowSent(null);
       if (reclaimed.length === 0) return;
       const queuedText = reclaimed
         .map((message) => message.text ?? "")
@@ -4629,9 +4587,9 @@ export default function App() {
       setError(errorText(cause));
       // A trampled abort reply can still have drained the native queue, so read
       // the host's list instead of showing rows that may already be gone.
-      setSteerPending(null);
-      steerPendingRef.current = null;
-      setSteerSent(null);
+      setSendNowPending(null);
+      sendNowPendingRef.current = null;
+      setSendNowSent(null);
       if (targetSession === activeSessionRef.current)
         void refreshQueue(targetSession);
     }
@@ -5113,6 +5071,13 @@ export default function App() {
               <ListTodo size={14} /> {t("queue")}
             </span>
             <span className="panel-heading-actions">
+              {sendNowSent?.sessionId === sessionId && (
+                <Check
+                  size={14}
+                  className="queue-send-now-sent-check"
+                  aria-label={t("sentNow")}
+                />
+              )}
               <strong>{queueItems.length}</strong>
               {actions.has("queue_status") && (
                 <button
@@ -5156,13 +5121,30 @@ export default function App() {
                     supported.has("cancel_queued") && (
                       <button
                         type="button"
-                        className="icon-button queue-send-now"
+                        className={`icon-button queue-send-now${
+                          sendNowSent?.entryId === item.entryId &&
+                          sendNowSent?.sessionId === sessionId
+                            ? " queue-send-now-sent"
+                            : ""
+                        }`}
                         title={t("sendNow")}
                         aria-label={`${t("sendNow")}: ${item.text}`}
                         onClick={() => void sendQueuedNow(item.entryId)}
-                        disabled={queueRunning}
+                        disabled={
+                          queueRunning ||
+                          (sendNowPending?.entryId === item.entryId &&
+                            sendNowPending?.sessionId === sessionId) ||
+                          (sendNowSent?.entryId === item.entryId &&
+                            sendNowSent?.sessionId === sessionId)
+                        }
                       >
-                        {queueRunning ? (
+                        {sendNowPending?.entryId === item.entryId &&
+                        sendNowPending?.sessionId === sessionId ? (
+                          <Loader2 size={13} className="spin" />
+                        ) : sendNowSent?.entryId === item.entryId &&
+                          sendNowSent?.sessionId === sessionId ? (
+                          <Check size={13} />
+                        ) : queueRunning ? (
                           <Loader2 size={13} className="spin" />
                         ) : (
                           <Play size={13} />
@@ -6558,15 +6540,33 @@ export default function App() {
                               supported.has("cancel_queued") && (
                                 <button
                                   type="button"
-                                  className="icon-button queue-send-now"
+                                  className={`icon-button queue-send-now${
+                                    sendNowSent?.entryId === item.entryId &&
+                                    sendNowSent?.sessionId === sessionId
+                                      ? " queue-send-now-sent"
+                                      : ""
+                                  }`}
                                   aria-label={`${t("sendNow")}: ${item.text}`}
                                   title={t("sendNow")}
                                   onClick={() =>
                                     void sendQueuedNow(item.entryId)
                                   }
-                                  disabled={queueRunning}
+                                  disabled={
+                                    queueRunning ||
+                                    (sendNowPending?.entryId === item.entryId &&
+                                      sendNowPending?.sessionId ===
+                                        sessionId) ||
+                                    (sendNowSent?.entryId === item.entryId &&
+                                      sendNowSent?.sessionId === sessionId)
+                                  }
                                 >
-                                  {queueRunning ? (
+                                  {sendNowPending?.entryId === item.entryId &&
+                                  sendNowPending?.sessionId === sessionId ? (
+                                    <Loader2 size={13} className="spin" />
+                                  ) : sendNowSent?.entryId === item.entryId &&
+                                    sendNowSent?.sessionId === sessionId ? (
+                                    <Check size={13} />
+                                  ) : queueRunning ? (
                                     <Loader2 size={13} className="spin" />
                                   ) : (
                                     <Play size={13} />
@@ -6791,32 +6791,24 @@ export default function App() {
                       // makes long-press-for-newline impossible. The button and
                       // the desktop Enter handler both call `submit()` instead.
                       type="button"
-                      className={`send-button${composerSteerSent ? " composer-action-sent" : composerSteerPending || composerSteerWaiting ? " composer-action-sending" : composerAbort && !composerRunningSend ? " composer-action-stop" : composerContinue ? " composer-action-continue" : ""}`}
+                      className={`send-button${composerAbort && !composerRunningSend ? " composer-action-stop" : composerContinue ? " composer-action-continue" : ""}`}
                       aria-label={
-                        composerSteerSent
-                          ? t("sent")
-                          : composerSteerPending || composerSteerWaiting
-                            ? t("sending")
-                            : composerRunningSend
-                              ? t("send")
-                              : composerAbort
-                                ? t("abort")
-                                : composerContinue
-                                  ? t("continue")
-                                  : t("send")
+                        composerRunningSend
+                          ? t("send")
+                          : composerAbort
+                            ? t("abort")
+                            : composerContinue
+                              ? t("continue")
+                              : t("send")
                       }
                       title={
-                        composerSteerSent
-                          ? t("sent")
-                          : composerSteerPending || composerSteerWaiting
-                            ? t("sending")
-                            : composerRunningSend
-                              ? t("send")
-                              : composerAbort
-                                ? t("abort")
-                                : composerContinue
-                                  ? t("continue")
-                                  : t("send")
+                        composerRunningSend
+                          ? t("send")
+                          : composerAbort
+                            ? t("abort")
+                            : composerContinue
+                              ? t("continue")
+                              : t("send")
                       }
                       disabled={
                         (!localSlash && (loadingSession || connectionFailed)) ||
@@ -6827,9 +6819,7 @@ export default function App() {
                             attachments.length === 0) ||
                             !sessionId ||
                             sending ||
-                            uploading)) ||
-                        composerSteerPending ||
-                        composerSteerSent
+                            uploading))
                       }
                       onClick={
                         composerAbort && !composerRunningSend
@@ -6837,15 +6827,7 @@ export default function App() {
                           : () => void submit()
                       }
                     >
-                      {composerSteerSent ? (
-                        <Check size={17} aria-hidden="true" />
-                      ) : composerSteerPending || composerSteerWaiting ? (
-                        <Loader2
-                          className="spin"
-                          size={17}
-                          aria-hidden="true"
-                        />
-                      ) : composerAbort && !composerRunningSend ? (
+                      {composerAbort && !composerRunningSend ? (
                         <span className="stop-indicator" aria-hidden="true" />
                       ) : composerContinue ? (
                         <Play size={17} aria-hidden="true" />
