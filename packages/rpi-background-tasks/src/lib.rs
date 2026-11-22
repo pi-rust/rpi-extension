@@ -2488,8 +2488,21 @@ mod tests {
         // The caller's own row is stoppable, and the cancel persists.
         let allowed = run_command(&format!("kill {mine_id}"));
         assert!(allowed.contains("Stopped job"), "{allowed}");
+        // Force the legal cross-owner interleaving that made this test flaky.
+        persist_snapshot("other-session").unwrap();
         let appends = host().lock().unwrap().appends.clone();
-        let last = appends.last().expect("the cancel must persist a snapshot");
+        // Another session's asynchronous writer may append after our kill.
+        // Inspect the latest snapshot containing our job, not the globally
+        // last append, which is allowed to describe only the other owner.
+        let last = appends
+            .iter()
+            .rev()
+            .find(|snapshot| {
+                snapshot["jobs"]
+                    .as_array()
+                    .is_some_and(|jobs| jobs.iter().any(|job| job["id"] == json!(mine_id)))
+            })
+            .expect("the cancel must persist an owning-session snapshot");
         assert!(
             last["jobs"]
                 .as_array()
