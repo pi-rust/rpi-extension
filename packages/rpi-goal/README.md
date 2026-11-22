@@ -104,6 +104,50 @@ not manage the parent's goal, and their turns are not counted against it.
 `/goal resume` from any stopped state rotates the goal id and resets the safety
 epoch; resuming a waiting goal keeps its id.
 
+## Completion verification (host bridge)
+
+Embedding hosts can verify a goal's completion claim externally and record the
+outcome through a hidden command face. The seven states are untouched: a verdict
+is a *record* plus, for a rejection, a queued direction for the existing
+continuation worker — nothing here reworks the state machine.
+
+```
+/goal _verify-result {"goalId": "<16-hex>", "outcome": "pass"}
+/goal _verify-result {"goalId": "<16-hex>", "outcome": "notSatisfied",
+                      "reason": "tests were never run",
+                      "nextAction": "Run the test suite and fix the failures"}
+```
+
+- `notSatisfied` requires `nextAction`. The verdict is appended to the goal's
+  bounded `verifications` row (50 rows, 2,000-char fields), and `nextAction` is
+  queued as the goal's pending next action.
+- If the goal was still active, it stays active. A real `goal_wait` (status
+  still `active` plus a `waiting` field, with or without a deadline) is
+  released: the verdict is exactly the external input the goal waited for, so
+  the wait clears, the active clock restarts, and the next action dispatches.
+- If the model itself had archived the goal (`goal_complete`, the legacy
+  `goal` tool's `complete` action, or `goal_blocked`),
+  it is reopened with a fresh id — stale terminal tools and stale verdicts for
+  the old id fail. A goal the user stopped (`/goal stop` and its aliases) is
+  **never** reopened: the verdict is recorded as history and the notice says
+  so. Archived rows carry their termination source (`terminatedBy`:
+  `modelCompleted` / `modelBlocked` / `userStop`); a legacy row without one is
+  treated as a user stop, and only an explicit new/resumed goal continues.
+- The continuation worker dispatches the queued next action at the next wake,
+  never into a live run; the run prompt quotes the verdict as untrusted task
+  data. Each queued action is versioned, and a run's fold-back consumes only the
+  version it actually served — a verdict arriving while an older verdict run is
+  in flight survives and is dispatched next.
+- If the goal is stopped (`paused`/`usage_limited`/`budget_limited`), the
+  verdict and next action are recorded and wait for `/goal resume`. Explicit
+  pause cancels any previous wait; a rejection cannot undo the pause.
+- `pass` records only. It supersedes and clears any queued next action (even
+  while paused) and never starts or wakes a run; on an archived goal it leaves
+  the goal archived. Hosts must not submit obsolete pass results expecting
+  them to leave a newer queued rejection untouched.
+- Nothing in the plugin produces verdicts. Without an embedding host calling
+  `_verify-result`, behavior is exactly the plain 0.3 loop.
+
 ## Settings
 
 `~/.rpi/agent/goal.json` (`RPI_CODING_AGENT_DIR` overrides the directory):
