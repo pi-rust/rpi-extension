@@ -52,6 +52,7 @@ import {
   X,
 } from "lucide-react";
 import { useInstallApp } from "./installApp";
+import { speakableText, splitForSpeech } from "./speech";
 import { MarkdownBody } from "./MarkdownBody";
 import { ShellCommand } from "./ShellCommand";
 import { SessionAnswerBadge, SessionIssueBadge } from "./SessionIssueBadge";
@@ -1517,6 +1518,39 @@ export default function App() {
     ttsUrl.current = null;
     setReadingRowId(null);
   }, []);
+  /**
+   * Play one synthesized chunk and resolve when it ends or the run is
+   * cancelled. Every chunk owns its object URL, so memory is released as soon
+   * as the browser is done with it.
+   */
+  const playSpeech = useCallback(
+    (blob: Blob, signal: AbortSignal) =>
+      new Promise<void>((resolve, reject) => {
+        const url = URL.createObjectURL(blob);
+        const audio = new Audio(url);
+        ttsUrl.current = url;
+        ttsAudio.current = audio;
+        const cancel = () => {
+          audio.pause();
+          settle();
+        };
+        const settle = (error?: unknown) => {
+          audio.onended = null;
+          audio.onerror = null;
+          signal.removeEventListener("abort", cancel);
+          if (ttsAudio.current === audio) ttsAudio.current = null;
+          if (ttsUrl.current === url) ttsUrl.current = null;
+          URL.revokeObjectURL(url);
+          if (error) reject(error);
+          else resolve();
+        };
+        audio.onended = () => settle();
+        audio.onerror = () => settle(new Error("audio playback failed"));
+        signal.addEventListener("abort", cancel, { once: true });
+        void audio.play().catch(settle);
+      }),
+    [],
+  );
   const speakMessage = useCallback(
     async (rowId: string, text: string) => {
       if (readingRowId === rowId) {
@@ -1524,27 +1558,38 @@ export default function App() {
         return;
       }
       stopReading();
+      // Only prose is spoken, and only a sentence or two per request: the first
+      // chunk can start playing while later chunks are still being synthesized.
+      const chunks = splitForSpeech(speakableText(text));
+      if (chunks.length === 0) {
+        note(translate(language, "nothingToRead"));
+        return;
+      }
       const controller = new AbortController();
       ttsAbort.current = controller;
+      // Show Stop immediately: the first chunk must not look like a dead button.
+      setReadingRowId(rowId);
+      const voice =
+        language === "zh" ? "zh-CN-XiaoxiaoNeural" : "en-US-AriaNeural";
+      const fetchChunk = (index: number) =>
+        api.tts(chunks[index], voice, controller.signal);
+      let next = fetchChunk(0);
       try {
-        const voice =
-          language === "zh" ? "zh-CN-XiaoxiaoNeural" : "en-US-AriaNeural";
-        const blob = await api.tts(text, voice, controller.signal);
-        if (controller.signal.aborted) return;
-        const url = URL.createObjectURL(blob);
-        const audio = new Audio(url);
-        ttsUrl.current = url;
-        ttsAudio.current = audio;
-        setReadingRowId(rowId);
-        audio.onended = stopReading;
-        audio.onerror = stopReading;
-        await audio.play();
+        for (let index = 0; index < chunks.length; index += 1) {
+          const blob = await next;
+          if (controller.signal.aborted) return;
+          // Keep one chunk of synthesis ahead of playback.
+          if (index + 1 < chunks.length) next = fetchChunk(index + 1);
+          await playSpeech(blob, controller.signal);
+          if (controller.signal.aborted) return;
+        }
       } catch (cause) {
         if (!controller.signal.aborted) setError(errorText(cause));
-        stopReading();
+      } finally {
+        if (ttsAbort.current === controller) stopReading();
       }
     },
-    [language, readingRowId, stopReading],
+    [language, note, playSpeech, readingRowId, stopReading],
   );
   useEffect(() => {
     try {
@@ -2406,13 +2451,7 @@ export default function App() {
     };
     window.addEventListener("keydown", keydown);
     return () => window.removeEventListener("keydown", keydown);
-  }, [
-    createSession,
-    authChecked,
-    authRequired,
-    authenticated,
-    sessionId,
-  ]);
+  }, [createSession, authChecked, authRequired, authenticated, sessionId]);
 
   useEffect(() => {
     if (!authChecked || (authRequired && !authenticated)) return;
@@ -6500,7 +6539,13 @@ export default function App() {
                   </div>
                   <div className="composer-controls">
                     <button
-                      type={composerRunningSend ? "submit" : composerAbort ? "button" : "submit"}
+                      type={
+                        composerRunningSend
+                          ? "submit"
+                          : composerAbort
+                            ? "button"
+                            : "submit"
+                      }
                       className={`send-button${composerAbort && !composerRunningSend ? " composer-action-stop" : composerContinue ? " composer-action-continue" : ""}`}
                       aria-label={
                         composerRunningSend

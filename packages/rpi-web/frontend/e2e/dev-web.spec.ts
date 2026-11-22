@@ -1546,6 +1546,99 @@ test("an older service with no host version keeps a single build pill", async ({
   await expect(page.locator(".brand-host-version")).toHaveCount(0);
 });
 
+test("read aloud speaks prose chunks in order and stops with the button", async ({
+  page,
+}) => {
+  const reply = [
+    "第一段说明。",
+    "",
+    "```ts",
+    "const answer = 42;",
+    "```",
+    "",
+    "第二段提到 [链接](https://example.com/docs)。",
+    "",
+    "第三段继续。",
+    "",
+    "第四段结束。",
+  ].join("\n");
+  // No media decoding in the test browser: a fake element records itself and
+  // lets the test drive chunk boundaries by calling `onended` itself.
+  await page.addInitScript(() => {
+    const scope = window as unknown as { __audios: FakeAudio[] };
+    scope.__audios = [];
+    class FakeAudio {
+      onended: (() => void) | null = null;
+      onerror: (() => void) | null = null;
+      constructor() {
+        scope.__audios.push(this);
+      }
+      play() {
+        return Promise.resolve();
+      }
+      pause() {}
+    }
+    window.Audio = FakeAudio as unknown as typeof Audio;
+  });
+  const spoken: string[] = [];
+  await mockHost(page, {
+    snapshotMessages: [
+      {
+        entryId: "message-3",
+        role: "assistant",
+        content: [{ type: "text", text: reply }],
+        timestamp: 1_700_000_000_000,
+      },
+    ],
+  });
+  await page.route("**/api/v1/tts", async (route) => {
+    const body = route.request().postDataJSON() as { text: string };
+    spoken.push(body.text);
+    return route.fulfill({
+      status: 200,
+      contentType: "audio/mpeg",
+      body: "chunk",
+    });
+  });
+  await page.goto("/");
+  const read = page.getByRole("button", {
+    name: "Read aloud",
+    exact: true,
+  });
+  await expect(read).toBeVisible();
+  await read.click();
+  // The button reflects the run immediately, before any audio exists.
+  await expect(
+    page.getByRole("button", { name: "Stop reading", exact: true }),
+  ).toBeVisible();
+  await expect.poll(() => spoken.length).toBeGreaterThanOrEqual(2);
+  // The first request is prose only: no fenced code, links or URLs.
+  expect(spoken[0]).toContain("第一段说明");
+  expect(spoken[0]).not.toContain("const answer");
+  expect(spoken[0]).not.toContain("```");
+  expect(spoken[0].length).toBeLessThan(reply.length);
+  const joined = spoken.join("\n");
+  expect(joined).not.toContain("example.com");
+  expect(joined).toContain("第二段提到 链接。");
+  // Stopping freezes the queue even if the browser reports another end.
+  await page.getByRole("button", { name: "Stop reading", exact: true }).click();
+  const stopped = spoken.length;
+  await page.evaluate(() =>
+    (
+      window as unknown as {
+        __audios: Array<{ onended?: (() => void) | null }>;
+      }
+    ).__audios
+      .at(-1)
+      ?.onended?.(),
+  );
+  await page.waitForTimeout(200);
+  expect(spoken.length).toBe(stopped);
+  await expect(
+    page.getByRole("button", { name: "Read aloud", exact: true }),
+  ).toBeVisible();
+});
+
 test("details jump is right-aligned in the slim metrics strip (#306)", async ({
   page,
 }) => {
@@ -2061,7 +2154,8 @@ test.describe("touch composer", () => {
       // Enter is a newline on touch, so nothing is queued. The synthetic
       // beforeinput cases only check that the default is not prevented;
       // dispatching them does not perform the browser's native insertion.
-      if (sendVia === "Enter") await expect(input).toHaveValue("继续补充需求\n");
+      if (sendVia === "Enter")
+        await expect(input).toHaveValue("继续补充需求\n");
       await expect.poll(() => queued).toEqual([]);
       // The main button is the explicit send entry point.
       await sendButton.click();
@@ -3901,9 +3995,7 @@ test("streaming thinking does not resize the transcript", async ({ page }) => {
   ).toBe(viewportHeight);
   const viewport = row.locator(".thinking-row-viewport");
   expect(
-    await viewport.evaluate(
-      (node) => node.scrollHeight > node.clientHeight,
-    ),
+    await viewport.evaluate((node) => node.scrollHeight > node.clientHeight),
   ).toBe(true);
   // The visual focus follows newly streamed text to the bottom.
   await expect
@@ -3918,9 +4010,7 @@ test("streaming thinking does not resize the transcript", async ({ page }) => {
     node.scrollTop = 0;
     node.dispatchEvent(new Event("scroll", { bubbles: true }));
   });
-  await expect
-    .poll(() => viewport.evaluate((node) => node.scrollTop))
-    .toBe(0);
+  await expect.poll(() => viewport.evaluate((node) => node.scrollTop)).toBe(0);
   await viewport.evaluate((node) => {
     node.scrollTop = node.scrollHeight;
     node.dispatchEvent(new Event("scroll", { bubbles: true }));

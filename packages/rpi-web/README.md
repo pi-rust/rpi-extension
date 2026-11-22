@@ -397,6 +397,27 @@ rpi-web --project /work/project-a --add-project /work/project-b --add-project /w
 
 Sessions are grouped by project. New sessions use the selected project as the tools' working directory; forks and clones retain their source project. Session menus support rename, tags, pin, archive, and restore. Archiving retains history and does not cancel a running task. Sidebar search filters project names, session titles, tags, and ids; tag and status selectors provide narrower views.
 
+### Read aloud
+
+Every assistant reply has a **Read aloud / 朗读** action. It speaks the prose,
+not the markup: fenced code (including unterminated fences), inline code,
+images, bare URLs and autolinks, HTML and table pipes are stripped before
+synthesis, headings/list/quote markers and emphasis markers keep only their
+words, and links keep their label. A reply that is nothing but code reports
+**Nothing to read aloud / 没有可朗读的内容** instead of starting a silent
+request.
+
+Long replies are read in sentence-sized requests (`MAX_SPEECH_CHARS = 320` in
+`frontend/src/speech.ts`, packed on paragraph and sentence boundaries, with
+over-long sentences cut on clause marks or spaces). Each chunk is one
+`POST /api/v1/tts` call and plays as soon as it is synthesized; the next chunk
+is requested while the current one plays, so a long answer starts after one
+chunk instead of after the whole reply. Chunk object URLs are revoked as they
+finish. The button becomes **Stop reading / 停止朗读** the moment it is pressed
+(not when the first audio arrives); stopping aborts pending synthesis, pauses
+the current chunk and drops the remainder. **Read new replies aloud /
+自动朗读新回复** in Settings uses the same chunked path.
+
 ### Message-linked image previews
 
 Click a project file link in a message to open a read-only preview. Raster image
