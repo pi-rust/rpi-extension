@@ -753,7 +753,14 @@ export default function App() {
   const [sessionId, setSessionId] = useState("");
   const [timelineOpen, setTimelineOpen] = useState(false);
   const [immersive, setImmersive] = useState(false);
-  const isMobileViewport = () => window.matchMedia("(pointer: coarse)").matches;
+  const isMobileViewport = () =>
+    window.matchMedia("(pointer: coarse)").matches ||
+    // A coarse pointer is the reliable signal, but some Android browsers report
+    // a fine pointer (desktop or stylus modes) while still running on a phone.
+    // Their soft keyboard must insert newlines instead of sending.
+    /Android|iPhone|iPad|iPod|Mobile|HarmonyOS|HuaweiBrowser/i.test(
+      navigator.userAgent,
+    );
   // Mobile keeps the whole page visible (including the composer) and only
   // asks the browser to hide its own chrome. Desktop keeps the CSS immersive
   // reading mode; the two paths are deliberately independent.
@@ -6564,6 +6571,9 @@ export default function App() {
                   disabled={!sessionId}
                   aria-label={t("sendPlaceholder")}
                   aria-keyshortcuts="Shift+Enter"
+                  // Tell soft keyboards this field takes newlines; a "send"
+                  // hint makes long-press Enter send instead of breaking lines.
+                  enterKeyHint={isMobileViewport() ? "enter" : undefined}
                 />
                 <div className="composer-footer">
                   <div className="composer-options">
@@ -6624,13 +6634,11 @@ export default function App() {
                   </div>
                   <div className="composer-controls">
                     <button
-                      type={
-                        composerRunningSend
-                          ? "submit"
-                          : composerAbort
-                            ? "button"
-                            : "submit"
-                      }
+                      // Never `submit`: an implicit form submit turns a soft
+                      // keyboard's Enter into "send" on some Android IMEs, which
+                      // makes long-press-for-newline impossible. The button and
+                      // the desktop Enter handler both call `submit()` instead.
+                      type="button"
                       className={`send-button${composerAbort && !composerRunningSend ? " composer-action-stop" : composerContinue ? " composer-action-continue" : ""}`}
                       aria-label={
                         composerRunningSend
@@ -6664,7 +6672,7 @@ export default function App() {
                       onClick={
                         composerAbort && !composerRunningSend
                           ? () => void abort()
-                          : undefined
+                          : () => void submit()
                       }
                     >
                       {composerAbort && !composerRunningSend ? (

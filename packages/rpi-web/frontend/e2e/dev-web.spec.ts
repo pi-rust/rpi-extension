@@ -2197,8 +2197,60 @@ test("a message typed during a run queues as a follow-up without a kind selector
     .toEqual([{ message: "Change course now", deliverAs: "followUp" }]);
 });
 
+test.describe("huawei browser that reports a fine pointer", () => {
+  // HuaweiBrowser can advertise a desktop-like pointer while running on a phone;
+  // the UA still marks it as mobile so Enter keeps newline semantics.
+  test.use({
+    userAgent:
+      "Mozilla/5.0 (Linux; Android 12; ELS-AN00) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/114.0.0.0 Mobile Safari/537.36 HuaweiBrowser/14.0.0.302",
+  });
+
+  test("Enter inserts a newline instead of sending", async ({ page }) => {
+    await mockHost(page);
+    const commands: string[] = [];
+    await page.route(
+      `**/api/v1/sessions/${sessionId}/commands`,
+      async (route) => {
+        commands.push(route.request().postDataJSON().type);
+        return route.fallback();
+      },
+    );
+    await page.setViewportSize({ width: 390, height: 844 });
+    await page.goto("/");
+    const input = page.getByRole("textbox", {
+      name: "Send a prompt, or type / for commands…",
+    });
+    await input.fill("继续补充需求");
+    await input.press("Enter");
+    await expect(input).toHaveValue("继续补充需求\n");
+    expect(commands).not.toContain("prompt");
+    // The send button is still the explicit way to send.
+    await page
+      .getByRole("button", { name: "Send message", exact: true })
+      .click();
+    await expect.poll(() => commands).toContain("prompt");
+  });
+});
+
 test.describe("touch composer", () => {
   test.use({ hasTouch: true });
+
+  test("composer never offers an implicit submit on touch", async ({
+    page,
+  }) => {
+    await mockHost(page);
+    await page.goto("/");
+    // A submit button turns some Android IMEs' Enter into "send", which makes
+    // long-press-for-newline impossible; the send button is type=button.
+    await expect(
+      page.locator('form.composer-area button[type="submit"]'),
+    ).toHaveCount(0);
+    const input = page.getByRole("textbox", {
+      name: "Send a prompt, or type / for commands…",
+    });
+    // Soft keyboards should show a newline key, not a send key.
+    await expect(input).toHaveAttribute("enterkeyhint", "enter");
+  });
 
   for (const sendVia of ["Enter", "insertLineBreak", "insertParagraph"]) {
     test(`touch ${sendVia} inserts a newline while a task is running`, async ({
