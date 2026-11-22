@@ -2295,7 +2295,7 @@ test("a steering send shows a sending spinner until the queue accepts it", async
   await expect(sendingButton.locator("svg.spin")).toBeVisible();
 });
 
-test("the steering acknowledgement ends when the message is delivered", async ({
+test("the steering acknowledgement ends in a sent check when delivered", async ({
   page,
 }) => {
   await mockHost(page);
@@ -2386,10 +2386,18 @@ test("the steering acknowledgement ends when the message is delivered", async ({
   // Deliver: flip the fixture so the queue read stops listing the entry and
   // the next event stream prints the user message.
   delivered = true;
-  await expect(sendingButton).toHaveCount(0, { timeout: 8000 });
+  // Delivered: the button confirms success with a green check ("Sent"),
+  // not Stop, for a brief moment.
+  const sentButton = page.getByRole("button", { name: "Sent", exact: true });
+  await expect(sentButton).toBeVisible({ timeout: 8000 });
+  await expect(sentButton).toBeDisabled();
+  await expect(sentButton).toHaveClass(/composer-action-sent/);
+  await expect(sentButton.locator("svg")).toBeVisible();
+  // The check is a flash: the plain Stop square returns afterwards.
   await expect(
     page.getByRole("button", { name: "Abort", exact: true }),
-  ).toBeEnabled();
+  ).toBeEnabled({ timeout: 4000 });
+  await expect(sentButton).toHaveCount(0);
   expect(reads).toBeGreaterThan(1);
 });
 
