@@ -21,6 +21,8 @@ import { translate, type Language } from "./i18n";
 import type { ProjectFileLink } from "./messageLinks";
 import { MarkdownBody } from "./MarkdownBody";
 import { isProjectImagePath, ProjectImageContext } from "./projectImages";
+import { ProjectBaseContext, projectDirname } from "./projectBase";
+import { readPreviewLink, writePreviewLink } from "./previewLink";
 import { absoluteProjectPath } from "./projectPaths";
 import { ZoomableImage } from "./ZoomableImage";
 import "./file-preview.css";
@@ -184,6 +186,45 @@ export function FilePreview({
   // the rendered reading view the first time the preview opens.
   const [source, setSource] = useState((!markdown && !html) || !!file.line);
   const [fullscreen, setFullscreen] = useState(false);
+  // The dialog is addressable: `?file=…` reopens it and a nested preview writes
+  // its own file. Each instance remembers what the URL named before it opened,
+  // so closing a stacked preview restores its parent instead of clearing it.
+  const previousLink = useRef<ProjectFileLink | null>(null);
+  /** What this dialog last put in the URL, resolved candidates included. */
+  const writtenLink = useRef<ProjectFileLink | null>(null);
+  useEffect(() => {
+    previousLink.current = readPreviewLink(window.location.search);
+    return () => {
+      const written = writtenLink.current;
+      const current = readPreviewLink(window.location.search);
+      // A stacked preview owns the URL while it is open; leave its link alone.
+      if (
+        written &&
+        (current?.path !== written.path || current?.root !== written.root)
+      )
+        return;
+      // A dialog restored *from* the URL has no parent link to restore, so
+      // closing it clears the parameters instead of keeping the same file.
+      const restored =
+        written &&
+        previousLink.current?.path === written.path &&
+        previousLink.current?.root === written.root;
+      writePreviewLink(restored ? null : previousLink.current);
+    };
+  }, []);
+  // Keep the address bar on the file actually being read: a resolved candidate
+  // or a worktree checkout replaces the guessed link path.
+  useEffect(() => {
+    const original = targetPath === file.path && targetRoot === file.root;
+    const link = {
+      path: targetPath,
+      root: targetRoot,
+      line: original ? file.line : undefined,
+      endLine: original ? file.endLine : undefined,
+    };
+    writtenLink.current = link;
+    writePreviewLink(link);
+  }, [targetPath, targetRoot, file.path, file.root, file.line, file.endLine]);
   useEffect(() => {
     setTargetPath(file.path);
     setTargetRoot(file.root);
@@ -372,6 +413,9 @@ export function FilePreview({
       aria-label={zh ? "文件预览" : "File preview"}
       onCancel={(event) => {
         event.preventDefault();
+        // A stacked preview's `cancel` is replayed through this dialog's React
+        // tree; only the dialog the browser actually targeted may close.
+        if (event.target !== event.currentTarget) return;
         onClose();
       }}
       onClick={(event) => {
@@ -692,9 +736,13 @@ export function FilePreview({
         </div>
       ) : markdown && !source ? (
         <div className="file-preview-markdown" tabIndex={0}>
-          <ProjectImageContext.Provider value={project}>
-            <MarkdownBody text={content} language={language} />
-          </ProjectImageContext.Provider>
+          <ProjectBaseContext.Provider
+            value={{ dir: projectDirname(targetPath), root: targetRoot }}
+          >
+            <ProjectImageContext.Provider value={project}>
+              <MarkdownBody text={content} language={language} />
+            </ProjectImageContext.Provider>
+          </ProjectBaseContext.Provider>
         </div>
       ) : (
         <pre

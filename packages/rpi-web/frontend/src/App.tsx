@@ -52,6 +52,9 @@ import {
   X,
 } from "lucide-react";
 import { useInstallApp } from "./installApp";
+import { FilePreview } from "./FilePreview";
+import { readPreviewLink } from "./previewLink";
+import type { ProjectFileLink } from "./messageLinks";
 import { speakableText, splitForSpeech } from "./speech";
 import { MarkdownBody } from "./MarkdownBody";
 import { ShellCommand } from "./ShellCommand";
@@ -804,6 +807,10 @@ export default function App() {
   const [deletePending, setDeletePending] = useState(false);
   const deleteInFlight = useRef(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
+  /** Preview restored from `?file=…`; the dialog itself keeps the URL current. */
+  const [linkedPreview, setLinkedPreview] = useState<ProjectFileLink | null>(
+    null,
+  );
   const install = useInstallApp();
   const [installHint, setInstallHint] = useState(false);
   const [toolNameMode, setToolNameMode] = useState<ToolNameMode>(() => {
@@ -2682,6 +2689,10 @@ export default function App() {
           initialSelectionError.current = selectionChanges ? message : "";
           setError(message);
         }
+        // A `?file=…` deep link opens its preview once the session exists; the
+        // dialog keeps the URL in sync from there on.
+        const linked = readPreviewLink(window.location.search);
+        if (linked) setLinkedPreview(linked);
       } catch (cause) {
         if (cancelled) return;
         setStatus("error");
@@ -4557,6 +4568,8 @@ export default function App() {
       setProjectId(nextProject);
     }
     setLoadingSession(Boolean(id));
+    // A preview restored from `?file=` belongs to the view that asked for it.
+    setLinkedPreview(null);
     rowsSessionRef.current = id;
     setRows(id ? (rowsBySession.current.get(id) ?? []) : []);
     followingRef.current = true;
@@ -5404,6 +5417,14 @@ export default function App() {
             await api.sessionMetadata(tagsTarget.sessionId, { tags });
             await refreshSessions();
           }}
+        />
+      )}
+      {linkedPreview && project && (
+        <FilePreview
+          project={project}
+          file={linkedPreview}
+          language={language}
+          onClose={() => setLinkedPreview(null)}
         />
       )}
       {settingsOpen && (
