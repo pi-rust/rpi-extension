@@ -2284,121 +2284,14 @@ test("a steering send shows a sending spinner until the queue accepts it", async
   // The draft is already cleared, so a second send cannot double-queue.
   await expect(input).toHaveValue("");
   release();
-  // Once the queue accepts the message the spinner persists (the message is
-  // only "sent" when the run delivers it), but the button returns to the
-  // abort affordance: with an empty composer a click stops, never sends.
+  // Once accepted the queued chip takes over and Stop returns.
   await expect
     .poll(() => queued)
     .toEqual([{ message: "Change course now", deliverAs: "followUp" }]);
-  await expect(sendingButton).toBeVisible();
-  await expect(sendingButton).toBeEnabled();
-  await expect(sendingButton.locator("svg.spin")).toBeVisible();
-});
-
-test("the steering acknowledgement ends in a sent check when delivered", async ({
-  page,
-}) => {
-  await mockHost(page);
-  let release!: () => void;
-  const gate = new Promise<void>((resolve) => {
-    release = resolve;
-  });
-  const queued: Array<{ message: string; deliverAs: string }> = [];
-  let reads = 0;
-  let delivered = false;
-  await page.route(
-    `**/api/v1/sessions/${sessionId}/events**`,
-    async (route) => {
-      if (!delivered)
-        return route.fulfill({
-          contentType: "text/event-stream",
-          body: 'id: 5\nevent: agent_start\ndata: {"type":"agent_start"}\n\n',
-        });
-      // After the flag flips, the next stream carries the delivery: the user
-      // message that prints the queued text into the conversation.
-      return route.fulfill({
-        contentType: "text/event-stream",
-        body:
-          'id: 5\nevent: agent_start\ndata: {"type":"agent_start"}\n\n' +
-          'id: 6\nevent: message_start\ndata: {"type":"message_start","message":{"role":"user","content":"Change course now"}}\n\n',
-      });
-    },
-  );
-  await page.route(
-    `**/api/v1/sessions/${sessionId}/commands`,
-    async (route) => {
-      const body = route.request().postDataJSON();
-      if (body.type === "queue_message") {
-        queued.push({ message: body.message, deliverAs: body.deliverAs });
-        await gate;
-        return route.fulfill({
-          json: response({ accepted: true, entryId: "steered" }, body.type),
-        });
-      }
-      if (body.type === "get_queue") {
-        reads += 1;
-        const items =
-          delivered || reads <= 1
-            ? []
-            : [
-                {
-                  entryId: "steered",
-                  queue: "followUp",
-                  status: "queued",
-                  text: "Change course now",
-                },
-              ];
-        return route.fulfill({
-          json: response({ items, count: items.length }, body.type),
-        });
-      }
-      return route.fallback();
-    },
-  );
-  await page.goto("/");
+  await expect(sendingButton).toHaveCount(0);
   await expect(
     page.getByRole("button", { name: "Abort", exact: true }),
   ).toBeEnabled();
-  const sendButton = page.getByRole("button", {
-    name: "Send message",
-    exact: true,
-  });
-  const input = page.getByRole("textbox", {
-    name: "Send a prompt, or type / for commands…",
-  });
-  await input.fill("Change course now");
-  await sendButton.click();
-  const sendingButton = page.getByRole("button", { name: "Sending…" });
-  await expect(sendingButton).toBeVisible();
-  // Phase 1: the enqueue request is in flight; disabled.
-  await expect(sendingButton).toBeDisabled();
-  release();
-  // Phase 2: accepted but not delivered; still spinning, still abortable.
-  await expect
-    .poll(() => queued)
-    .toEqual([{ message: "Change course now", deliverAs: "followUp" }]);
-  await expect(sendingButton).toBeEnabled();
-  await expect(sendingButton.locator("svg.spin")).toBeVisible();
-  // The bounded queue poll keeps listing the entry, so the wait continues.
-  await expect(input).toHaveValue("");
-  await page.waitForTimeout(1700);
-  await expect(sendingButton).toBeVisible();
-  // Deliver: flip the fixture so the queue read stops listing the entry and
-  // the next event stream prints the user message.
-  delivered = true;
-  // Delivered: the button confirms success with a green check ("Sent"),
-  // not Stop, for a brief moment.
-  const sentButton = page.getByRole("button", { name: "Sent", exact: true });
-  await expect(sentButton).toBeVisible({ timeout: 8000 });
-  await expect(sentButton).toBeDisabled();
-  await expect(sentButton).toHaveClass(/composer-action-sent/);
-  await expect(sentButton.locator("svg")).toBeVisible();
-  // The check is a flash: the plain Stop square returns afterwards.
-  await expect(
-    page.getByRole("button", { name: "Abort", exact: true }),
-  ).toBeEnabled({ timeout: 4000 });
-  await expect(sentButton).toHaveCount(0);
-  expect(reads).toBeGreaterThan(1);
 });
 
 test("an idle prompt send never shows the steering spinner", async ({

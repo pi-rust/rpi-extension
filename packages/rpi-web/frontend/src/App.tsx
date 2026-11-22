@@ -843,35 +843,10 @@ export default function App() {
     900,
   );
   const [sending, setSending] = useState(false);
-  // True while the in-flight HTTP submission is a queueing one (steer into
-  // the running task or a queued edit re-delivery); drives the composer
-  // button's "sending" feedback until the request itself settles.
+  // True while the in-flight submission is a queueing one (steer into the
+  // running task or a queued edit re-delivery); drives the composer button's
+  // "sending" feedback.
   const [queueing, setQueueing] = useState(false);
-  // A steering message is only "sent" when the host delivers it and the
-  // user message is printed into the conversation, not when the queue
-  // accepts it. Track the pending delivery per session + text so the
-  // composer can keep acknowledging (spinner, still abortable) until the
-  // message_start event arrives, the queue read no longer lists the entry,
-  // or a stop/abort reclaims it.
-  const [steerPending, setSteerPending] = useState<{
-    sessionId: string;
-    text: string;
-    queuedAt: number;
-  } | null>(null);
-  // Mirror of steerPending for event callbacks that must match without
-  // re-rendering first (SSE delivery, queue reconciliation).
-  const steerPendingRef = useRef<{
-    sessionId: string;
-    text: string;
-    queuedAt: number;
-  } | null>(null);
-  // Brief "delivered" confirmation: a green check flashes in the composer
-  // button once the steering message is actually sent (printed into the
-  // conversation), then the button returns to the plain Stop square.
-  const [steerSent, setSteerSent] = useState<{ sessionId: string } | null>(
-    null,
-  );
-  const steerSentTimer = useRef<number | null>(null);
   const sendingRef = useRef(false);
   const sendingRevision = useRef(0);
   const localMessageSeq = useRef(0);
@@ -1866,27 +1841,6 @@ export default function App() {
     if (previouslyBusy.current && !busy) void refreshProjectRoots();
     previouslyBusy.current = busy;
   }, [busy, refreshProjectRoots]);
-  // Keep the mirror in sync after every render so callbacks reading
-  // steerPendingRef.current see the latest pending entry.
-  steerPendingRef.current = steerPending;
-  const markSteerSent = useCallback((sessionId: string) => {
-    setSteerPending(null);
-    steerPendingRef.current = null;
-    setSteerSent({ sessionId });
-    if (steerSentTimer.current !== null)
-      window.clearTimeout(steerSentTimer.current);
-    steerSentTimer.current = window.setTimeout(() => {
-      steerSentTimer.current = null;
-      setSteerSent(null);
-    }, 1600);
-  }, []);
-  useEffect(
-    () => () => {
-      if (steerSentTimer.current !== null)
-        window.clearTimeout(steerSentTimer.current);
-    },
-    [],
-  );
   const composerAbort =
     busy && supported.has("abort") && !loadingSession && !connectionFailed;
   // While a run is active the main button is Stop for an empty composer and
@@ -1896,30 +1850,10 @@ export default function App() {
   const composerRunningSend = composerAbort && composerDraftReady;
   // A steering send clears the draft immediately, so the running button would
   // flip straight back to the bare Stop square with no acknowledgement of the
-  // click. Two phases keep the acknowledgement honest:
-  // 1. queueing — the enqueue request is in flight; show the spinner and
-  //    disable the button so a fast second click cannot abort or double-send.
-  // 2. steerPending — the queue accepted the message but the run has not
-  //    delivered it yet (no user message printed); keep the spinner and stay
-  //    on Abort: with an empty composer a click is a stop, never a send.
-  // It clears when the message_start event prints the user message, the
-  // queue read stops listing the entry, or a stop reclaims the draft.
-  const composerSteerWaiting =
-    composerAbort &&
-    !queueing &&
-    steerPending?.sessionId === sessionId &&
-    !composerDraftReady &&
-    !queueEditId;
+  // click. While the queueing request is in flight show a spinner instead;
+  // once it lands the queued chip takes over and Stop stays the safe default.
   const composerSteerPending =
     composerAbort && sending && queueing && !composerDraftReady;
-  // Delivered confirmation: show a green check for a moment after the
-  // steering message is printed into the conversation, then fall back to
-  // the plain Stop square.
-  const composerSteerSent =
-    composerAbort &&
-    steerSent?.sessionId === sessionId &&
-    !composerDraftReady &&
-    !queueEditId;
   const composerContinue =
     !busy &&
     status !== "closed" &&
@@ -2219,14 +2153,6 @@ export default function App() {
                   )
                 : previous,
             );
-            // The steering acknowledgement ends here: the message is printed
-            // into the conversation, which is what "sent" means. The check
-            // confirmation is keyed to the session being viewed.
-            if (
-              steerPendingRef.current &&
-              steerPendingRef.current.text.trim() === text.trim()
-            )
-              markSteerSent(steerPendingRef.current.sessionId);
             const prefix = `u${seq}`;
             currentUser.current = prefix;
             const initial = rowsFromUser(event.message, prefix);
@@ -2833,9 +2759,6 @@ export default function App() {
     sendingRef.current = false;
     setSending(false);
     setQueueing(false);
-    setSteerPending(null);
-    steerPendingRef.current = null;
-    setSteerSent(null);
     setLevels([]);
     setSeen(0);
     setError(initialSelectionError.current);
@@ -3274,26 +3197,6 @@ export default function App() {
             ? previous.filter(isEditableQueueItem)
             : items,
         );
-        // A queued steering message disappears from the host's list exactly
-        // when it is delivered to the run. If the message_start event was
-        // missed (tool-batch steering can emit no user event at this client),
-        // the queue read is the recovery signal that ends the acknowledgement
-        // and flashes the sent check. The grace period keeps a read that
-        // raced the enqueue (and can still lag the fresh entry) from ending
-        // the acknowledgement early.
-        const mirrored = steerPendingRef.current;
-        if (
-          mirrored &&
-          mirrored.sessionId === id &&
-          Date.now() - mirrored.queuedAt > 2_000 &&
-          !queueSubmission.current.has(id) &&
-          !items.some(
-            (item) =>
-              (item.text ?? "").trim() === mirrored.text.trim() &&
-              item.status === "queued",
-          )
-        )
-          markSteerSent(mirrored.sessionId);
       } catch (cause) {
         // A revoked session must log out exactly like any other read.
         if (cause instanceof ApiError && cause.status === 401) {
@@ -3888,10 +3791,6 @@ export default function App() {
     try {
       if (shouldQueue) {
         if (!supported.has("queue_message")) throw new Error(t("runBusy"));
-        // Hold the in-flight-enqueue marker so a concurrent queue read treats
-        // this session like the panel's own send: the host's list may lag the
-        // optimistic row until the command returns.
-        queueSubmission.current.add(targetSession);
         if (editingQueueId)
           await api.cancelQueued(targetSession, editingQueueId);
         const queued = await api.queueMessage(
@@ -3909,14 +3808,6 @@ export default function App() {
               status: "queued",
             },
           ]);
-          // The queue has accepted the message, but it is only sent once the
-          // run delivers it and the user message is printed. Keep tracking it
-          // so the composer acknowledgement outlives the HTTP round trip.
-          setSteerPending({
-            sessionId: targetSession,
-            text: submissionMessage,
-            queuedAt: Date.now(),
-          });
           setQueueEditId(null);
           void refreshDiagnostics(targetSession);
         }
@@ -3949,7 +3840,6 @@ export default function App() {
         setError(errorText(cause));
       }
     } finally {
-      queueSubmission.current.delete(targetSession);
       if (submission === sendingRevision.current) {
         sendingRef.current = false;
         setSending(false);
@@ -4602,11 +4492,6 @@ export default function App() {
       // messages back (`steer` + `followUp`). Dropping that reply is what made
       // staged input disappear after a stop, so put it back in the composer.
       const reclaimed = [...(result.steer ?? []), ...(result.followUp ?? [])];
-      // A stop drains the native queue; a pending steering acknowledgement has
-      // nothing left to wait for (the reclaim puts the text back in the draft).
-      setSteerPending(null);
-      steerPendingRef.current = null;
-      setSteerSent(null);
       if (reclaimed.length === 0) return;
       const queuedText = reclaimed
         .map((message) => message.text ?? "")
@@ -4629,9 +4514,6 @@ export default function App() {
       setError(errorText(cause));
       // A trampled abort reply can still have drained the native queue, so read
       // the host's list instead of showing rows that may already be gone.
-      setSteerPending(null);
-      steerPendingRef.current = null;
-      setSteerSent(null);
       if (targetSession === activeSessionRef.current)
         void refreshQueue(targetSession);
     }
@@ -6791,32 +6673,28 @@ export default function App() {
                       // makes long-press-for-newline impossible. The button and
                       // the desktop Enter handler both call `submit()` instead.
                       type="button"
-                      className={`send-button${composerSteerSent ? " composer-action-sent" : composerSteerPending || composerSteerWaiting ? " composer-action-sending" : composerAbort && !composerRunningSend ? " composer-action-stop" : composerContinue ? " composer-action-continue" : ""}`}
+                      className={`send-button${composerSteerPending ? " composer-action-sending" : composerAbort && !composerRunningSend ? " composer-action-stop" : composerContinue ? " composer-action-continue" : ""}`}
                       aria-label={
-                        composerSteerSent
-                          ? t("sent")
-                          : composerSteerPending || composerSteerWaiting
-                            ? t("sending")
-                            : composerRunningSend
-                              ? t("send")
-                              : composerAbort
-                                ? t("abort")
-                                : composerContinue
-                                  ? t("continue")
-                                  : t("send")
+                        composerSteerPending
+                          ? t("sending")
+                          : composerRunningSend
+                            ? t("send")
+                            : composerAbort
+                              ? t("abort")
+                              : composerContinue
+                                ? t("continue")
+                                : t("send")
                       }
                       title={
-                        composerSteerSent
-                          ? t("sent")
-                          : composerSteerPending || composerSteerWaiting
-                            ? t("sending")
-                            : composerRunningSend
-                              ? t("send")
-                              : composerAbort
-                                ? t("abort")
-                                : composerContinue
-                                  ? t("continue")
-                                  : t("send")
+                        composerSteerPending
+                          ? t("sending")
+                          : composerRunningSend
+                            ? t("send")
+                            : composerAbort
+                              ? t("abort")
+                              : composerContinue
+                                ? t("continue")
+                                : t("send")
                       }
                       disabled={
                         (!localSlash && (loadingSession || connectionFailed)) ||
@@ -6828,8 +6706,7 @@ export default function App() {
                             !sessionId ||
                             sending ||
                             uploading)) ||
-                        composerSteerPending ||
-                        composerSteerSent
+                        composerSteerPending
                       }
                       onClick={
                         composerAbort && !composerRunningSend
@@ -6837,9 +6714,7 @@ export default function App() {
                           : () => void submit()
                       }
                     >
-                      {composerSteerSent ? (
-                        <Check size={17} aria-hidden="true" />
-                      ) : composerSteerPending || composerSteerWaiting ? (
+                      {composerSteerPending ? (
                         <Loader2
                           className="spin"
                           size={17}

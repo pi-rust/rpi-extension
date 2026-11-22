@@ -1125,17 +1125,6 @@
     opacity: 0.85;
   }
 }
-/* Delivered confirmation: a brief green check replaces the spinner once the
-   steering message is printed into the conversation, then Stop returns. */
-.workspace .send-button.composer-action-sent {
-  background: var(--green);
-  color: #fff;
-}
-.workspace .send-button.composer-action-sent:disabled {
-  background: var(--green);
-  color: #fff;
-  opacity: 0.9;
-}
 .start-project-chat {
   margin: 15px auto 0;
   font-size: 11px;

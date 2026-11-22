@@ -182,15 +182,6 @@
   color: var(--bg);
   opacity: 0.85;
 }
-.workspace .send-button.composer-action-sent {
-  background: var(--green);
-  color: #fff;
-}
-.workspace .send-button.composer-action-sent:disabled {
-  background: var(--green);
-  color: #fff;
-  opacity: 0.9;
-}
 
 /* The pending queue lives directly above the composer and can be folded into a
    single compact preview row. */
