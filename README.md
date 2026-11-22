@@ -2,6 +2,8 @@
 
 **English** | [简体中文](README.zh-CN.md)
 
+[Website](https://rpi.bigfisharc.cn/) · [Extension catalog](https://rpi.bigfisharc.cn/packages.html) · [Submit an extension](https://rpi.bigfisharc.cn/submit.html)
+
 Rust-native extension packages for the `rpi` agent, built against the stable
 `rpi-plugin-sdk` ABI from `pi-rust`.
 
@@ -22,6 +24,34 @@ client adapters. Each package has its own version and setup guide. The
 versioned prebuilt manifests for catalog extensions. See the
 [tool guidance contract](docs/tool-guidance.md) for model-facing descriptions,
 parameter schemas, and regression checks.
+
+## Submit an extension
+
+Built an extension? [Submit it to the extension catalog](https://rpi.bigfisharc.cn/submit.html)
+and share it with the community. Extensions can stay in your own GitHub
+repository; catalog submission does not require moving their source into this
+workspace. The submission page also provides a downloadable
+`rpi-extension-packaging` skill for coding agents.
+
+Before submitting:
+
+1. Add a root `rpi-extension.json` with `name`, `version`, `type: "extension"`,
+   `targets`, and a complete install command such as
+   `rpi install rpi-your-extension --github OWNER/REPO`.
+2. Provide an installable package: a Cargo `cdylib` for source builds, or
+   platform-specific prebuilt libraries in GitHub Releases (recommended). Use
+   release tags in the `<name>-v<version>` format.
+3. Add the `rpi-extension` GitHub repository topic so the catalog discovery task
+   can find it. Community repositories enter a review queue; automatic approval
+   and the official badge are reserved for the official repositories.
+4. Include cross-platform formatting, tests, Clippy and a real-host installation
+   smoke check in CI. Verify installation in a clean environment before
+   submitting: catalog discovery alone does not guarantee installability.
+
+See the [submission guide](https://rpi.bigfisharc.cn/submit.html) for the current
+requirements and packaging templates. To contribute code or documentation to
+**this repository** instead, follow [CONTRIBUTING.md](CONTRIBUTING.md); outside
+contributors must open an issue before submitting a pull request.
 
 ## Packages
 
