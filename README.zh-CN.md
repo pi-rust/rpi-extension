@@ -2,6 +2,8 @@
 
 [English](README.md) | **简体中文**
 
+[官网](https://rpi.bigfisharc.cn/) · [扩展目录](https://rpi.bigfisharc.cn/packages.html) · [提交扩展](https://rpi.bigfisharc.cn/submit.html)
+
 基于 `pi-rust` 稳定版 `rpi-plugin-sdk` ABI 的 `rpi` 代理扩展包，使用 Rust 原生实现。
 
 本仓库导入了 `pi-rust/rpi-package` 的 main 分支代码树，并作为这些扩展的 crates.io
@@ -17,6 +19,28 @@ crates.io 发布并创建各包标签，入口是
 和安装指南。[包目录](catalog/packages.json)记录了各扩展的安装命令和带版本的预编译
 清单。面向模型的工具描述、参数 schema 与回归检查见
 [工具指引契约](docs/tool-guidance.md)。
+
+## 提交扩展
+
+欢迎[自主贡献扩展](https://rpi.bigfisharc.cn/submit.html)，与社区分享你的作品。
+扩展可以保留在你自己的 GitHub 仓库中，收录到目录不要求把源码迁入本工作区。
+提交页面还提供可下载的 `rpi-extension-packaging` 技能，可交给编码 Agent 按指引完成打包。
+
+提交前请准备：
+
+1. 在仓库根目录添加 `rpi-extension.json`，包含 `name`、`version`、
+   `type: "extension"`、`targets`，以及完整的安装命令，例如
+   `rpi install rpi-your-extension --github OWNER/REPO`。
+2. 提供可安装的扩展：Cargo 源码构建需产出 `cdylib`，也可在 GitHub Releases 中提供
+   分平台预编译动态库（推荐）。Release 标签采用 `<name>-v<version>` 格式。
+3. 为 GitHub 仓库添加 `rpi-extension` topic，供目录发现任务识别。社区仓库会进入
+   人工审核队列；免审和“官方”标记仅适用于官方仓库。
+4. 配置跨平台格式检查、测试、Clippy 与真实宿主安装冒烟 CI，并在干净环境中验证
+   安装。能被目录发现不代表一定能安装成功。
+
+最新要求与打包模板见[扩展提交指南](https://rpi.bigfisharc.cn/submit.html)。
+如果你想直接向**本仓库**贡献代码或文档，请遵循[贡献指南](CONTRIBUTING.md)；
+外部贡献者需先提 issue，再提交 PR。
 
 ## 扩展包列表
 
