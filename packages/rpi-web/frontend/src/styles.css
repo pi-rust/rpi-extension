@@ -857,7 +857,12 @@ code {
   letter-spacing: 0.1px;
 }
 .composer-area {
-  padding: 12px 35px 17px;
+  position: relative;
+  /* One source for the side padding: the slash palette anchors its insets to
+     the same variable, so palette and composer always share a box however the
+     desktop/workbench sheets and the mobile breakpoint restyle this form. */
+  --composer-pad-x: 35px;
+  padding: 12px var(--composer-pad-x) 17px;
   max-width: 900px;
   width: 100%;
   align-self: center;
@@ -2893,8 +2898,7 @@ details[open] > summary:before {
     padding-right: 28px;
   }
   .composer-area {
-    padding-left: 28px;
-    padding-right: 28px;
+    --composer-pad-x: 28px;
   }
 }
 @media (max-width: 767px) {
@@ -3247,7 +3251,8 @@ details[open] > summary:before {
     margin-top: 21px;
   }
   .composer-area {
-    padding: 10px 14px max(13px, env(safe-area-inset-bottom));
+    --composer-pad-x: 14px;
+    padding: 10px var(--composer-pad-x) max(13px, env(safe-area-inset-bottom));
   }
   .composer {
     padding: 13px 13px 10px;
@@ -3731,8 +3736,15 @@ details[open] > summary:before {
   color: var(--muted);
 }
 
-/* Slash commands: a browser-side palette above the composer. */
+/* Slash commands: an opaque palette that floats above the transcript instead
+   of competing with conversation text for document flow, and keeps the
+   composer's exact width at every breakpoint. */
 .slash-menu {
+  position: absolute;
+  left: var(--composer-pad-x);
+  right: var(--composer-pad-x);
+  bottom: 100%;
+  z-index: 30;
   display: flex;
   flex-direction: column;
   gap: 2px;
@@ -3777,6 +3789,9 @@ details[open] > summary:before {
 /* Mobile: rows wrap instead of squeezing onto one line, and the palette
    scrolls with a bounded height instead of pushing the composer off-screen. */
 @media (max-width: 767px) {
+  .composer-area {
+    --composer-pad-x: 14px;
+  }
   .slash-menu {
     max-height: min(44dvh, 340px);
     overflow-y: auto;
