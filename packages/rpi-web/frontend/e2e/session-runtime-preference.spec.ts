@@ -42,6 +42,8 @@ class Host {
   failNext = false;
   holdNext: ReturnType<typeof gate> | null = null;
   streams: ReturnType<typeof gate>[] = [];
+  /** SSE frames the next opened event stream delivers before staying open. */
+  pending = "";
   constructor(readonly page: Page) {}
   resetHost() {
     for (const id of Object.keys(this.states)) {
@@ -137,6 +139,9 @@ class Host {
       const match = path.match(
         /^\/sessions\/([^/]+)\/(open|snapshot|events|commands|run-timings\/query)$/,
       );
+      // Keepalive probes target the session without opening a host.
+      if (req.method() === "GET" && /^\/sessions\/[^/]+$/.test(path))
+        return json(this.summary(path.split("/")[2]));
       if (match && this.states[match[1]]) {
         const [, session, endpoint] = match;
         if (endpoint === "open") return json(this.summary(session));
@@ -154,13 +159,17 @@ class Host {
             pendingResume: false,
           });
         if (endpoint === "events") {
+          const body = `retry: 60000\n\n${this.pending}`;
+          this.pending = "";
+          // A test that stages frames needs them delivered now; otherwise keep
+          // the stream open so unrelated assertions do not race a settlement.
+          if (body.trim() !== "retry: 60000") {
+            return route.fulfill({ contentType: "text/event-stream", body });
+          }
           const stream = gate();
           this.streams.push(stream);
           await stream.promise;
-          return route.fulfill({
-            contentType: "text/event-stream",
-            body: "retry: 60000\n\n",
-          });
+          return route.fulfill({ contentType: "text/event-stream", body });
         }
         if (endpoint === "run-timings/query")
           return json({ timings: [], complete: true, cursor: null });
@@ -459,4 +468,45 @@ test("session memory persists across reload and repairs model-only drift", async
   expect(host.states.old.thinkingLevel).toBe("off");
   const repairs = host.writes("old").map((call) => call.type);
   expect(repairs).toEqual(["set_model"]);
+});
+
+/**
+ * An explicit successful model choice repairs the remembered model, so the
+ * restore-failure banner must stop advertising the model it just fixed (#56).
+ */
+test("an explicit model choice clears the restore-failure banner", async ({
+  page,
+  host,
+}) => {
+  await start(page);
+  await choose(page);
+  host.resetHost();
+  host.failNext = true;
+  await page.reload();
+  await ready(page);
+  const banner = page.locator(".error-banner");
+  await expect(banner).toContainText("Could not restore this session");
+  await expect(banner).toContainText("special");
+  // Choosing a working model satisfies the failure the banner describes.
+  await choose(page);
+  await expect.poll(() => host.states.old.modelId).toBe("special");
+  await expect(banner).toHaveCount(0);
+});
+
+/**
+ * A reconnect replay can hand the browser the failed settlement and the next
+ * run's start in the same batch. The accepted run is the authority that the
+ * connection works again, so the stale failure notice must not survive it
+ * (#56).
+ */
+test("an accepted run clears a replayed failure notice", async ({
+  page,
+  host,
+}) => {
+  host.pending =
+    'id: 7\nevent: agent_settled\ndata: {"type":"agent_settled","runId":"run-1","outcome":"failed","error":"provider unavailable"}\n\n' +
+    'id: 8\nevent: agent_start\ndata: {"type":"agent_start","runId":"run-2"}\n\n';
+  await page.goto("/?session=old");
+  await ready(page);
+  await expect(page.locator(".error-banner")).toHaveCount(0);
 });
