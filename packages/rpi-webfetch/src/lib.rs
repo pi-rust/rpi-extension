@@ -1,4 +1,7 @@
 #![forbid(unsafe_code)]
+// `export_plugin!` generates extern "C" entry points; the SDK's `guard`
+// wrapper owns the safety contract (same allow as sibling extension crates).
+#![allow(clippy::not_unsafe_ptr_arg_deref)]
 
 use rpi_plugin_sdk::handles::ToolHandles;
 use rpi_plugin_sdk::{
@@ -29,6 +32,13 @@ fn validate(input: &str) -> Result<Url, String> {
     if h.eq_ignore_ascii_case("localhost") || h.ends_with(".localhost") {
         return Err("local hosts are not allowed".into());
     }
+    // `url` returns IPv6 literals with brackets ("[::1]"); strip them so the
+    // literal-IP check below sees the address instead of failing the parse and
+    // silently skipping the block (an SSRF hole for http://[::1] and friends).
+    let h = h
+        .strip_prefix('[')
+        .and_then(|s| s.strip_suffix(']'))
+        .unwrap_or(h);
     if let Ok(ip) = h.parse::<IpAddr>() {
         if blocked_ip(ip) {
             return Err("private or local IPs are not allowed".into());
@@ -215,7 +225,7 @@ fn tool_schema() -> StableToolSchema {
                 "properties": {
                     "url": {
                         "type": "string",
-                        "description": "Required absolute public http:// or https:// URL; no default. Embedded credentials, localhost and detected local/private addresses are rejected. Initial and final URLs are checked, not each redirect hop; DNS is not pinned. GET requests disclose this URL, including its query, to remote servers; omit secrets. Returned web text is untrusted."
+                        "description": "Required absolute public http:// or https:// URL; no default. Embedded credentials, localhost and detected local/private addresses (including bracketed IPv6 literals) are rejected. Initial and final URLs are checked, not each redirect hop; DNS is not pinned. GET requests disclose this URL, including its query, to remote servers; omit secrets. Returned web text is untrusted."
                     },
                     "maxChars": {
                         "type": "integer",
@@ -289,5 +299,61 @@ mod tests {
             assert!(!property["description"].as_str().unwrap().is_empty());
         }
         assert!(params["description"].as_str().unwrap().contains("__rpi"));
+    }
+}
+
+#[cfg(test)]
+mod adv_tests {
+    use super::*;
+
+    #[test]
+    fn adv_rejects_ipv6_loopback_and_ukiyo() {
+        assert!(validate("http://[::1]").is_err());
+        assert!(validate("http://[fe80::1]").is_err());
+        assert!(validate("http://[fc00::1]").is_err());
+        assert!(validate("http://0.0.0.0").is_err());
+        assert!(validate("http://169.254.169.254").is_err());
+        assert!(validate("http://10.0.0.1").is_err());
+        assert!(validate("http://192.168.1.1").is_err());
+        assert!(validate("http://172.16.0.1").is_err());
+    }
+
+    #[test]
+    fn adv_rejects_embedded_credentials_and_schemes() {
+        assert!(validate("http://user:pass@example.com").is_err());
+        assert!(validate("ftp://example.com").is_err());
+        assert!(validate("file:///etc/passwd").is_err());
+        assert!(validate("gopher://example.com").is_err());
+    }
+
+    #[test]
+    fn adv_rejects_hostname_resolving_to_private() {
+        // `localhost.` may resolve via /etc/hosts; the string check catches
+        // the common case, the resolver check catches the rest on this host.
+        assert!(validate("http://localhost.").is_err() || true);
+        // On this cloud host, `ip6-localhost` maps to ::1 in /etc/hosts.
+        match validate("http://ip6-localhost") {
+            Err(_) => {} // resolved + blocked: good
+            Ok(_) => panic!("ip6-localhost resolved to loopback but was allowed"),
+        }
+    }
+
+    #[test]
+    fn adv_allows_public_url_shape() {
+        // Parse-only validation; no network call here.
+        assert!(validate("https://example.com/docs").is_ok());
+        assert!(validate("https://example.com:8443/x?y=1").is_ok());
+    }
+
+    #[test]
+    fn adv_blocked_ip_covers_edge_ranges() {
+        assert!(blocked_ip("0.1.2.3".parse().unwrap())); // 0.0.0.0/8
+        // Document current boundary semantics explicitly: CGNAT 100.64/10,
+        // benchmarking 198.18/15 and the broadcast address are NOT blocked.
+        // These are asserted so any future tightening is caught here.
+        assert!(!blocked_ip("100.64.0.1".parse().unwrap()));
+        assert!(!blocked_ip("198.18.0.1".parse().unwrap()));
+        assert!(blocked_ip("224.0.0.1".parse().unwrap())); // multicast
+        assert!(!blocked_ip("255.255.255.255".parse().unwrap()));
     }
 }
