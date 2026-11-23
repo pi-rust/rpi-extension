@@ -5952,18 +5952,6 @@ export default function App() {
                 <span className="status-dot" /> {connectionLabel}
               </span>
             )}
-            {actions.has("fork") && (
-              <button
-                type="button"
-                disabled={!sessionId || forkPending}
-                className="icon-button toolbar-fork"
-                title={t("forkSession")}
-                aria-label={t("forkSession")}
-                onClick={() => void forkCurrent()}
-              >
-                <GitBranch size={16} />
-              </button>
-            )}
             {actions.has("clone") && (
               <button
                 disabled={!sessionId}
@@ -6469,6 +6457,8 @@ export default function App() {
                                   language={language}
                                   onSpeak={speakMessage}
                                   readingRowId={readingRowId}
+                                  onFork={(entryId) => void forkCurrent(entryId)}
+                                  forkPending={forkPending}
                                   assistantStreamRevision={
                                     assistantStreamRevision
                                   }
@@ -7527,6 +7517,8 @@ const RowView = memo(function RowView({
   todoHistory,
   onSpeak,
   readingRowId,
+  onFork,
+  forkPending,
   assistantStreamRevision,
   thinkingStreaming,
 }: {
@@ -7535,6 +7527,8 @@ const RowView = memo(function RowView({
   todoHistory?: ToolRow[];
   onSpeak?: (rowId: string, text: string) => void;
   readingRowId?: string | null;
+  onFork?: (entryId: string) => void;
+  forkPending?: boolean;
   /** Changes when a streaming assistant turn starts or ends. */
   assistantStreamRevision?: number;
   thinkingStreaming?: boolean;
@@ -7608,6 +7602,8 @@ const RowView = memo(function RowView({
       language={language}
       onSpeak={onSpeak}
       reading={readingRowId === row.id}
+      onFork={onFork}
+      forkPending={forkPending}
       streaming={thinkingStreaming}
       streamKey={`${row.id}:${assistantStreamRevision ?? 0}`}
     />
@@ -7808,6 +7804,8 @@ function MessageRow({
   language,
   onSpeak,
   reading,
+  onFork,
+  forkPending,
   streaming = false,
   streamKey = "",
 }: {
@@ -7815,6 +7813,8 @@ function MessageRow({
   language: Language;
   onSpeak?: (rowId: string, text: string) => void;
   reading?: boolean;
+  onFork?: (entryId: string) => void;
+  forkPending?: boolean;
   streaming?: boolean;
   streamKey?: string;
 }) {
@@ -7853,23 +7853,31 @@ function MessageRow({
         <div className="message-actions">
           <button
             type="button"
-            className="message-copy message-copy-markdown"
+            className="message-copy message-copy-markdown message-action-icon"
             onClick={() => void copyMarkdown()}
             aria-label={copiedMarkdown ? t("copied") : t("copyMarkdown")}
             title={copiedMarkdown ? t("copied") : t("copyMarkdown")}
           >
-            {copiedMarkdown ? <Check size={12} /> : <Copy size={12} />}
-            <span>{copiedMarkdown ? t("copied") : t("copyMarkdown")}</span>
+            {copiedMarkdown ? <Check size={14} /> : <Copy size={14} />}
           </button>
           <button
             type="button"
-            className="message-copy message-copy-markdown"
+            className="message-copy message-copy-markdown message-action-icon"
+            disabled={!row.entryId || forkPending}
+            onClick={() => row.entryId && onFork?.(row.entryId)}
+            aria-label={t("forkHere")}
+            title={t("forkHere")}
+          >
+            <GitBranch size={14} />
+          </button>
+          <button
+            type="button"
+            className="message-copy message-copy-markdown message-action-icon"
             onClick={() => onSpeak?.(row.id, row.text)}
             aria-label={reading ? t("stopReading") : t("readAloud")}
             title={reading ? t("stopReading") : t("readAloud")}
           >
-            {reading ? <VolumeX size={12} /> : <Volume2 size={12} />}
-            <span>{reading ? t("stopReading") : t("readAloud")}</span>
+            {reading ? <VolumeX size={14} /> : <Volume2 size={14} />}
           </button>
         </div>
       )}

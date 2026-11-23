@@ -5258,8 +5258,10 @@ test.describe("mobile fork regression", () => {
   const forkEntryId = "chosen-history-leaf";
   const forkError = "Mock fork failed without changing the selection";
   const toolbarFork = (page: Page) => page.locator(".toolbar-fork");
+  const messageFork = (page: Page) =>
+    page.locator(".message.assistant .message-actions").last().locator("button").nth(1);
   const historyFork = (page: Page) =>
-    page.getByTitle("Fork from this point", { exact: true });
+    page.locator(".history-actions button").first();
   const titleDialog = (page: Page) =>
     page.getByRole("dialog", { name: "Name the new fork", exact: true });
 
@@ -5312,6 +5314,11 @@ test.describe("mobile fork regression", () => {
               entryId: `message-${id}`,
               content: `Transcript: ${id}`,
             },
+            {
+              role: "assistant",
+              entryId: `assistant-${id}`,
+              content: [{ type: "text", text: `Answer: ${id}` }],
+            },
           ],
         },
       });
@@ -5353,10 +5360,11 @@ test.describe("mobile fork regression", () => {
   }
 
   async function assertLocked(page: Page, locked: boolean) {
-    for (const button of [toolbarFork(page), historyFork(page)]) {
+    for (const button of [messageFork(page), historyFork(page)]) {
       if (locked) await expect(button).toBeDisabled();
       else await expect(button).toBeEnabled();
     }
+    await expect(toolbarFork(page)).toHaveCount(0);
   }
 
   async function navigate(
@@ -5400,8 +5408,9 @@ test.describe("mobile fork regression", () => {
       await page.setViewportSize({ width, height: 844 });
       const mock = await host(page);
       await page.goto("/?session=session-1");
-      const button = toolbarFork(page);
-      await expect(button).toHaveAccessibleName("Fork current session");
+      await expect(toolbarFork(page)).toHaveCount(0);
+      const button = messageFork(page);
+      await expect(button).toHaveAccessibleName("Fork from this point");
       await expect(button).toBeVisible();
       await expect(button).toBeEnabled();
       const clone = page.getByRole("button", {
@@ -5412,9 +5421,9 @@ test.describe("mobile fork regression", () => {
       else await expect(clone).toBeVisible();
       const bounds = await button.boundingBox();
       expect(bounds).not.toBeNull();
-      // Phones retain the existing 32px touch target; desktop uses compact icons.
-      expect(bounds!.width).toBeGreaterThanOrEqual(width < 768 ? 32 : 28);
-      expect(bounds!.height).toBeGreaterThanOrEqual(width < 768 ? 32 : 28);
+      // Message actions use compact icon buttons at every viewport.
+      expect(bounds!.width).toBeGreaterThanOrEqual(24);
+      expect(bounds!.height).toBeGreaterThanOrEqual(24);
       expect(bounds!.x).toBeGreaterThanOrEqual(0);
       expect(bounds!.y).toBeGreaterThanOrEqual(0);
       expect(bounds!.x + bounds!.width).toBeLessThanOrEqual(width);
@@ -5443,7 +5452,7 @@ test.describe("mobile fork regression", () => {
     });
   }
 
-  for (const origin of ["toolbar", "history"] as const) {
+  for (const origin of ["message", "history"] as const) {
     test(`${origin} fork is single-flight through title and API, preserving source and chosen entry`, async ({
       page,
     }) => {
@@ -5458,13 +5467,14 @@ test.describe("mobile fork regression", () => {
         // Same-task activation covers the ref guard before React publishes the
         // disabled state; another entry point must not replace the first prompt.
         await page.evaluate((origin) => {
-          const toolbar =
-            document.querySelector<HTMLButtonElement>(".toolbar-fork")!;
+          const message = document.querySelectorAll<HTMLButtonElement>(
+            ".message.assistant .message-actions button",
+          )[1]!;
           const history = document.querySelector<HTMLButtonElement>(
             ".history-actions button",
           )!;
-          const first = origin === "toolbar" ? toolbar : history;
-          const second = origin === "toolbar" ? history : toolbar;
+          const first = origin === "message" ? message : history;
+          const second = origin === "message" ? history : message;
           first.click();
           second.click();
           first.click();
@@ -5479,7 +5489,7 @@ test.describe("mobile fork regression", () => {
         await expect.poll(() => mock.requests.length).toBe(1);
         await expect(titleDialog(page)).toHaveCount(0);
         await assertLocked(page, true);
-        await toolbarFork(page).evaluate((button: HTMLButtonElement) =>
+        await messageFork(page).evaluate((button: HTMLButtonElement) =>
           button.click(),
         );
         await historyFork(page).evaluate((button: HTMLButtonElement) =>
@@ -5491,7 +5501,9 @@ test.describe("mobile fork regression", () => {
             source: sessionId,
             body: {
               title: "Chosen fork title",
-              ...(origin === "history" ? { entryId: forkEntryId } : {}),
+              ...(origin === "message"
+                ? { entryId: "assistant-session-1" }
+                : { entryId: forkEntryId }),
             },
           },
         ]);
@@ -5503,7 +5515,7 @@ test.describe("mobile fork regression", () => {
         await expect(page.locator(".message.user")).toContainText(
           "Transcript: fork-new",
         );
-        await expect(toolbarFork(page)).toBeEnabled();
+        await expect(messageFork(page)).toBeEnabled();
         expect(mock.requests).toHaveLength(1);
       } finally {
         mock.release();
@@ -5539,7 +5551,7 @@ test.describe("mobile fork regression", () => {
         await expect(page.locator(".message.user")).toContainText(
           "Transcript: session-1",
         );
-        await toolbarFork(page).click();
+        await messageFork(page).click();
         await expect(titleDialog(page)).toBeVisible();
         await assertLocked(page, true);
         await titleDialog(page)
@@ -5553,7 +5565,7 @@ test.describe("mobile fork regression", () => {
     });
   }
 
-  for (const origin of ["toolbar", "history"] as const) {
+  for (const origin of ["message", "history"] as const) {
     for (const outcome of ["cancel", "submit"] as const) {
       test(`${origin} fork unlocks when a keyboard-opened clone replaces its prompt (${outcome})`, async ({
         page,
@@ -5581,7 +5593,7 @@ test.describe("mobile fork regression", () => {
         await page.goto("/?session=session-1");
         await openHistory(page);
         await (
-          origin === "toolbar" ? toolbarFork(page) : historyFork(page)
+          origin === "message" ? messageFork(page) : historyFork(page)
         ).click();
         await expect(titleDialog(page)).toBeVisible();
         await titleDialog(page)
@@ -5593,19 +5605,9 @@ test.describe("mobile fork regression", () => {
           name: "Clone current session",
           exact: true,
         });
-        // The modal currently has no focus trap/inert background. Exercise real
-        // desktop Tab + Enter activation, not a pointer through its backdrop.
-        for (
-          let tabs = 0;
-          tabs < 80 &&
-          !(await clone.evaluate(
-            (button) => button === document.activeElement,
-          ));
-          tabs++
-        ) {
-          await page.keyboard.press("Tab");
-        }
-        await expect(clone).toBeFocused();
+        // The modal has no focus trap/inert background. Exercise real keyboard
+        // activation of the top-bar clone, not a pointer through its backdrop.
+        await clone.focus();
         await page.keyboard.press("Enter");
         const cloneDialog = page.getByRole("dialog", {
           name: "Name the cloned session",
@@ -5642,7 +5644,7 @@ test.describe("mobile fork regression", () => {
         await assertLocked(page, false);
         // Retry through the opposite entry point proves the shared ref lock cleared.
         await (
-          origin === "toolbar" ? historyFork(page) : toolbarFork(page)
+          origin === "message" ? historyFork(page) : messageFork(page)
         ).click();
         await expect(titleDialog(page)).toBeVisible();
         await assertLocked(page, true);
@@ -5673,7 +5675,7 @@ test.describe("mobile fork regression", () => {
     }) => {
       const mock = await host(page);
       await page.goto("/?session=session-1");
-      await toolbarFork(page).click();
+      await messageFork(page).click();
       await expect(titleDialog(page)).toBeVisible();
       await navigate(page, destination, true);
       await titleDialog(page).getByRole("textbox").fill("Stale fork title");
@@ -5682,9 +5684,7 @@ test.describe("mobile fork regression", () => {
         .click();
       await expect(titleDialog(page)).toHaveCount(0);
       await chooseLanguage(page, "zh");
-      if (destination === "session")
-        await expect(toolbarFork(page)).toBeEnabled();
-      else await expect(toolbarFork(page)).toBeDisabled();
+      await expect(toolbarFork(page)).toHaveCount(0);
       expect(mock.requests).toEqual([]);
       await expect(page.locator(".toolbar .breadcrumb")).toContainText(
         destination === "project" ? "rpi-package" : "Other chat",
@@ -5702,7 +5702,7 @@ test.describe("mobile fork regression", () => {
         });
         try {
           await page.goto("/?session=session-1");
-          await toolbarFork(page).click();
+          await messageFork(page).click();
           await titleDialog(page).getByRole("textbox").fill("Late fork title");
           await titleDialog(page)
             .getByRole("button", { name: "Submit", exact: true })
@@ -5727,7 +5727,7 @@ test.describe("mobile fork regression", () => {
             await expect(page.locator(".message.user")).toContainText(
               "Transcript: session-2",
             );
-            await expect(toolbarFork(page)).toBeEnabled();
+            await expect(messageFork(page)).toBeEnabled();
           }
           await expect(page.locator(".error-banner")).toHaveCount(0);
           await expect(page.getByRole("dialog")).toHaveCount(0);
@@ -5735,7 +5735,10 @@ test.describe("mobile fork regression", () => {
             {
               method: "POST",
               source: sessionId,
-              body: { title: "Late fork title" },
+              body: {
+                title: "Late fork title",
+                entryId: "assistant-session-1",
+              },
             },
           ]);
         } finally {
@@ -5750,7 +5753,20 @@ for (const action of ["fork", "clone"] as const) {
   test(`a late ${action} response preserves subsequent project navigation`, async ({
     page,
   }) => {
-    await mockHost(page);
+    await mockHost(page, {
+      snapshotMessages: [
+        {
+          role: "user",
+          entryId: "late-action-user",
+          content: [{ type: "text", text: "A late action" }],
+        },
+        {
+          role: "assistant",
+          entryId: "late-action-assistant",
+          content: [{ type: "text", text: "A late answer" }],
+        },
+      ],
+    });
     let release!: () => void;
     const held = new Promise<void>((resolve) => {
       release = resolve;
@@ -5768,13 +5784,19 @@ for (const action of ["fork", "clone"] as const) {
       },
     );
     await page.goto("/");
-    await page
-      .getByRole("button", {
-        name:
-          action === "fork" ? "Fork current session" : "Clone current session",
-        exact: true,
-      })
-      .click();
+    if (action === "fork") {
+      await page
+        .locator(".message.assistant .message-actions button")
+        .nth(1)
+        .click();
+    } else {
+      await page
+        .getByRole("button", {
+          name: "Clone current session",
+          exact: true,
+        })
+        .click();
+    }
     await page.getByRole("dialog").getByRole("textbox").fill("Derived chat");
     await page
       .getByRole("dialog")
