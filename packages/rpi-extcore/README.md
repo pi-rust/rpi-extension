@@ -4,6 +4,38 @@ Shared native-agent services for protocol adapters. This is a normal Rust librar
 
 The Web and ACP adapters use the same native RPC driver, request correlation, bounded command writer, child cleanup and run tracker. Native transcripts remain owned by the rpi host. Existing Web and ACP storage locations are preserved by their entrypoints.
 
+## Native startup failure and cleanup ownership
+
+The ready handshake distinguishes EOF before ready, timeout, oversized frames,
+invalid JSON and an incompatible protocol. Startup failures include the owned
+child PID, observed exit status when available, and at most the last 16 KiB of
+raw native stderr (decoded lossily with control characters filtered). Stderr is
+continuously drained and still forwarded to the service stderr after ready;
+never put credentials in native diagnostics. Existing adapter error codes and
+successful ready frames are unchanged.
+
+Before launching, core acquires a supplemental OS lock named
+`native-owner-<sha256(session-id)>.lock` in the supplied timings directory. The
+blocking child-tree reaper owns that lock through actual child exit, not just
+RPC EOF, request cancellation, a stop acknowledgement or a cleanup waiter
+returning. If exit cannot be confirmed, cleanup stays owned and same-ID launches
+in that directory fail closed. Confirmed cleanup releases the lock before it
+signals completion. Stable lock files are never unlinked; their existence alone
+is not evidence of an active owner.
+
+This is launch/cleanup exclusion for callers using the same timings directory
+and requested session ID, not a replacement for the native transcript writer
+lease or a global Service/Registry singleton. Different registries, native CLI
+writers and aliases still rely on native's authoritative transcript lease.
+Separate Service instances do not share live hosts or registry transactions;
+applications must continue to use one Service per registry. There is no automatic
+startup retry, lock stealing, transcript repair or prompt replay in this path.
+
+Unix regressions use isolated shell children (not the installed native binary)
+to cover bounded diagnostics, duplicate launch rejection, concurrent reopen and
+caller cancellation. Fault-injected exit observations additionally verify that
+a cleanup timeout or unknown exit cannot release launch ownership.
+
 ## Transport-neutral native resources
 
 `resources::ResourceSelection`, `Service::apply_resources`,
