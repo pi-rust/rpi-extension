@@ -1,5 +1,9 @@
 use super::*;
 
+#[cfg(windows)]
+#[path = "startup_windows_tests.rs"]
+mod windows;
+
 #[tokio::test]
 async fn empty_ready_is_eof_not_a_json_parse_error() {
     let mut empty = &b""[..];
