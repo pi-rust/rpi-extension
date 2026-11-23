@@ -8,8 +8,10 @@
 .deploy/
 __pycache__/
 
-# Web frontend build dependencies, test output, and generated bundle
-packages/rpi-web/frontend/node_modules/
+# Web frontend build dependencies, test output, and generated bundle.
+# No trailing slash on node_modules: a trailing slash only matches directories,
+# so a stray symlink of that name would otherwise be committed as a blob.
+packages/rpi-web/frontend/node_modules
 packages/rpi-web/frontend/test-results/
 packages/rpi-web/frontend/playwright-report/
 packages/rpi-web/assets/
