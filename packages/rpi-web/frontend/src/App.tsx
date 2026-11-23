@@ -1407,6 +1407,19 @@ export default function App() {
           delete next[session];
           return next;
         });
+        // A successful explicit model choice repairs the remembered model,
+        // so stop advertising that part of an earlier restore failure.
+        setSessionRuntimeFailures((previous) => {
+          const failure = previous[session];
+          if (!failure) return previous;
+          const remaining = { ...failure };
+          delete remaining.provider;
+          delete remaining.modelId;
+          const next = { ...previous };
+          if (Object.keys(remaining).length) next[session] = remaining;
+          else delete next[session];
+          return next;
+        });
       }
       return current;
     };
@@ -1436,6 +1449,16 @@ export default function App() {
       setThinkingPreferenceFailures((prior) => {
         const next = { ...prior };
         delete next[session];
+        return next;
+      });
+      setSessionRuntimeFailures((previous) => {
+        const failure = previous[session];
+        if (!failure?.thinkingLevel) return previous;
+        const remaining = { ...failure };
+        delete remaining.thinkingLevel;
+        const next = { ...previous };
+        if (Object.keys(remaining).length) next[session] = remaining;
+        else delete next[session];
         return next;
       });
     }
@@ -2047,6 +2070,7 @@ export default function App() {
           setStatus("running");
           setInterrupted(false);
           setFailedRun(false);
+          setError("");
           break;
         case "agent_settled": {
           setRows(stopToolTimers);
