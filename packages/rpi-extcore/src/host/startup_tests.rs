@@ -1,5 +1,9 @@
 use super::*;
 
+#[cfg(windows)]
+#[path = "startup_windows_tests.rs"]
+mod windows;
+
 #[tokio::test]
 async fn empty_ready_is_eof_not_a_json_parse_error() {
     let mut empty = &b""[..];
@@ -14,6 +18,107 @@ async fn empty_ready_is_eof_not_a_json_parse_error() {
         .await
         .unwrap_err()
         .contains("invalid rpi ready frame"));
+}
+
+#[tokio::test]
+async fn confirmed_exit_retires_a_reader_without_pipe_eof() {
+    let (_writer, reader) = tokio::io::duplex(64);
+    let (exited, exit) = tokio::sync::watch::channel(None);
+    let capture = StderrCapture::start(reader, exit);
+    exited.send_replace(Some(true));
+    tokio::time::timeout(Duration::from_secs(2), capture.worker)
+        .await
+        .expect("inherited stderr must not retain the reader after confirmed exit")
+        .unwrap();
+    // `_writer` deliberately remains open throughout reader termination.
+}
+
+#[tokio::test]
+async fn unconfirmed_exit_keeps_collecting_until_confirmation() {
+    let (mut writer, reader) = tokio::io::duplex(64);
+    let (exited, exit) = tokio::sync::watch::channel(Some(false));
+    let mut capture = StderrCapture::start(reader, exit);
+    assert!(
+        tokio::time::timeout(Duration::from_millis(20), &mut capture.worker)
+            .await
+            .is_err()
+    );
+    writer.write_all(b"diagnostic after ready\n").await.unwrap();
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while capture.tail.lock().unwrap().is_empty() {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let tail: Vec<u8> = capture.tail.lock().unwrap().iter().copied().collect();
+    assert_eq!(tail, b"diagnostic after ready\n");
+    assert!(!capture.worker.is_finished());
+    exited.send_replace(Some(true));
+    tokio::time::timeout(Duration::from_secs(2), capture.worker)
+        .await
+        .unwrap()
+        .unwrap();
+}
+
+#[tokio::test]
+async fn stderr_eof_does_not_publish_child_exit() {
+    let (writer, reader) = tokio::io::duplex(64);
+    let (_exited, exit) = tokio::sync::watch::channel(None);
+    let observer = exit.clone();
+    let capture = StderrCapture::start(reader, exit);
+    drop(writer);
+    tokio::time::timeout(Duration::from_secs(2), capture.worker)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(*observer.borrow(), None, "pipe EOF is not OS exit evidence");
+}
+
+#[tokio::test]
+async fn cancelling_a_pending_read_closes_the_pipe() {
+    let (mut writer, reader) = tokio::io::duplex(64);
+    let (_exited, exit) = tokio::sync::watch::channel(None);
+    let capture = StderrCapture::start(reader, exit);
+    tokio::task::yield_now().await;
+    capture.worker.abort();
+    assert!(capture.worker.await.unwrap_err().is_cancelled());
+    assert!(writer.write_all(b"no reader").await.is_err());
+}
+
+#[cfg(windows)]
+#[test]
+fn windows_pending_pipe_read_does_not_retain_runtime() {
+    let (writer_tx, writer_rx) = std::sync::mpsc::channel();
+    let (retired_tx, retired_rx) = std::sync::mpsc::channel();
+    let owner = std::thread::spawn(move || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let (writer, _exited, _capture) = runtime.block_on(async {
+            let (writer, reader) = windows_stderr_pipe().await.unwrap();
+            let (exited, exit) = tokio::sync::watch::channel(None);
+            let capture = StderrCapture::start(reader, exit);
+            // Start an actual Windows pipe read, not a duplex mock. The writer
+            // and exit sender remain live while runtime cancellation runs.
+            tokio::task::yield_now().await;
+            assert!(!capture.worker.is_finished());
+            (writer, exited, capture)
+        });
+        writer_tx.send(writer).unwrap();
+        drop(runtime);
+        retired_tx.send(()).unwrap();
+    });
+    let writer = writer_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+    let retired = retired_rx.recv_timeout(Duration::from_secs(2)).is_ok();
+    // Release the test's pipe even on regression before joining the owner.
+    drop(writer);
+    if !retired {
+        retired_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    }
+    owner.join().unwrap();
+    assert!(retired, "Windows stderr read retained the Tokio runtime");
 }
 
 #[cfg(unix)]

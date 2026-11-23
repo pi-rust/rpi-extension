@@ -10,9 +10,24 @@ The ready handshake distinguishes EOF before ready, timeout, oversized frames,
 invalid JSON and an incompatible protocol. Startup failures include the owned
 child PID, observed exit status when available, and at most the last 16 KiB of
 raw native stderr (decoded lossily with control characters filtered). Stderr is
-continuously drained and still forwarded to the service stderr after ready;
-never put credentials in native diagnostics. Existing adapter error codes and
-successful ready frames are unchanged.
+continuously drained by a cancellable async reader and still forwarded to the
+service stderr after ready; diagnostic-sink writes stay off async executors.
+Windows uses a private, local-only overlapped named pipe, rather than Tokio's
+blocking-backed conversion of a standard child pipe, so pending reads can also
+be cancelled there without retaining the blocking pool.
+After confirmed child exit the reader has at most 200 ms to drain final bytes,
+then closes its pipe even if a daemonized descendant still holds stderr open.
+Startup-failure reporting likewise bounds its drain wait and cancels the reader
+on expiry. Reader retirement is not OS-exit evidence and cannot release the
+independent launch lock. Never put credentials in native diagnostics. Existing
+adapter error codes and successful ready frames are unchanged.
+
+The 200 ms budget bounds diagnostic **pipe reading**, not arbitrary kernel I/O.
+Forwarding retains the existing synchronous service-stderr sink on bounded-chunk
+blocking writes. A stalled output destination can still hold a write and delay
+runtime shutdown; do not advertise a universal shutdown deadline. These writes
+must remain joined by runtime/plugin teardown: detaching them merely to return
+from shutdown could leave code executing after its plugin library is unloaded.
 
 Before launching, core acquires a supplemental OS lock named
 `native-owner-<sha256(session-id)>.lock` in the supplied timings directory. The
@@ -34,7 +49,15 @@ startup retry, lock stealing, transcript repair or prompt replay in this path.
 Unix regressions use isolated shell children (not the installed native binary)
 to cover bounded diagnostics, duplicate launch rejection, concurrent reopen and
 caller cancellation. Fault-injected exit observations additionally verify that
-a cleanup timeout or unknown exit cannot release launch ownership.
+a cleanup timeout or unknown exit cannot release launch ownership. Portable
+async-reader tests exercise EOF, cancellation, continued diagnostics and confirmed
+exit without pipe EOF. Unix daemon fixtures (requiring `python3`) additionally
+hold inherited stderr outside the native process group to verify bounded runtime
+retirement after normal shutdown, startup failure and startup cancellation; they
+are not real native acceptance tests. Windows additionally uses a trusted batch
+fixture through `HostSession` and `ProcessTree` to verify inherited named-pipe
+writes reach startup-failure diagnostics, failed launches permit retry, and ready
+children reject duplicates but can shut down and reopen.
 
 ## Transport-neutral native resources
 
