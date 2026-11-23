@@ -4620,7 +4620,11 @@ export default function App() {
     }
   }
 
-  function select(id: string, selectedProjectId?: string) {
+  function select(
+    id: string,
+    selectedProjectId?: string,
+    options: { keepSidebarOpen?: boolean } = {},
+  ) {
     pendingNotificationContinue.current = null;
     // refreshSessions publishes this ref before React renders: URL initialization
     // and post-mutation fallbacks must guard against that latest list too.
@@ -4630,7 +4634,8 @@ export default function App() {
     const blocked = sessionSelectionError(known);
     if (blocked) {
       setError(errorText(blocked));
-      if (window.innerWidth < 768) setSidebar(false);
+      if (!options.keepSidebarOpen && window.innerWidth < 768)
+        setSidebar(false);
       return;
     }
     const nextProject = selectedProjectId ?? known?.projectId;
@@ -4639,7 +4644,8 @@ export default function App() {
       (!nextProject || projectRef.current === nextProject)
     ) {
       setPanel(false);
-      if (window.innerWidth < 768) setSidebar(false);
+      if (!options.keepSidebarOpen && window.innerWidth < 768)
+        setSidebar(false);
       return;
     }
     if (
@@ -4665,7 +4671,8 @@ export default function App() {
     setFollowing(true);
     setSessionId(id);
     setPanel(false);
-    if (window.innerWidth < 768) setSidebar(false);
+    if (!options.keepSidebarOpen && window.innerWidth < 768)
+      setSidebar(false);
     const url = new URL(location.href);
     if (id) url.searchParams.set("session", id);
     else url.searchParams.delete("session");
@@ -4730,7 +4737,11 @@ export default function App() {
                 !entry.archived &&
                 !entry.deleting,
             );
-            select(next?.sessionId ?? "", next?.projectId ?? session.projectId);
+            // Archiving from the sidebar should leave the menu open so
+            // repeated session management does not need a reopen each time.
+            select(next?.sessionId ?? "", next?.projectId ?? session.projectId, {
+              keepSidebarOpen: true,
+            });
           }
         } catch (cause) {
           if (
@@ -4738,11 +4749,6 @@ export default function App() {
             navigation === navigationRevision.current
           )
             setError(retirementError(cause));
-          if (
-            navigation === navigationRevision.current &&
-            window.innerWidth < 768
-          )
-            setSidebar(false);
         }
       },
     );
@@ -4784,11 +4790,12 @@ export default function App() {
           !entry.archived &&
           !entry.deleting,
       );
-      select(next?.sessionId ?? "", next?.projectId ?? session.projectId);
+      select(next?.sessionId ?? "", next?.projectId ?? session.projectId, {
+        keepSidebarOpen: true,
+      });
     } catch (cause) {
       if (navigation !== navigationRevision.current) return;
       setError(retirementError(cause, true));
-      if (window.innerWidth < 768) setSidebar(false);
     } finally {
       deleteInFlight.current = false;
       setDeletePending(false);
