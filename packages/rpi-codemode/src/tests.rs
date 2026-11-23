@@ -436,3 +436,93 @@ fn bound_host_response_preserves_business_names_but_never_actual_credentials() {
         "business"
     );
 }
+
+// ---- adversarial probes (2026-11-23 review): bounded-resource guarantees ----
+
+#[test]
+fn adv_deep_recursion_is_stack_bounded() {
+    let cancelled = Arc::new(AtomicBool::new(false));
+    let action: Arc<Action> = Arc::new(|_| {
+        Ok(
+            json!({"protocolVersion":1,"capabilities":{"resultEnvelope":1,"hostAccounting":1,"parentProgress":1,"losslessValues":1,"resultReferences":1,"contentAttachments":1},"tools":[],"nextOffset":null}),
+        )
+    });
+    let r = engine::execute("function f(){return f()} f()", 2000, action, cancelled);
+    assert_ne!(
+        r["status"], "completed",
+        "unbounded recursion must not complete: {r}"
+    );
+}
+
+#[test]
+fn adv_heap_bomb_is_memory_bounded() {
+    let cancelled = Arc::new(AtomicBool::new(false));
+    let action: Arc<Action> = Arc::new(|_| {
+        Ok(
+            json!({"protocolVersion":1,"capabilities":{"resultEnvelope":1,"hostAccounting":1,"parentProgress":1,"losslessValues":1,"resultReferences":1,"contentAttachments":1},"tools":[],"nextOffset":null}),
+        )
+    });
+    let r = engine::execute(
+        "let a=[]; for(;;){a.push(new Array(1e6).fill('x'))}",
+        3000,
+        action,
+        cancelled,
+    );
+    assert!(
+        matches!(
+            r["status"].as_str(),
+            Some("terminated") | Some("timed_out") | Some("error") | Some("cancelled")
+        ),
+        "heap bomb must be bounded, got {r}"
+    );
+}
+
+#[test]
+fn adv_regex_and_string_bomb_is_bounded() {
+    let cancelled = Arc::new(AtomicBool::new(false));
+    let action: Arc<Action> = Arc::new(|_| {
+        Ok(
+            json!({"protocolVersion":1,"capabilities":{"resultEnvelope":1,"hostAccounting":1,"parentProgress":1,"losslessValues":1,"resultReferences":1,"contentAttachments":1},"tools":[],"nextOffset":null}),
+        )
+    });
+    // repeated string concat: quadratic blowup attempt
+    let r = engine::execute(
+        "let s='x'; for(let i=0;i<40;i++){s=s+s+s;}",
+        3000,
+        action,
+        cancelled,
+    );
+    assert!(
+        matches!(
+            r["status"].as_str(),
+            Some("terminated") | Some("timed_out") | Some("error") | Some("completed")
+        ),
+        "string bomb must not hang, got {r}"
+    );
+    // if completed, result must be within the 1 MiB budget
+    if r["status"] == "completed" {
+        assert!(r.to_string().len() <= engine::MAX_JSON);
+    }
+}
+
+#[test]
+fn adv_no_host_globals_in_guest() {
+    let cancelled = Arc::new(AtomicBool::new(false));
+    let action: Arc<Action> = Arc::new(|_| {
+        Ok(
+            json!({"protocolVersion":1,"capabilities":{"resultEnvelope":1,"hostAccounting":1,"parentProgress":1,"losslessValues":1,"resultReferences":1,"contentAttachments":1},"tools":[],"nextOffset":null}),
+        )
+    });
+    let code = r#"
+        const probes = ['process','require','import','fetch','XMLHttpRequest','WebSocket','__rpi'];
+        const found = probes.filter(p => { try { return typeof globalThis[p] !== 'undefined' } catch(e) { return false } });
+        return found;
+    "#;
+    let r = engine::execute(code, 2000, action, cancelled);
+    assert_eq!(r["status"], "completed", "probe should complete: {r}");
+    let found = r["result"].as_array().cloned().unwrap_or_default();
+    assert!(
+        found.is_empty(),
+        "guest must not see host globals: {found:?}"
+    );
+}

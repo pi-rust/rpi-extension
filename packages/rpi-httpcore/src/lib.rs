@@ -3,7 +3,7 @@
 pub mod access;
 pub mod config;
 pub mod node;
-mod security;
+pub mod security;
 mod server;
 pub mod transport;
 pub use config::AppConfig;
