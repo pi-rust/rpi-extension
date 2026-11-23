@@ -417,6 +417,7 @@
 }
 .workspace .composer-area {
   padding: 10px 22px 18px;
+  --composer-pad-x: 22px;
 }
 .workspace .toolbar {
   height: 56px;
@@ -482,6 +483,7 @@
   }
   .workspace .composer-area {
     padding: 8px 12px 14px;
+    --composer-pad-x: 12px;
   }
   .workspace .conversation-column .welcome {
     padding: 40px 0 12px;

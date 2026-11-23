@@ -131,8 +131,10 @@ test("slash menu floats opaquely above mobile conversation text", async ({
   const geometry = await page.evaluate(() => {
     const menuEl = document.querySelector(".slash-menu")!;
     const inputEl = document.querySelector(".composer textarea")!;
+    const composerEl = document.querySelector(".composer")!;
     const menuRect = menuEl.getBoundingClientRect();
     const inputRect = inputEl.getBoundingClientRect();
+    const composerRect = composerEl.getBoundingClientRect();
     const style = getComputedStyle(menuEl);
     const probes = [
       [(menuRect.left + menuRect.right) / 2, menuRect.top + 4],
@@ -144,6 +146,9 @@ test("slash menu floats opaquely above mobile conversation text", async ({
     ];
     return {
       aboveComposer: menuRect.bottom <= inputRect.top + 1,
+      // The palette is the composer's own box, not a narrower content box.
+      sameLeft: Math.abs(menuRect.left - composerRect.left) <= 1,
+      sameRight: Math.abs(menuRect.right - composerRect.right) <= 1,
       position: style.position,
       opaque: style.backgroundColor === "rgb(255, 255, 255)",
       zIndex: Number(style.zIndex),
@@ -159,4 +164,41 @@ test("slash menu floats opaquely above mobile conversation text", async ({
   expect(geometry.opaque).toBe(true);
   expect(geometry.zIndex).toBeGreaterThan(0);
   expect(geometry.probes.every(Boolean)).toBe(true);
+  expect(geometry.sameLeft).toBe(true);
+  expect(geometry.sameRight).toBe(true);
 });
+
+// The form's side padding changes per breakpoint and per stylesheet, so pin the
+// palette/composer alignment where each of those values is in force.
+for (const [width, height] of [
+  [1280, 900],
+  [1100, 900],
+  [900, 900],
+  [600, 900],
+] as const) {
+  test(`slash menu keeps the composer box at ${width}px`, async ({ page }) => {
+    await page.setViewportSize({ width, height });
+    await mockHost(page);
+    await page.goto(`/?session=${sessionId}`);
+    const input = page.locator(".composer textarea");
+    await expect(input).toBeVisible();
+    await input.fill("/");
+    await expect(page.locator(".slash-menu")).toBeVisible();
+    const box = await page.evaluate(() => {
+      const menu = document
+        .querySelector(".slash-menu")!
+        .getBoundingClientRect();
+      const composer = document
+        .querySelector(".composer")!
+        .getBoundingClientRect();
+      return {
+        left: Math.abs(menu.left - composer.left),
+        right: Math.abs(menu.right - composer.right),
+        width: composer.width,
+      };
+    });
+    expect(box.width).toBeGreaterThan(0);
+    expect(box.left).toBeLessThanOrEqual(1);
+    expect(box.right).toBeLessThanOrEqual(1);
+  });
+}
