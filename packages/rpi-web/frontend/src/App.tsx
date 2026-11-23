@@ -697,6 +697,15 @@ function isFailedOutcome(outcome: string) {
   );
 }
 
+function hasUserTurn(session: SessionSummary) {
+  return Boolean(
+    session.title?.trim() ||
+    session.lastTurnEndedAt ||
+    session.latestSettlement ||
+    session.lastSeq > 0,
+  );
+}
+
 type SettlementIdentity = NonNullable<SessionSummary["latestSettlement"]>;
 const SESSION_NOTIFICATION_SUCCESS_TIMEOUT_MS = 6_000;
 const SESSION_NOTIFICATION_ERROR_TIMEOUT_MS = 12_000;
@@ -857,6 +866,9 @@ export default function App() {
     null,
   );
   const sessionListValue = useRef<SessionSummary[] | null>(null);
+  // Untouched session per project: `createSession` reuses the entry for the
+  // project it is asked to open instead of borrowing another project's chat.
+  const lastEmptySessionId = useRef(new Map<string, string>());
   const sessionListInitialized = useRef(false);
   const sessionTitles = useRef(new Map<string, string>());
   const notifiedSettlements = useRef(new Set<string>());
@@ -2393,6 +2405,7 @@ export default function App() {
     sessionListRevision.current++;
     sessionListRequest.current = null;
     sessionListValue.current = null;
+    lastEmptySessionId.current.clear();
     sessionListInitialized.current = false;
     sessionTitles.current.clear();
     notifiedSettlements.current.clear();
@@ -2487,6 +2500,29 @@ export default function App() {
             }
             sessionListInitialized.current = true;
             sessionListValue.current = list;
+            // Reconcile the per-project tracking with the authoritative list:
+            // keep a tracked entry that is still untouched, otherwise adopt the
+            // oldest listed untouched chat and forget projects that lost theirs.
+            for (const [project, id] of [...lastEmptySessionId.current]) {
+              if (
+                !list.some(
+                  (entry) =>
+                    entry.sessionId === id &&
+                    (entry.projectId ?? "") === project &&
+                    !entry.archived &&
+                    !entry.deleting &&
+                    !hasUserTurn(entry),
+                )
+              )
+                lastEmptySessionId.current.delete(project);
+            }
+            for (const entry of list) {
+              if (entry.archived || entry.deleting || hasUserTurn(entry))
+                continue;
+              const project = entry.projectId ?? "";
+              if (!lastEmptySessionId.current.has(project))
+                lastEmptySessionId.current.set(project, entry.sessionId);
+            }
             setSessions(list);
             return list;
           },
@@ -2519,9 +2555,28 @@ export default function App() {
       try {
         setError("");
         const preference = readModelPreference(targetProject);
-        const created = await api.createSession(targetProject || undefined);
+        // Keep exactly one untouched session per project: login, the New
+        // session button and `/new` all land on the same empty chat until the
+        // user actually sends a prompt. An untouched session has no title,
+        // settlement or transcript activity, so it is safe to reuse — but only
+        // for the project it belongs to, or the sidebar's "New session in
+        // <project>" would silently open a chat in a different project.
+        const emptyId = lastEmptySessionId.current.get(targetProject ?? "");
+        const existing = sessionListValue.current?.find(
+          (entry) =>
+            entry.sessionId === emptyId &&
+            !entry.archived &&
+            !entry.deleting &&
+            !hasUserTurn(entry) &&
+            (entry.projectId ?? "") === (targetProject ?? ""),
+        );
+        const reusedProject = existing?.projectId;
+        const created = existing
+          ? { sessionId: existing.sessionId, status: existing.status }
+          : await api.createSession(targetProject || undefined);
         // Settle the preference before publishing the session or its composer.
         // A failure must not discard the newly-created, reachable session.
+        // Re-applying a saved preference to a reused empty chat is best effort.
         if (preference) {
           const { thinkingLevel, ...model } = preference;
           const hasModel = Boolean(preference.provider && preference.modelId);
@@ -2560,9 +2615,10 @@ export default function App() {
           return;
         }
         navigationRevision.current++;
-        if (targetProject) {
-          projectRef.current = targetProject;
-          setProjectId(targetProject);
+        const nextProject = reusedProject ?? targetProject;
+        if (nextProject) {
+          projectRef.current = nextProject;
+          setProjectId(nextProject);
         }
         activeSessionRef.current = created.sessionId;
         setSessionId(created.sessionId);
@@ -2738,15 +2794,18 @@ export default function App() {
                   project.id === session.projectId && !project.archived,
               )),
         );
+        const empty = reusable.find((session) => !hasUserTurn(session));
         const match =
           (blockedRequest ? undefined : requestedSession) ??
           reusable.find(
             (session) => session.sessionId === activeSessionRef.current,
           ) ??
-          reusable.sort((a, b) => b.updatedAt - a.updatedAt)[0];
+          reusable
+            .filter((session) => hasUserTurn(session))
+            .sort((a, b) => b.updatedAt - a.updatedAt)[0];
         const blocked =
           blockedRequest ??
-          (!match
+          (!match && !empty
             ? sessionSelectionError(
                 list.find((session) => session.archived || session.deleting),
               )
@@ -2754,10 +2813,11 @@ export default function App() {
         const selectionChanges =
           match && match.sessionId !== activeSessionRef.current;
         if (match) select(match.sessionId, match.projectId);
+        else if (empty) select(empty.sessionId, empty.projectId);
         else if (blocked) {
           select("");
           setLoadingSession(false);
-        } else await createSession();
+        } else await createSession(projectRef.current || undefined);
         if (blocked) {
           const message = errorText(blocked);
           initialSelectionError.current = selectionChanges ? message : "";

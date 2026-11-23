@@ -4685,6 +4685,92 @@ test("archiving a previous chat does not navigate away from a newly selected cha
   expect(page.url()).toBe(activeUrl);
 });
 
+test("an empty session is reused instead of creating another one", async ({
+  page,
+}) => {
+  const emptySession = {
+    ...session,
+    sessionId: "empty-session",
+    title: null,
+    lastSeq: 0,
+    lastTurnEndedAt: null,
+    latestSettlement: null,
+    createdAt: 1_700_000_000_000,
+    updatedAt: 1_700_000_000_000,
+  };
+  await mockHost(page);
+  await page.route("**/api/v1/sessions", async (route: Route) => {
+    if (route.request().method() === "GET")
+      return route.fulfill({ json: { sessions: [emptySession] } });
+    throw new Error("an untouched session must not create another session");
+  });
+  await page.route("**/api/v1/sessions/empty-session/open", (route) =>
+    route.fulfill({ json: emptySession }),
+  );
+  await page.goto("/");
+  await expect(page.locator(".toolbar h1")).toHaveText("New session");
+  await expect.poll(() => page.url()).toContain("session=empty-session");
+  let created = 0;
+  page.on("request", (request) => {
+    if (
+      request.url().endsWith("/api/v1/sessions") &&
+      request.method() === "POST"
+    )
+      created++;
+  });
+  await page
+    .getByRole("button", { name: "New session", exact: false })
+    .first()
+    .click();
+  await expect(page.locator(".toolbar h1")).toHaveText("New session");
+  expect(page.url()).toContain("session=empty-session");
+  await page.waitForTimeout(250);
+  expect(created).toBe(0);
+});
+
+test("an untouched session in another project is not reused", async ({
+  page,
+}) => {
+  // Project-scoped "New session in <project>" must open a chat in that project.
+  // A single global empty session would silently switch the project instead.
+  const emptyInA = {
+    ...session,
+    sessionId: "empty-a",
+    projectId: "project-a",
+    title: null,
+    lastSeq: 0,
+    lastTurnEndedAt: null,
+    latestSettlement: null,
+    createdAt: 1_700_000_000_000,
+    updatedAt: 1_700_000_000_000,
+  };
+  const createdInB = {
+    ...emptyInA,
+    sessionId: "empty-b",
+    projectId: "project-b",
+    createdAt: 1_700_000_000_500,
+  };
+  await mockHost(page);
+  let created = 0;
+  await page.route("**/api/v1/sessions", async (route: Route) => {
+    if (route.request().method() === "GET")
+      return route.fulfill({ json: { sessions: [emptyInA] } });
+    created++;
+    return route.fulfill({ status: 201, json: createdInB });
+  });
+  await page.route("**/api/v1/sessions/empty-a/open", (route) =>
+    route.fulfill({ json: emptyInA }),
+  );
+  await page.route("**/api/v1/sessions/empty-b/open", (route) =>
+    route.fulfill({ json: createdInB }),
+  );
+  await page.goto("/");
+  await expect.poll(() => page.url()).toContain("session=empty-a");
+  await clickRowAction(page, "New session in: rpi-package");
+  await expect.poll(() => created).toBe(1);
+  await expect.poll(() => page.url()).toContain("session=empty-b");
+});
+
 test("a failed session list does not create a replacement chat", async ({
   page,
 }) => {
