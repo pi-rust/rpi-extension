@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.10](https://github.com/pi-rust/rpi-extension/compare/rpi-permissions-v0.1.9...rpi-permissions-v0.1.10) - 2026-11-23
+
+### Fixed
+
+- *(webfetch)* reject bracketed IPv6 literals and add security probes ([#52](https://github.com/pi-rust/rpi-extension/pull/52))
+
 ## [0.1.9](https://github.com/pi-rust/rpi-package/compare/rpi-permissions-v0.1.8...rpi-permissions-v0.1.9) - 2026-11-06
 
 ### Fixed
