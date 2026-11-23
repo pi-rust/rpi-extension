@@ -1054,6 +1054,7 @@ export default function App() {
   const attachmentPreviews = useRef(new Set<string>());
   const fileInputRef = useRef<HTMLInputElement>(null);
   const [status, setStatus] = useState("connecting");
+  const [compacting, setCompacting] = useState(false);
   /** Set when the native host reports `host_closed`; cleared on session switch. */
   const hostClosedRef = useRef(false);
   const [loadingSession, setLoadingSession] = useState(false);
@@ -1839,6 +1840,7 @@ export default function App() {
   );
   const busy =
     runActive ||
+    compacting ||
     status === "running" ||
     status === "starting" ||
     status === "awaiting_input";
@@ -2045,12 +2047,14 @@ export default function App() {
           );
           setRunActive(true);
           setStatus("running");
+          if (event.type === "agent_start") setCompacting(false);
           setInterrupted(false);
           setFailedRun(false);
           break;
         case "agent_settled": {
           setRows(stopToolTimers);
           setRunActive(false);
+          setCompacting(false);
           if (freshDialogEvent) {
             dialogRequests.current.clear();
             activeDialogId.current = "";
@@ -2807,6 +2811,7 @@ export default function App() {
     initialSelectionError.current = "";
     setConnectionFailed(false);
     hostClosedRef.current = false;
+    setCompacting(false);
     setStatus("connecting");
     setLoadingSession(Boolean(sessionId));
     setNativeMessageQueries(false);
@@ -3457,16 +3462,31 @@ export default function App() {
     void refreshSessions();
     if (!sessionId) return;
     const controller = new AbortController();
-    void api
-      .runtimeState(sessionId, controller.signal)
-      .then((state) => {
-        if (
-          !controller.signal.aborted &&
-          activeSessionRef.current === sessionId
-        )
-          setRuntime(state);
-      })
-      .catch(() => {});
+    const readRuntime = (allowRetry: boolean) => {
+      api
+        .runtimeState(sessionId, controller.signal)
+        .then((state) => {
+          if (
+            !controller.signal.aborted &&
+            activeSessionRef.current === sessionId
+          )
+            setRuntime(state);
+        })
+        .catch(() => {
+          // A settlement read can race the native host committing a /compact.
+          // Retry once so the footer's CH/context badges reflect the compacted
+          // branch instead of keeping the pre-compact values (#307).
+          if (!allowRetry || controller.signal.aborted) return;
+          window.setTimeout(() => {
+            if (
+              !controller.signal.aborted &&
+              activeSessionRef.current === sessionId
+            )
+              readRuntime(false);
+          }, 1500);
+        });
+    };
+    readRuntime(true);
     return () => controller.abort();
   }, [refreshSessions, sessionId, settleTick]);
 
@@ -3577,6 +3597,7 @@ export default function App() {
         }
         setStatus("running");
         setRunActive(true);
+        setCompacting(true);
         await commandData(
           sessionId,
           "compact",
@@ -3685,6 +3706,7 @@ export default function App() {
         );
         setRunActive(priorActive);
       }
+      if (name === "/compact") setCompacting(false);
       const text = errorText(cause);
       setError(text);
       note(`${name} failed: ${text}`);
@@ -6416,7 +6438,9 @@ export default function App() {
                   {!historical.active && busy && rows.length > 0 && (
                     <div className="working-indicator">
                       <Loader2 size={14} className="spin" />{" "}
-                      {dialog ? t("waitingForAnswer") : t("waiting")}
+                      {dialog
+                        ? t("waitingForAnswer")
+                        : t(compacting ? "compacting" : "waiting")}
                     </div>
                   )}
                 </div>

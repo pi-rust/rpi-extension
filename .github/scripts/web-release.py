@@ -131,7 +131,7 @@ def publish(args):
     root = Path(args.output)
     fragments = assets.collect(root, "rpi-web.*.json", args.source_ref, assets.WEB_TARGETS)
     first = fragments[0]
-    if not re.fullmatch(r"rpi-web-v\d+\.\d+\.\d+", args.tag):
+    if not re.fullmatch(r"rpi-web-v\d+\.\d+\.\d+(?:-preview)?", args.tag):
         raise ValueError("Invalid Web release tag")
     for fragment in fragments:
         if (fragment["schema_version"] != 1 or fragment["name"] != "rpi-web"

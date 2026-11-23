@@ -7263,6 +7263,104 @@ test("a rejected compact command releases the composer and restores its draft", 
   await expect(page.locator(".connection")).toContainText("reconnecting");
 });
 
+
+test("a compact settlement retries a transient runtime read to reset the footer (#307)", async ({
+  page,
+}) => {
+  await mockHost(page);
+  await page.route("**/api/v1/capabilities", (route) =>
+    route.fulfill({
+      json: {
+        ...capabilities,
+        supportedCommands: [...capabilities.supportedCommands, "compact"],
+      },
+    }),
+  );
+  let stateReads = 0;
+  let compactRequested = false;
+  let settled = false;
+  let failNextStateRead = false;
+  let releaseEvents!: () => void;
+  const eventsHeld = new Promise<void>((resolve) => {
+    releaseEvents = resolve;
+  });
+  const stateFor = (compacted: boolean) => ({
+    sessionId,
+    leafId: "leaf-1",
+    context: compacted
+      ? { tokens: 900, window: 960000, percent: 0.1, estimated: true }
+      : { tokens: 200000, window: 960000, percent: 20.8, estimated: false },
+    stats: {
+      messageCount: 1,
+      cachedTokens: compacted ? 10 : 800,
+      uncachedTokens: compacted ? 990 : 200,
+      totalTokens: compacted ? 1000 : 100000,
+      costTotal: 0,
+      cacheHitRatio: null,
+    },
+  });
+  await page.route(
+    `**/api/v1/sessions/${sessionId}/commands`,
+    async (route) => {
+      const body = route.request().postDataJSON();
+      if (body.type === "get_state") {
+        stateReads += 1;
+        if (failNextStateRead) {
+          failNextStateRead = false;
+          return route.fulfill({ status: 503, json: { error: "committing" } });
+        }
+        return route.fulfill({
+          json: response(stateFor(compactRequested), body.type),
+        });
+      }
+      if (body.type === "compact") {
+        compactRequested = true;
+        return route.fulfill({
+          json: response(
+            { outcome: "compacted", summary: "Conversation compacted" },
+            body.type,
+          ),
+        });
+      }
+      return route.fallback();
+    },
+  );
+  await page.route(
+    `**/api/v1/sessions/${sessionId}/events**`,
+    async (route) => {
+      await eventsHeld;
+      settled = true;
+      failNextStateRead = true;
+      return route.fulfill({
+        contentType: "text/event-stream",
+        body: compactRequested
+          ? 'id: 5\nevent: agent_settled\ndata: {"type":"agent_settled","runId":"compact-run","outcome":"completed","summary":"Conversation compacted"}\n\n'
+          : 'event: ready\ndata: {"type":"ready"}\n\n',
+      });
+    },
+  );
+  await page.goto("/");
+  const metrics = page.locator(".composer-metrics.slim-metrics");
+  await expect(
+    metrics.getByLabel("Cache hit: 80%", { exact: true }),
+  ).toBeVisible();
+  await expect(
+    metrics.getByLabel("Context: 200k / 960k", { exact: true }),
+  ).toBeVisible();
+  const input = page.locator(".composer textarea");
+  await input.fill("/compact");
+  await input.press("Enter");
+  await expect.poll(() => compactRequested).toBe(true);
+  releaseEvents();
+  await expect.poll(() => settled).toBe(true);
+  await expect(
+    metrics.getByLabel("Cache hit: 1%", { exact: true }),
+  ).toBeVisible();
+  await expect(
+    metrics.getByLabel("Context: 900 / 960k", { exact: true }),
+  ).toBeVisible();
+  expect(stateReads).toBeGreaterThanOrEqual(2);
+});
 test("a rejected resume keeps its recovery action and releases the busy composer", async ({
   page,
 }) => {
@@ -7497,6 +7595,66 @@ test("an operation accepted in another tab stays busy without an agent_start eve
   await expect(
     page.getByRole("button", { name: "Abort", exact: true }),
   ).toBeEnabled();
+  await expect(page.locator(".working-indicator")).toHaveCount(0);
+});
+
+test("a manual /compact shows the localized compacting indicator", async ({
+  page,
+}) => {
+  await mockHost(page, {
+    snapshotMessages: [
+      {
+        entryId: "compact-status-user",
+        role: "user",
+        content: [{ type: "text", text: "Keep the decisions" }],
+        timestamp: 1_700_000_000_000,
+      },
+    ],
+  });
+  await page.route("**/api/v1/capabilities", (route) =>
+    route.fulfill({
+      json: {
+        ...capabilities,
+        supportedCommands: [...capabilities.supportedCommands, "compact"],
+      },
+    }),
+  );
+  let release!: () => void;
+  const held = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  let pending = false;
+  await page.route(
+    `**/api/v1/sessions/${sessionId}/commands`,
+    async (route) => {
+      if (route.request().postDataJSON().type !== "compact")
+        return route.fallback();
+      pending = true;
+      await held;
+      return route.fulfill({
+        json: {
+          type: "response",
+          command: "compact",
+          success: false,
+          error: "Cannot compact yet",
+        },
+      });
+    },
+  );
+  await page.goto("/");
+  await expect(page.locator(".working-indicator")).toHaveCount(0);
+  await chooseLanguage(page, "zh");
+  const input = page.locator(".composer textarea");
+  await input.fill("/compact keep recent context");
+  await input.press("Enter");
+  await expect.poll(() => pending).toBe(true);
+  const indicator = page.locator(".working-indicator");
+  await expect(indicator).toHaveText("压缩中…");
+  await release();
+  await expect(indicator).toHaveCount(0);
+  await expect(page.locator(".error-banner")).toContainText(
+    "Cannot compact yet",
+  );
 });
 
 test("a live settlement replaces the matching restored settlement", async ({
