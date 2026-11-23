@@ -4633,6 +4633,67 @@ test("delayed diagnostics from another chat cannot replace the active chat queue
   await expect(page.locator(".queue-item")).not.toContainText("Old chat queue");
 });
 
+for (const width of [375, 1280]) {
+  test(`session management keeps the sidebar expanded at ${width}px`, async ({
+    page,
+  }) => {
+    await page.setViewportSize({ width, height: 844 });
+    await mockHost(page, { additionalSessions: 1 });
+    await page.goto("/");
+    const sidebar = page.locator("aside.sidebar.open");
+    if (width < 768) {
+      await expect(sidebar).toHaveCount(0);
+      await page
+        .getByRole("button", { name: "Toggle sidebar", exact: true })
+        .click();
+    }
+    await expect(sidebar).toBeVisible();
+
+    await clickRowAction(page, "Session actions: Mock session");
+    await page.getByRole("menuitem", { name: "Archive", exact: true }).click();
+    await expect(sidebar).toBeVisible();
+    await expect(
+      page.locator(".project-session-link").filter({ hasText: "Mock session" }),
+    ).toHaveCount(0);
+
+    if (width < 768) {
+      await page.getByRole("button", { name: "Close sidebar" }).click();
+      await expect(sidebar).toHaveCount(0);
+      await page
+        .getByRole("button", { name: "Switch session", exact: true })
+        .click();
+      await page
+        .locator(".mobile-session-option")
+        .filter({ hasText: "Recent session 1" })
+        .click();
+      await page
+        .getByRole("button", { name: "Toggle sidebar", exact: true })
+        .click();
+    } else {
+      await page
+        .locator(".project-session-link")
+        .filter({ hasText: "Recent session 1" })
+        .click();
+    }
+    await expect(page.locator(".toolbar h1")).toHaveText("Recent session 1");
+    await expect(sidebar).toBeVisible();
+    await clickRowAction(page, "Session actions: Recent session 1");
+    await page
+      .getByRole("menuitem", { name: "Delete permanently", exact: true })
+      .click();
+    await page
+      .getByRole("dialog", { name: "Delete session permanently" })
+      .getByRole("button", { name: "Delete permanently", exact: true })
+      .click();
+    await expect(sidebar).toBeVisible();
+    await expect(
+      page
+        .locator(".project-session-link")
+        .filter({ hasText: "Recent session 1" }),
+    ).toHaveCount(0);
+  });
+}
+
 test("archiving a previous chat does not navigate away from a newly selected chat", async ({
   page,
 }) => {
