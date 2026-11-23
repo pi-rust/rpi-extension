@@ -7,6 +7,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Support WeCom (企业微信) intelligent-bot long connections alongside Feishu/Lark,
+  including Bot ID/Secret authentication, heartbeat/reconnect handling, passive
+  Markdown/template-card replies, passive-reply fallback to active push,
+  Markdown chunking, exponential reconnect backoff, duplicate Bot ID start
+  protection, `msgid` de-duplication, group mention handling for commands,
+  inbound text/voice/mixed extraction, per-provider session IDs and `wecom`
+  profile validation/tests.
+
+### Fixed
+
+- Aggregate all WeCom Markdown chunk acknowledgements (including passive-reply
+  fallbacks) before reporting delivery success, reject new sends at capacity
+  without evicting pending deliveries, and ignore malformed acknowledgements.
+- Reserve WeCom Bot IDs atomically before startup and retain the reservation
+  through worker shutdown; request cleanup when startup times out.
+- Bound WeCom writes with a shared multi-frame deadline, abandon poisoned
+  transports and fail pending callers on write errors without automatic resend.
+  Allow Stop during connection/authentication and handle worker exit with Stop
+  queued. Only matching outstanding heartbeat acknowledgements reset liveness.
+- Keep Feishu stream polling active during bounded REST requests; validate
+  explicit API success codes, de-duplicate callbacks before side effects and
+  ignore malformed events without poisoning connection state. Only text
+  messages with content beyond mentions trigger Feishu automatic generation.
+- Synchronize receive-state notifications with the queue wait, wake stopped
+  receivers promptly after draining messages, and validate send timeouts before
+  enqueueing either provider's externally visible send command.
+- Reject non-object tool parameters and malformed action/profile/conversation
+  types instead of silently defaulting to `start` or the configured destination;
+  trim identifier parameters and configuration IDs. WeCom callbacks now require
+  `msgid` and a group `chatid`; mention stripping no longer prefix-matches a
+  longer mention key. Remove the unsupported Feishu `MEDIA:` prompt directive.
+- Bound worker runtime shutdown so a blocked auto-reply task cannot make `stop`
+  wait for the full model/process timeout; leaked blocking work may outlive the
+  server but no longer delays shutdown.
+
 ## [0.1.15](https://github.com/pi-rust/rpi-package/compare/rpi-im-message-v0.1.14...rpi-im-message-v0.1.15) - 2026-11-06
 
 ### Fixed

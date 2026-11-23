@@ -279,6 +279,31 @@ exit 1
     }
 
     #[tokio::test]
+    async fn fork_cut_entrypoint_preserves_launch_ownership_and_arguments() {
+        let f = Fixture::new(&format!("printf '%s\\n' \"$@\" > argv\n{READY_SCRIPT}"));
+        let mut options = f.options();
+        options.fork_source = Some("source-session".into());
+        let host =
+            HostSession::spawn_options_with_fork_cut(options.clone(), Some("assistant-entry"))
+                .await
+                .unwrap();
+        let args = std::fs::read_to_string(f.root.join("argv")).unwrap();
+        assert!(args.contains("--fork\nsource-session\n"), "{args}");
+        assert!(args.contains("--fork-entry\nassistant-entry\n"), "{args}");
+        assert!(args.contains("--fork-position\nat\n"), "{args}");
+        let error = HostSession::spawn_options(options.clone())
+            .await
+            .err()
+            .expect("legacy entrypoint must respect the same launch guard");
+        assert!(error.contains("already owned"), "{error}");
+        host.shutdown().await;
+        let reopened = HostSession::spawn_options_with_fork_cut(options, Some("assistant-entry"))
+            .await
+            .unwrap();
+        reopened.shutdown().await;
+    }
+
+    #[tokio::test]
     async fn cancelled_ready_wait_retains_reaper_until_launch_lock_is_released() {
         let f = Fixture::new("printf 'started\\n' > started\nexec sleep 60");
         let options = f.options();

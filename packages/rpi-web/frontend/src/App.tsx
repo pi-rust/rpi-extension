@@ -697,6 +697,15 @@ function isFailedOutcome(outcome: string) {
   );
 }
 
+function hasUserTurn(session: SessionSummary) {
+  return Boolean(
+    session.title?.trim() ||
+    session.lastTurnEndedAt ||
+    session.latestSettlement ||
+    session.lastSeq > 0,
+  );
+}
+
 type SettlementIdentity = NonNullable<SessionSummary["latestSettlement"]>;
 const SESSION_NOTIFICATION_SUCCESS_TIMEOUT_MS = 6_000;
 const SESSION_NOTIFICATION_ERROR_TIMEOUT_MS = 12_000;
@@ -857,6 +866,9 @@ export default function App() {
     null,
   );
   const sessionListValue = useRef<SessionSummary[] | null>(null);
+  // Untouched session per project: `createSession` reuses the entry for the
+  // project it is asked to open instead of borrowing another project's chat.
+  const lastEmptySessionId = useRef(new Map<string, string>());
   const sessionListInitialized = useRef(false);
   const sessionTitles = useRef(new Map<string, string>());
   const notifiedSettlements = useRef(new Set<string>());
@@ -1407,6 +1419,19 @@ export default function App() {
           delete next[session];
           return next;
         });
+        // A successful explicit model choice repairs the remembered model,
+        // so stop advertising that part of an earlier restore failure.
+        setSessionRuntimeFailures((previous) => {
+          const failure = previous[session];
+          if (!failure) return previous;
+          const remaining = { ...failure };
+          delete remaining.provider;
+          delete remaining.modelId;
+          const next = { ...previous };
+          if (Object.keys(remaining).length) next[session] = remaining;
+          else delete next[session];
+          return next;
+        });
       }
       return current;
     };
@@ -1436,6 +1461,16 @@ export default function App() {
       setThinkingPreferenceFailures((prior) => {
         const next = { ...prior };
         delete next[session];
+        return next;
+      });
+      setSessionRuntimeFailures((previous) => {
+        const failure = previous[session];
+        if (!failure?.thinkingLevel) return previous;
+        const remaining = { ...failure };
+        delete remaining.thinkingLevel;
+        const next = { ...previous };
+        if (Object.keys(remaining).length) next[session] = remaining;
+        else delete next[session];
         return next;
       });
     }
@@ -2047,6 +2082,7 @@ export default function App() {
           setStatus("running");
           setInterrupted(false);
           setFailedRun(false);
+          setError("");
           break;
         case "agent_settled": {
           setRows(stopToolTimers);
@@ -2369,6 +2405,7 @@ export default function App() {
     sessionListRevision.current++;
     sessionListRequest.current = null;
     sessionListValue.current = null;
+    lastEmptySessionId.current.clear();
     sessionListInitialized.current = false;
     sessionTitles.current.clear();
     notifiedSettlements.current.clear();
@@ -2463,6 +2500,29 @@ export default function App() {
             }
             sessionListInitialized.current = true;
             sessionListValue.current = list;
+            // Reconcile the per-project tracking with the authoritative list:
+            // keep a tracked entry that is still untouched, otherwise adopt the
+            // oldest listed untouched chat and forget projects that lost theirs.
+            for (const [project, id] of [...lastEmptySessionId.current]) {
+              if (
+                !list.some(
+                  (entry) =>
+                    entry.sessionId === id &&
+                    (entry.projectId ?? "") === project &&
+                    !entry.archived &&
+                    !entry.deleting &&
+                    !hasUserTurn(entry),
+                )
+              )
+                lastEmptySessionId.current.delete(project);
+            }
+            for (const entry of list) {
+              if (entry.archived || entry.deleting || hasUserTurn(entry))
+                continue;
+              const project = entry.projectId ?? "";
+              if (!lastEmptySessionId.current.has(project))
+                lastEmptySessionId.current.set(project, entry.sessionId);
+            }
             setSessions(list);
             return list;
           },
@@ -2495,9 +2555,28 @@ export default function App() {
       try {
         setError("");
         const preference = readModelPreference(targetProject);
-        const created = await api.createSession(targetProject || undefined);
+        // Keep exactly one untouched session per project: login, the New
+        // session button and `/new` all land on the same empty chat until the
+        // user actually sends a prompt. An untouched session has no title,
+        // settlement or transcript activity, so it is safe to reuse — but only
+        // for the project it belongs to, or the sidebar's "New session in
+        // <project>" would silently open a chat in a different project.
+        const emptyId = lastEmptySessionId.current.get(targetProject ?? "");
+        const existing = sessionListValue.current?.find(
+          (entry) =>
+            entry.sessionId === emptyId &&
+            !entry.archived &&
+            !entry.deleting &&
+            !hasUserTurn(entry) &&
+            (entry.projectId ?? "") === (targetProject ?? ""),
+        );
+        const reusedProject = existing?.projectId;
+        const created = existing
+          ? { sessionId: existing.sessionId, status: existing.status }
+          : await api.createSession(targetProject || undefined);
         // Settle the preference before publishing the session or its composer.
         // A failure must not discard the newly-created, reachable session.
+        // Re-applying a saved preference to a reused empty chat is best effort.
         if (preference) {
           const { thinkingLevel, ...model } = preference;
           const hasModel = Boolean(preference.provider && preference.modelId);
@@ -2536,9 +2615,10 @@ export default function App() {
           return;
         }
         navigationRevision.current++;
-        if (targetProject) {
-          projectRef.current = targetProject;
-          setProjectId(targetProject);
+        const nextProject = reusedProject ?? targetProject;
+        if (nextProject) {
+          projectRef.current = nextProject;
+          setProjectId(nextProject);
         }
         activeSessionRef.current = created.sessionId;
         setSessionId(created.sessionId);
@@ -2714,15 +2794,18 @@ export default function App() {
                   project.id === session.projectId && !project.archived,
               )),
         );
+        const empty = reusable.find((session) => !hasUserTurn(session));
         const match =
           (blockedRequest ? undefined : requestedSession) ??
           reusable.find(
             (session) => session.sessionId === activeSessionRef.current,
           ) ??
-          reusable.sort((a, b) => b.updatedAt - a.updatedAt)[0];
+          reusable
+            .filter((session) => hasUserTurn(session))
+            .sort((a, b) => b.updatedAt - a.updatedAt)[0];
         const blocked =
           blockedRequest ??
-          (!match
+          (!match && !empty
             ? sessionSelectionError(
                 list.find((session) => session.archived || session.deleting),
               )
@@ -2730,10 +2813,11 @@ export default function App() {
         const selectionChanges =
           match && match.sessionId !== activeSessionRef.current;
         if (match) select(match.sessionId, match.projectId);
+        else if (empty) select(empty.sessionId, empty.projectId);
         else if (blocked) {
           select("");
           setLoadingSession(false);
-        } else await createSession();
+        } else await createSession(projectRef.current || undefined);
         if (blocked) {
           const message = errorText(blocked);
           initialSelectionError.current = selectionChanges ? message : "";
@@ -4620,7 +4704,11 @@ export default function App() {
     }
   }
 
-  function select(id: string, selectedProjectId?: string) {
+  function select(
+    id: string,
+    selectedProjectId?: string,
+    options: { keepSidebarOpen?: boolean } = {},
+  ) {
     pendingNotificationContinue.current = null;
     // refreshSessions publishes this ref before React renders: URL initialization
     // and post-mutation fallbacks must guard against that latest list too.
@@ -4630,7 +4718,8 @@ export default function App() {
     const blocked = sessionSelectionError(known);
     if (blocked) {
       setError(errorText(blocked));
-      if (window.innerWidth < 768) setSidebar(false);
+      if (!options.keepSidebarOpen && window.innerWidth < 768)
+        setSidebar(false);
       return;
     }
     const nextProject = selectedProjectId ?? known?.projectId;
@@ -4639,7 +4728,8 @@ export default function App() {
       (!nextProject || projectRef.current === nextProject)
     ) {
       setPanel(false);
-      if (window.innerWidth < 768) setSidebar(false);
+      if (!options.keepSidebarOpen && window.innerWidth < 768)
+        setSidebar(false);
       return;
     }
     if (
@@ -4665,7 +4755,8 @@ export default function App() {
     setFollowing(true);
     setSessionId(id);
     setPanel(false);
-    if (window.innerWidth < 768) setSidebar(false);
+    if (!options.keepSidebarOpen && window.innerWidth < 768)
+      setSidebar(false);
     const url = new URL(location.href);
     if (id) url.searchParams.set("session", id);
     else url.searchParams.delete("session");
@@ -4730,7 +4821,11 @@ export default function App() {
                 !entry.archived &&
                 !entry.deleting,
             );
-            select(next?.sessionId ?? "", next?.projectId ?? session.projectId);
+            // Archiving from the sidebar should leave the menu open so
+            // repeated session management does not need a reopen each time.
+            select(next?.sessionId ?? "", next?.projectId ?? session.projectId, {
+              keepSidebarOpen: true,
+            });
           }
         } catch (cause) {
           if (
@@ -4738,11 +4833,6 @@ export default function App() {
             navigation === navigationRevision.current
           )
             setError(retirementError(cause));
-          if (
-            navigation === navigationRevision.current &&
-            window.innerWidth < 768
-          )
-            setSidebar(false);
         }
       },
     );
@@ -4784,11 +4874,12 @@ export default function App() {
           !entry.archived &&
           !entry.deleting,
       );
-      select(next?.sessionId ?? "", next?.projectId ?? session.projectId);
+      select(next?.sessionId ?? "", next?.projectId ?? session.projectId, {
+        keepSidebarOpen: true,
+      });
     } catch (cause) {
       if (navigation !== navigationRevision.current) return;
       setError(retirementError(cause, true));
-      if (window.innerWidth < 768) setSidebar(false);
     } finally {
       deleteInFlight.current = false;
       setDeletePending(false);
@@ -5861,18 +5952,6 @@ export default function App() {
                 <span className="status-dot" /> {connectionLabel}
               </span>
             )}
-            {actions.has("fork") && (
-              <button
-                type="button"
-                disabled={!sessionId || forkPending}
-                className="icon-button toolbar-fork"
-                title={t("forkSession")}
-                aria-label={t("forkSession")}
-                onClick={() => void forkCurrent()}
-              >
-                <GitBranch size={16} />
-              </button>
-            )}
             {actions.has("clone") && (
               <button
                 disabled={!sessionId}
@@ -6378,6 +6457,8 @@ export default function App() {
                                   language={language}
                                   onSpeak={speakMessage}
                                   readingRowId={readingRowId}
+                                  onFork={(entryId) => void forkCurrent(entryId)}
+                                  forkPending={forkPending}
                                   assistantStreamRevision={
                                     assistantStreamRevision
                                   }
@@ -7436,6 +7517,8 @@ const RowView = memo(function RowView({
   todoHistory,
   onSpeak,
   readingRowId,
+  onFork,
+  forkPending,
   assistantStreamRevision,
   thinkingStreaming,
 }: {
@@ -7444,6 +7527,8 @@ const RowView = memo(function RowView({
   todoHistory?: ToolRow[];
   onSpeak?: (rowId: string, text: string) => void;
   readingRowId?: string | null;
+  onFork?: (entryId: string) => void;
+  forkPending?: boolean;
   /** Changes when a streaming assistant turn starts or ends. */
   assistantStreamRevision?: number;
   thinkingStreaming?: boolean;
@@ -7517,6 +7602,8 @@ const RowView = memo(function RowView({
       language={language}
       onSpeak={onSpeak}
       reading={readingRowId === row.id}
+      onFork={onFork}
+      forkPending={forkPending}
       streaming={thinkingStreaming}
       streamKey={`${row.id}:${assistantStreamRevision ?? 0}`}
     />
@@ -7717,6 +7804,8 @@ function MessageRow({
   language,
   onSpeak,
   reading,
+  onFork,
+  forkPending,
   streaming = false,
   streamKey = "",
 }: {
@@ -7724,6 +7813,8 @@ function MessageRow({
   language: Language;
   onSpeak?: (rowId: string, text: string) => void;
   reading?: boolean;
+  onFork?: (entryId: string) => void;
+  forkPending?: boolean;
   streaming?: boolean;
   streamKey?: string;
 }) {
@@ -7762,23 +7853,31 @@ function MessageRow({
         <div className="message-actions">
           <button
             type="button"
-            className="message-copy message-copy-markdown"
+            className="message-copy message-copy-markdown message-action-icon"
             onClick={() => void copyMarkdown()}
             aria-label={copiedMarkdown ? t("copied") : t("copyMarkdown")}
             title={copiedMarkdown ? t("copied") : t("copyMarkdown")}
           >
-            {copiedMarkdown ? <Check size={12} /> : <Copy size={12} />}
-            <span>{copiedMarkdown ? t("copied") : t("copyMarkdown")}</span>
+            {copiedMarkdown ? <Check size={14} /> : <Copy size={14} />}
           </button>
           <button
             type="button"
-            className="message-copy message-copy-markdown"
+            className="message-copy message-copy-markdown message-action-icon"
+            disabled={!row.entryId || forkPending}
+            onClick={() => row.entryId && onFork?.(row.entryId)}
+            aria-label={t("forkHere")}
+            title={t("forkHere")}
+          >
+            <GitBranch size={14} />
+          </button>
+          <button
+            type="button"
+            className="message-copy message-copy-markdown message-action-icon"
             onClick={() => onSpeak?.(row.id, row.text)}
             aria-label={reading ? t("stopReading") : t("readAloud")}
             title={reading ? t("stopReading") : t("readAloud")}
           >
-            {reading ? <VolumeX size={12} /> : <Volume2 size={12} />}
-            <span>{reading ? t("stopReading") : t("readAloud")}</span>
+            {reading ? <VolumeX size={14} /> : <Volume2 size={14} />}
           </button>
         </div>
       )}

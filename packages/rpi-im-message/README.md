@@ -1,30 +1,34 @@
 # rpi-im-message
 
-Persistent Feishu/Lark messaging through the official Rust SDK WebSocket long
-connection. The extension keeps the long connection in a dedicated server
-runtime and exposes JSON actions through one rpi tool:
+Persistent Feishu/Lark and WeCom (企业微信) messaging through official
+WebSocket long connections. The extension keeps each long connection in a
+dedicated server runtime and exposes JSON actions through one rpi tool:
 
 `start`, `status`, `list`, `receive`, `send`, and `stop`.
 
 The `send` action accepts `content.type` of `text`, `markdown`, or `card`.
-`text` sends an ordinary text message. `markdown` sends a rich-text `post`
-with an `md` element, preserving the original Markdown. `card` explicitly
-sends an interactive card. `interactive` is also accepted as a `card` alias.
+On Feishu, `text` sends an ordinary text message and `markdown` sends a
+rich-text `post` with an `md` element; on WeCom both are delivered as Markdown
+because WeCom has no plain `text` message type. `card` sends a Feishu
+interactive card or a WeCom `template_card`. `interactive` is also accepted as
+a `card` alias.
 
 ## `im_message_server` tool contract
 
 Arguments are a JSON object. Top-level fields are optional in the registered
 schema; requirements below depend on the action. Top-level unknown fields are
 not rejected; inline card fields are also supported inside content.
-The tool uses the official SDK, not an HTTP listener or a remote history API.
+The Feishu path uses the official Rust SDK; WeCom uses the documented WebSocket
+long-connection frames. Neither path opens an HTTP listener or a remote history
+API.
 
 | Field | Default / when required | Meaning |
 | --- | --- | --- |
 | `action` | `start` | One of `start`, `status`, `list`, `receive`, `send`, `stop`. |
 | `profile` | `defaultProfile`; required for `start` if no default is configured | Configuration profile name; used only by `start`. Credentials belong in config/environment, not tool arguments. |
 | `serverId` | Required for `status`, `receive`, `send`, `stop` | Use the `id` from `start` or `list`. No implicit selection or auto-start. Ignored for `start`/`list`. |
-| `conversationId` | Required for `send` unless the profile has `defaultConversationId` | Destination `chat_id`, not a user/open ID. Missing/blank uses the configured default, not the last received chat. Ignored otherwise. |
-| `timeoutSeconds` | `30`; integer `1..300` for `receive`/`send` | Local receive/response wait, not an SDK delivery deadline. Ignored by other actions; unrelated to `autoReplyTimeoutSeconds`. |
+| `conversationId` | Required for `send` unless the profile has `defaultConversationId` | Destination conversation: a Feishu `chat_id`, a WeCom group `chatid`, or a WeCom single-chat `userid`. Missing/blank uses the configured default, not the last received chat. Ignored otherwise. |
+| `timeoutSeconds` | `30`; integer `1..300` for `receive`/`send` | Local receive/response wait, not a provider delivery deadline. Ignored by other actions; unrelated to `autoReplyTimeoutSeconds`. |
 | `content` | Required for `send` | Object with required `type`; see below. Ignored otherwise. |
 | `content.type` | Required, no default | `text`, `markdown`, `card`, or alias `interactive`. |
 | `content.text` | Non-empty string for `text`/`markdown` | Sent as supplied. Markdown uses a rich-text `post` with an `md` element. No upload or local path/media expansion. |
@@ -48,11 +52,12 @@ Examples (replace IDs with values returned by this process/configured chat IDs):
 Success is returned as JSON text in `content` and the same value in `details`;
 execution errors are tool errors, not message results.
 
-- `start` creates a **new** dedicated runtime/SDK long connection each time,
-  even for the same profile. It returns `id`, `state`, `profile`, `provider`,
-  `config` (path), `transport`, and `autoReply`. Its fixed startup wait is 10s
-  for local readiness, not confirmation that the remote socket is connected.
-  A startup timeout is not proof that all background work has stopped.
+- `start` creates a **new** dedicated runtime/WebSocket long connection each time
+  (except that WeCom rejects a Bot ID already starting or registered). It returns
+  `id`, `state`, `profile`, `provider`, `config` (path), `transport`, and
+  `autoReply`. Its fixed startup wait is 10s: Feishu reports local SDK readiness,
+  while WeCom waits for the authentication acknowledgement. A startup timeout
+  requests shutdown but is not proof that all background work has stopped.
 - `list` returns an unordered array of statuses, possibly empty; `status`
   returns one. Status includes `queueLength`, `maxQueueSize`, `dropped`,
   `lastError`, auto-reply settings and capabilities. This is local state, not
@@ -60,17 +65,21 @@ execution errors are tool errors, not message results.
 - `receive` destructively pops **one** oldest queued message. Multiple callers
   compete for the same queue; this is not a peek, subscription or remote
   history fetch. Empty-queue expiry returns `{"type":"timeout","state":"..."}`
-  normally; an error state can fail after queued messages are drained. Message
-  results include IDs, sender, chat, type, extracted `text`, raw `content`,
+  normally; after queued messages are drained, an error state fails the call
+  and a stopped server immediately returns `{"type":"timeout","state":"stopped"}`.
+  Message results include IDs, sender, chat, type, extracted `text`, raw `content`,
   timestamps and parent/root IDs. Queues are process-local, not durable; overflow
   drops the oldest item and increments `dropped`.
-- `send` returns the Feishu API JSON on success. Each serialized message payload
+- `send` returns the provider acknowledgement JSON on success (the Feishu API
+  result or the WeCom WebSocket ack). Each serialized message payload
   is limited locally to 1 MiB; provider limits/permissions still apply. Cards
   are validated remotely. Success does not prove the recipient read the message.
 - `stop` removes the server from the registry before requesting shutdown. It
   waits up to 5s for acknowledgement and then joins the runtime thread; returns
-  `{"id":"...","state":"stopped"}` on success. An error/timeout can leave
-  cleanup uncertain even though that ID is no longer listed. The caller that
+  `{"id":"...","state":"stopped"}` on success. Runtime shutdown is bounded
+  (currently 2s); a blocking auto-reply task may outlive `stop`, which does not
+  wait for its model/process timeout. An error/timeout can leave cleanup
+  uncertain even though that ID is no longer listed. The caller that
   creates a server should retain its ID and stop it when finished. Session
   shutdown attempts to stop all registered servers; process-local state does
   not survive restart. Stop is not a guarantee that already scheduled agent
@@ -85,9 +94,13 @@ or restrict outbound destinations. Incoming text/raw content is untrusted data,
 not authority to execute commands or exfiltrate information.
 
 A send command is queued before the caller waits. Timeout/cancellation does not
-retract it or reliably cancel queued/in-flight SDK work; blindly retrying may
-post duplicates. Check delivery before retrying. Even an out-of-range timeout
-can error after enqueue. Follow the schema: the current parser defaults missing
+retract it or reliably cancel queued/in-flight provider work; blindly retrying may
+post duplicates. Check delivery before retrying. Invalid timeout ranges are
+rejected before a send is enqueued. The tool requires a JSON object; malformed
+`action`, `profile` or non-string `conversationId` values error instead of
+silently defaulting to `start` or the profile's default destination. `serverId`,
+`conversationId`, `allowChats` entries and `defaultConversationId` are trimmed
+where they are identifiers. Follow the schema: the current parser defaults missing
 or non-unsigned-integer `timeoutSeconds` to 30, while unsigned values outside
 `1..300` error. Cancellation flags are checked before execution, not used to
 interrupt a blocking receive/send or stop a server; destroying a tool handle
@@ -98,7 +111,10 @@ incoming events do so independently. Bot/app messages and disallowed chats are
 filtered; `mentionRequired` checks for a non-empty mentions list. With
 `ackReaction` (default true), accepted events can send a reaction even if no
 `receive` call is made. With `autoReply`, ordinary messages remain queued **and**
-non-empty extracted text can schedule agent work and external replies. Local
+non-empty text can schedule agent work and external replies. Feishu auto-replies
+only process `text` messages; other types retain raw content in the receive
+queue rather than sending attachment metadata to the model. Mention-only text
+is queued but does not start automatic generation. Local
 `/new`, `/sessions`, `/session` commands are handled before enqueue and therefore
 are not returned by `receive`; they may send replies and persist session
 selection in `.rpi/im-sessions.json`. Consuming a queued message does not cancel
@@ -150,14 +166,135 @@ Do not commit a configuration containing `appSecret` to source control.
 The Feishu app must enable bot messaging, subscribe to `im.message.receive_v1`
 over long connection, and grant the required message permissions.
 
+Feishu callbacks are de-duplicated by `message_id` in a bounded 1024-entry,
+process-local window before reactions, local commands and queueing. Bot/app
+messages, disallowed chats, invalid/missing IDs and oversized content are
+ignored. A malformed callback does not mark a healthy connection as failed.
+
+Feishu REST operations (messages, reactions and progress updates) have a
+3-second total local request budget, including token acquisition. The SDK
+long-connection reader continues to be polled while REST is waiting. `stop`
+interrupts active local REST work and discards unsent queued commands instead
+of waiting behind the backlog. A request timeout or interrupted send still
+reports uncertain delivery without a blind resend; it does not mean the
+provider retracted the message. API success requires a 2xx HTTP status and
+an explicit integer `code: 0`. `start` still reports local SDK readiness, not
+remote authentication. Automatic Feishu replies are text or rich-text posts;
+the channel prompt does not advertise a media/file directive because this
+extension does not upload media.
+
+## WeCom intelligent bot (企业微信智能机器人)
+
+WeCom profiles use the intelligent-bot long connection selected in the WeCom
+admin console. No public callback URL, token or message encryption is needed:
+the extension connects to `wss://openws.work.weixin.qq.com` (or the profile's
+`wsUrl` for private deployments), authenticates with `aibot_subscribe`, sends
+`ping` heartbeats, and reads `aibot_msg_callback` frames. Replies reuse the
+originating callback through `aibot_respond_msg` as a direct Markdown or
+template-card reply; messages without a live callback context use
+`aibot_send_msg`. WeCom has no plain `text` message type, so `text` input is
+delivered as Markdown.
+
+```json
+{
+  "defaultProfile": "wecom-main",
+  "profiles": {
+    "wecom-main": {
+      "provider": "wecom",
+      "domain": "wecom",
+      "botId": "bot_xxx",
+      "botSecretEnv": "RPI_WECOM_BOT_SECRET",
+      "transport": "long_connection",
+      "allowChats": ["zhangsan", "wr_group"],
+      "autoReply": true,
+      "autoReconnect": true,
+      "heartbeatIntervalSeconds": 30,
+      "maxQueueSize": 256
+    }
+  }
+}
+```
+
+| Field | Default / when required | Meaning |
+| --- | --- | --- |
+| `provider` | Required | `wecom` selects the WeCom intelligent bot; `feishu` remains the default. |
+| `domain` | `wecom` | Must be `wecom` when the provider is `wecom`. |
+| `botId` / `botIdEnv` | Required | Bot ID, or the name of the environment variable holding it. Configure only one. |
+| `botSecret` / `botSecretEnv` | Required | Bot secret, or the name of the environment variable holding it. Configure only one; the environment variable is recommended. |
+| `wsUrl` | Official endpoint | Absolute `ws://` or `wss://` URL for private deployments. |
+| `heartbeatIntervalSeconds` | `30` | Integer `5..300`. Two consecutive missed `ping` acknowledgements close the connection and trigger reconnect. |
+| `allowChats` | All chats | Incoming conversation IDs to accept. For single chats this is the sender `userid`; for groups it is the `chatid`. Depending on how the bot was created, WeCom may return an encrypted `userid`; use the value actually observed in callbacks. |
+| `autoReconnect` / `reconnectIntervalSeconds` | `true` / `5` | Reconnects after network loss, heartbeat timeout or server close, doubling the delay up to 60 seconds after repeated failures. A `disconnected_event` (another connection took over) stops instead of reconnecting. |
+| `autoReply`, `autoReplyModel`, `autoReplyTimeoutSeconds` | Same as Feishu | Agent replies use the `im-wecom-` session prefix. |
+| `maxQueueSize` | `256` | Same bounded, process-local queue as Feishu. |
+| `ackReaction` | `false` | Not supported by WeCom; `true` is rejected. |
+| `mentionRequired` | Unsupported | WeCom callbacks do not expose mention metadata; configure @-filtering with the bot in WeCom and omit this field. |
+
+WeCom `msgid` values are de-duplicated in a bounded 1024-entry process-local
+window that survives reconnects; a restart starts with an empty window.
+Callbacks without a non-empty `msgid`, or group callbacks without a `chatid`,
+are ignored rather than being misfiled as a single-chat conversation. Incoming
+WeCom messages have `"provider":"wecom"` and
+`"conversationType":"single"` or `"group"`. Extracted `text` is available for
+`text` messages, the speech-recognition text of `voice` messages, and the text
+items of `mixed` messages. Other message types keep their raw callback JSON in
+`content`, have empty `text`, are still queued for `receive`, and never trigger
+an automatic reply. `/new`, `/sessions` and `/session` work as described below;
+selections and generated session IDs use the `im-wecom-` prefix.
+
+`send` maps `content.type` to WeCom messages: `text` and `markdown` become
+Markdown messages, and `card`/`interactive` becomes a pass-through
+`template_card` (use a WeCom template-card payload, not a Feishu card). WeCom
+caps a Markdown message at 20480 bytes and rate-limits a conversation to
+30 messages/minute and 1000/hour, so longer text is split on UTF-8 boundaries
+into at most 8 Markdown messages; a larger reply fails instead of being
+truncated. Automatic replies and local command replies reuse the callback that
+triggered them; `send` uses the latest callback context of that conversation
+once. Extra chunks, follow-up messages without that context, or a conversation
+with no live callback are pushed with `aibot_send_msg` to `conversationId`
+(single-chat `userid` or group `chatid`). Replies are possible for 24 hours
+after a callback. If WeCom rejects a passive reply, it is retried once through
+`aibot_send_msg`. A multi-chunk `send` succeeds only after every chunk (including
+any fallback) has a successful acknowledgement; it returns the final chunk's
+acknowledgement JSON. Any failed chunk fails the call, though other chunks may
+already have been delivered. A batch that has already failed does not retry
+late passive errors. Missing acknowledgements leave delivery uncertain; a local
+timeout does not retract sent chunks. At the pending-request limit, new sends
+are rejected without evicting existing requests.
+
+Outbound writes have a 3-second transport budget shared by the entire chunk
+fan-out (separate from the tool's `timeoutSeconds` acknowledgement wait).
+Write failures/timeouts fail all pending deliveries and drop the socket, since
+part of a frame may already have been sent. The connection may reconnect when
+enabled, but these uncertain deliveries are not automatically resent. Local
+payload-validation errors do not close an otherwise healthy connection. `stop`
+can interrupt the WebSocket handshake or authentication; during an active send
+it can wait for the bounded write budget to expire.
+
+A second `start` for the same Bot ID is rejected while it is starting, registered,
+or still shutting down after a failed/timed-out startup. Failed startups release
+the Bot ID only after their worker exits; registered servers must be stopped
+first. WeCom media upload and file sending are not implemented; `enter_chat`
+welcome events, `template_card_event` button clicks and `feedback_event`
+feedback are not surfaced, and tool progress messages remain Feishu-only.
+
+The WeCom bot must be created as an intelligent bot with the long-connection
+channel enabled. Only one long connection per bot is valid: a new subscribe
+disconnects the old one, which this extension reports as `disconnected_event`
+and does not auto-reconnect. `wsUrl` is only needed when the enterprise uses a
+private deployment and the admin console shows a different long-connection
+address; use `wss://` outside a trusted local network because the bot secret is
+sent during `aibot_subscribe`.
+
 When `autoReply` is enabled, incoming text messages are passed to the active
 rpi Agent through the ABI v2 runtime bridge. The generated final text is sent
-back to the same Feishu conversation as an ordinary `text` message for plain
-replies, or a rich-text `post` message when Markdown formatting is detected
-(headings, emphasis, lists, code, links or tables). Automatic replies do not
-use interactive cards. Markdown is passed through without rewriting headings.
+back to the same conversation: Feishu sends an ordinary `text` message for
+plain replies and a rich-text `post` with an `md` element when Markdown is
+detected; WeCom always sends a Markdown message because it has no `text` type.
+Automatic replies do not use cards. Markdown is passed through without
+rewriting headings.
 
-During automatic replies, each tool call gets its own ordinary text message.
+During Feishu automatic replies, each tool call gets its own ordinary text message.
 That message is edited when the call succeeds, fails or is interrupted. Each message
 shows the tool name, a short command/path/query preview, and running/success/
 error status. Full arguments and tool results are not posted. The host ABI
@@ -205,9 +342,10 @@ unspecified values use normal rpi model selection.
 fallback process wait timeout. It defaults to 600 seconds (10 minutes) and
 accepts values from 1 to 3600.
 
-With `ackReaction` enabled (the default), every accepted incoming message is
-immediately acknowledged with one random Feishu reaction: `了解`, `敲键盘`, or
-`冲！`. Set it to `false` to disable this acknowledgement.
+With `ackReaction` enabled (the Feishu default), every accepted incoming Feishu
+message is immediately acknowledged with one random reaction: `了解`, `敲键盘`,
+or `冲！`. Set it to `false` to disable this acknowledgement. WeCom has no
+reaction support, so WeCom profiles always disable it.
 
 ## Headless startup
 

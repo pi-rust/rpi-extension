@@ -26,7 +26,12 @@ fn key(profile: &str, chat: &str) -> String {
     format!("{profile}\n{chat}")
 }
 
-fn selection<'a>(value: &'a Value, profile: &str, chat: &str) -> Result<Option<&'a str>, String> {
+fn selection<'a>(
+    value: &'a Value,
+    provider: &str,
+    profile: &str,
+    chat: &str,
+) -> Result<Option<&'a str>, String> {
     let entry = &value["chats"][key(profile, chat)];
     if entry.is_null() {
         return Ok(None);
@@ -37,7 +42,7 @@ fn selection<'a>(value: &'a Value, profile: &str, chat: &str) -> Result<Option<&
     let known = entry["sessions"]
         .as_array()
         .ok_or("invalid IM session list")?;
-    let base = super::conversation_session_id(chat);
+    let base = super::conversation_session_id(provider, chat);
     if !(selected == base || selected.starts_with(&format!("{base}-")))
         || !selected
             .chars()
@@ -49,16 +54,22 @@ fn selection<'a>(value: &'a Value, profile: &str, chat: &str) -> Result<Option<&
     Ok(Some(selected))
 }
 
-pub fn selected(path: &Path, profile: &str, chat: &str) -> Result<Option<String>, String> {
+pub fn selected(
+    path: &Path,
+    provider: &str,
+    profile: &str,
+    chat: &str,
+) -> Result<Option<String>, String> {
     let _guard = STORE_LOCK
         .lock()
         .map_err(|_| "IM session store lock is poisoned")?;
-    selection(&load(path)?, profile, chat).map(|selected| selected.map(str::to_owned))
+    selection(&load(path)?, provider, profile, chat).map(|selected| selected.map(str::to_owned))
 }
 
 /// Unknown slash commands remain normal user prompts.
 pub fn command(
     path: &Path,
+    provider: &str,
     profile: &str,
     chat: &str,
     text: &str,
@@ -68,16 +79,22 @@ pub fn command(
     if !matches!(command, "/new" | "/sessions" | "/session") {
         return None;
     }
-    Some(handle(path, profile, chat, &words))
+    Some(handle(path, provider, profile, chat, &words))
 }
 
-fn handle(path: &Path, profile: &str, chat: &str, words: &[&str]) -> Result<String, String> {
+fn handle(
+    path: &Path,
+    provider: &str,
+    profile: &str,
+    chat: &str,
+    words: &[&str],
+) -> Result<String, String> {
     let _guard = STORE_LOCK
         .lock()
         .map_err(|_| "IM session store lock is poisoned")?;
     let mut value = load(path)?;
-    let base = super::conversation_session_id(chat);
-    let current = selection(&value, profile, chat)?
+    let base = super::conversation_session_id(provider, chat);
+    let current = selection(&value, provider, profile, chat)?
         .unwrap_or(&base)
         .to_owned();
     let entry_key = key(profile, chat);
@@ -139,8 +156,10 @@ mod tests {
                 .as_nanos()
         ));
         std::fs::write(&path, b"{invalid").unwrap();
-        assert!(selected(&path, "p", "oc_a").is_err());
-        assert!(command(&path, "p", "oc_a", "/new").unwrap().is_err());
+        assert!(selected(&path, "feishu", "p", "oc_a").is_err());
+        assert!(command(&path, "feishu", "p", "oc_a", "/new")
+            .unwrap()
+            .is_err());
         assert_eq!(std::fs::read(&path).unwrap(), b"{invalid");
         std::fs::remove_file(path).unwrap();
     }
@@ -154,39 +173,57 @@ mod tests {
                 .unwrap()
                 .as_nanos()
         ));
-        assert!(selected(&path, "p", "oc_a").unwrap().is_none());
-        assert!(command(&path, "p", "oc_a", "/session")
+        assert!(selected(&path, "feishu", "p", "oc_a").unwrap().is_none());
+        assert!(command(&path, "feishu", "p", "oc_a", "/session")
             .unwrap()
             .unwrap()
             .contains("im-feishu-oc_a"));
-        command(&path, "p", "oc_a", "/new").unwrap().unwrap();
-        let first = selected(&path, "p", "oc_a").unwrap().unwrap();
-        command(&path, "p", "oc_a", "/new").unwrap().unwrap();
-        assert_ne!(selected(&path, "p", "oc_a").unwrap().unwrap(), first);
-        assert!(command(&path, "p", "oc_a", "/sessions")
+        command(&path, "feishu", "p", "oc_a", "/new")
+            .unwrap()
+            .unwrap();
+        let first = selected(&path, "feishu", "p", "oc_a").unwrap().unwrap();
+        command(&path, "feishu", "p", "oc_a", "/new")
+            .unwrap()
+            .unwrap();
+        assert_ne!(
+            selected(&path, "feishu", "p", "oc_a").unwrap().unwrap(),
+            first
+        );
+        assert!(command(&path, "feishu", "p", "oc_a", "/sessions")
             .unwrap()
             .unwrap()
             .contains(&first));
-        command(&path, "p", "oc_a", &format!("/session {first}"))
-            .unwrap()
-            .unwrap();
-        assert_eq!(selected(&path, "p", "oc_a").unwrap().unwrap(), first);
-        assert!(command(&path, "p", "oc_b", &format!("/session {first}"))
-            .unwrap()
-            .is_err());
-        assert!(selected(&path, "other-profile", "oc_a").unwrap().is_none());
-        command(&path, "p", "oc_a", "/session im-feishu-oc_a")
+        command(&path, "feishu", "p", "oc_a", &format!("/session {first}"))
             .unwrap()
             .unwrap();
         assert_eq!(
-            selected(&path, "p", "oc_a").unwrap().unwrap(),
+            selected(&path, "feishu", "p", "oc_a").unwrap().unwrap(),
+            first
+        );
+        assert!(
+            command(&path, "feishu", "p", "oc_b", &format!("/session {first}"))
+                .unwrap()
+                .is_err()
+        );
+        assert!(selected(&path, "feishu", "other-profile", "oc_a")
+            .unwrap()
+            .is_none());
+        command(&path, "feishu", "p", "oc_a", "/session im-feishu-oc_a")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            selected(&path, "feishu", "p", "oc_a").unwrap().unwrap(),
             "im-feishu-oc_a"
         );
-        assert!(command(&path, "p", "oc_a", "/session ../../secret")
+        assert!(
+            command(&path, "feishu", "p", "oc_a", "/session ../../secret")
+                .unwrap()
+                .is_err()
+        );
+        assert!(command(&path, "feishu", "p", "oc_a", "/new extra")
             .unwrap()
             .is_err());
-        assert!(command(&path, "p", "oc_a", "/new extra").unwrap().is_err());
-        assert!(command(&path, "p", "oc_a", "普通消息 /new").is_none());
+        assert!(command(&path, "feishu", "p", "oc_a", "普通消息 /new").is_none());
         std::fs::remove_file(path).unwrap();
     }
 }

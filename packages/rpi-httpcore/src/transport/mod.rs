@@ -7,7 +7,7 @@
 mod auth;
 mod connection;
 mod middleware;
-mod origin;
+pub mod origin;
 mod policy;
 mod router;
 mod sse;

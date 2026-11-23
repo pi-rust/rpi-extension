@@ -54,14 +54,14 @@
     "descriptionZh": "将有界任务委派给宿主管理的子代理，接收进度和结构化执行报告。",
     "descriptionEn": "Delegate bounded tasks to host-managed subagents and receive progress updates and structured execution reports.",
     "description": "Delegate bounded tasks to host-managed subagents and receive progress updates and structured execution reports.",
-    "version": "0.1.16",
+    "version": "0.1.17",
     "type": "extension",
     "tool": "delegate_task",
     "inspiredBy": "pi-subagents",
     "sourceDownloadsPerMonth": 362483,
     "install": "rpi install rpi-subagents --github pi-rust/rpi-extension",
     "repository": "https://github.com/pi-rust/rpi-extension",
-    "prebuilt_manifest": "https://github.com/pi-rust/rpi-extension/releases/download/rpi-subagents-v0.1.16/rpi-extension.json"
+    "prebuilt_manifest": "https://github.com/pi-rust/rpi-extension/releases/download/rpi-subagents-v0.1.17/rpi-extension.json"
   },
   {
     "name": "rpi-codemode",
@@ -70,14 +70,14 @@
     "descriptionZh": "使用有界原生 JavaScript 程序调用当前可用工具，组合多步工具操作。",
     "descriptionEn": "Run bounded native JavaScript programs against the tools active in the current invocation.",
     "description": "Run bounded native JavaScript programs against the tools active in the current invocation.",
-    "version": "0.1.16",
+    "version": "0.1.17",
     "type": "extension",
     "tool": "codemode",
     "inspiredBy": "Bounded native JavaScript tool programs",
     "sourceDownloadsPerMonth": null,
     "install": "rpi install rpi-codemode --github pi-rust/rpi-extension",
     "repository": "https://github.com/pi-rust/rpi-extension",
-    "prebuilt_manifest": "https://github.com/pi-rust/rpi-extension/releases/download/rpi-codemode-v0.1.16/rpi-extension.json"
+    "prebuilt_manifest": "https://github.com/pi-rust/rpi-extension/releases/download/rpi-codemode-v0.1.17/rpi-extension.json"
   },
   {
     "name": "rpi-orchestrator",
@@ -86,14 +86,14 @@
     "descriptionZh": "使用会话内的有界任务图规划和调度子代理进程，汇总任务执行结果。",
     "descriptionEn": "Plan and dispatch bounded subagent processes through a session-scoped task graph and collect their results.",
     "description": "Plan and dispatch bounded subagent processes through a session-scoped task graph and collect their results.",
-    "version": "0.1.16",
+    "version": "0.1.17",
     "type": "extension",
     "tool": "subagent + plan + dispatch",
     "inspiredBy": "DAG subagent orchestration",
     "sourceDownloadsPerMonth": null,
     "install": "rpi install rpi-orchestrator --github pi-rust/rpi-extension",
     "repository": "https://github.com/pi-rust/rpi-extension",
-    "prebuilt_manifest": "https://github.com/pi-rust/rpi-extension/releases/download/rpi-orchestrator-v0.1.16/rpi-extension.json"
+    "prebuilt_manifest": "https://github.com/pi-rust/rpi-extension/releases/download/rpi-orchestrator-v0.1.17/rpi-extension.json"
   },
   {
     "name": "rpi-btw",
@@ -118,14 +118,14 @@
     "descriptionZh": "运行预设的差异、Cargo 编译、格式或 Clippy 检查，返回有界代码诊断。",
     "descriptionEn": "Run allowlisted diff, Cargo check, formatting or Clippy checks and return bounded code diagnostics.",
     "description": "Run allowlisted diff, Cargo check, formatting or Clippy checks and return bounded code diagnostics.",
-    "version": "0.1.16",
+    "version": "0.1.17",
     "type": "extension",
     "tool": "code_lens",
     "inspiredBy": "pi-lens",
     "sourceDownloadsPerMonth": 65476,
     "install": "rpi install rpi-lens --github pi-rust/rpi-extension",
     "repository": "https://github.com/pi-rust/rpi-extension",
-    "prebuilt_manifest": "https://github.com/pi-rust/rpi-extension/releases/download/rpi-lens-v0.1.16/rpi-extension.json"
+    "prebuilt_manifest": "https://github.com/pi-rust/rpi-extension/releases/download/rpi-lens-v0.1.17/rpi-extension.json"
   },
   {
     "name": "rpi-todo",
@@ -230,14 +230,14 @@
     "descriptionZh": "保存并查询工具调用的允许和拒绝规则，由宿主挂钩负责执行权限策略。",
     "descriptionEn": "Store and inspect tool allow/deny rules for enforcement through the host permission hook.",
     "description": "Store and inspect tool allow/deny rules for enforcement through the host permission hook.",
-    "version": "0.1.9",
+    "version": "0.1.10",
     "type": "extension",
     "tool": "permissions",
     "inspiredBy": "@gotgenes/pi-permission-system",
     "sourceDownloadsPerMonth": 38300,
     "install": "rpi install rpi-permissions --github pi-rust/rpi-extension",
     "repository": "https://github.com/pi-rust/rpi-extension",
-    "prebuilt_manifest": "https://github.com/pi-rust/rpi-extension/releases/download/rpi-permissions-v0.1.9/rpi-extension.json"
+    "prebuilt_manifest": "https://github.com/pi-rust/rpi-extension/releases/download/rpi-permissions-v0.1.10/rpi-extension.json"
   },
   {
     "name": "rpi-websearch",
@@ -262,26 +262,26 @@
     "descriptionZh": "无需 API key，获取公开 HTTP(S) 页面中的有界文本，不执行 JavaScript。",
     "descriptionEn": "Fetch bounded text from public HTTP(S) pages without an API key or JavaScript execution.",
     "description": "Fetch bounded text from public HTTP(S) pages without an API key or JavaScript execution.",
-    "version": "0.1.9",
+    "version": "0.1.10",
     "type": "extension",
     "tool": "webfetch",
     "inspiredBy": "web access extensions",
     "sourceDownloadsPerMonth": null,
     "install": "rpi install rpi-webfetch --github pi-rust/rpi-extension",
     "repository": "https://github.com/pi-rust/rpi-extension",
-    "prebuilt_manifest": "https://github.com/pi-rust/rpi-extension/releases/download/rpi-webfetch-v0.1.9/rpi-extension.json"
+    "prebuilt_manifest": "https://github.com/pi-rust/rpi-extension/releases/download/rpi-webfetch-v0.1.10/rpi-extension.json"
   },
   {
     "name": "rpi-im-message",
     "nameZh": "rpi-im-message",
     "nameEn": "rpi-im-message",
-    "descriptionZh": "通过飞书或 Lark 长连接接收消息，并发送文本、Markdown 和交互卡片。",
-    "descriptionEn": "Receive Feishu/Lark messages over a persistent connection and send text, Markdown and interactive cards.",
-    "description": "Receive Feishu/Lark messages over a persistent connection and send text, Markdown and interactive cards.",
+    "descriptionZh": "通过飞书、Lark 或企业微信智能机器人长连接接收消息，并发送文本、Markdown 和卡片。",
+    "descriptionEn": "Receive Feishu/Lark or WeCom bot messages over a persistent connection and send text, Markdown and cards.",
+    "description": "Receive Feishu/Lark or WeCom bot messages over a persistent connection and send text, Markdown and cards.",
     "version": "0.1.15",
     "type": "extension",
     "tool": "im_message_server",
-    "inspiredBy": "Hermes Feishu/Lark channels",
+    "inspiredBy": "Hermes Feishu/Lark and WeCom channels",
     "sourceDownloadsPerMonth": null,
     "install": "rpi install rpi-im-message --github pi-rust/rpi-extension",
     "repository": "https://github.com/pi-rust/rpi-extension",
@@ -326,14 +326,14 @@
     "descriptionZh": "通过语音输入和按键说话与 rpi 对话，并可选择开启助手回复朗读。",
     "descriptionEn": "Talk to rpi with voice input and push-to-talk, with optional spoken assistant replies.",
     "description": "Talk to rpi with voice input and push-to-talk, with optional spoken assistant replies.",
-    "version": "0.3.15",
+    "version": "0.3.16",
     "type": "extension",
     "tool": "/voice command + push-to-talk shortcut",
     "inspiredBy": "hands-free voice assistants, made local",
     "sourceDownloadsPerMonth": null,
     "install": "rpi install rpi-voice --github pi-rust/rpi-extension",
     "repository": "https://github.com/pi-rust/rpi-extension",
-    "prebuilt_manifest": "https://github.com/pi-rust/rpi-extension/releases/download/rpi-voice-v0.3.15/rpi-extension.json"
+    "prebuilt_manifest": "https://github.com/pi-rust/rpi-extension/releases/download/rpi-voice-v0.3.16/rpi-extension.json"
   },
   {
     "name": "rpi-acp",
@@ -406,14 +406,14 @@
     "descriptionZh": "在浏览器中管理项目和会话，查看流式对话、工具交互、文件预览与 Git 差异。",
     "descriptionEn": "Manage projects and sessions in a browser with streamed conversations, tool interactions, file previews and Git diffs.",
     "description": "Manage projects and sessions in a browser with streamed conversations, tool interactions, file previews and Git diffs.",
-    "version": "0.1.85",
+    "version": "0.1.86",
     "type": "extension",
     "tool": null,
     "inspiredBy": "Browser project and session workspace",
     "sourceDownloadsPerMonth": null,
     "install": "rpi install rpi-web --github pi-rust/rpi-extension",
     "repository": "https://github.com/pi-rust/rpi-extension",
-    "prebuilt_manifest": "https://github.com/pi-rust/rpi-extension/releases/download/rpi-web-v0.1.85/rpi-extension.json"
+    "prebuilt_manifest": "https://github.com/pi-rust/rpi-extension/releases/download/rpi-web-v0.1.86/rpi-extension.json"
   },
   {
     "name": "rpi-edit-diagnostics",
@@ -438,13 +438,13 @@
     "descriptionZh": "通过原生扩展或独立服务提供 HTTP/SSE API，复用共享运行时且不附带前端界面。",
     "descriptionEn": "Serve the shared runtime through an HTTP/SSE API using a native extension or standalone service, without a frontend.",
     "description": "Serve the shared runtime through an HTTP/SSE API using a native extension or standalone service, without a frontend.",
-    "version": "0.2.4",
+    "version": "0.2.5",
     "type": "extension",
     "tool": null,
     "inspiredBy": "API-only HTTP/SSE service over the shared rpi core",
     "sourceDownloadsPerMonth": null,
     "install": "rpi install rpi-http --github pi-rust/rpi-extension",
     "repository": "https://github.com/pi-rust/rpi-extension",
-    "prebuilt_manifest": "https://github.com/pi-rust/rpi-extension/releases/download/rpi-http-v0.2.4/rpi-extension.json"
+    "prebuilt_manifest": "https://github.com/pi-rust/rpi-extension/releases/download/rpi-http-v0.2.5/rpi-extension.json"
   }
 ]

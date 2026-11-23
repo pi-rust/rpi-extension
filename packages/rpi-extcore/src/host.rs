@@ -758,6 +758,20 @@ impl HostSession {
     }
 
     pub async fn spawn_options(options: SessionOptions) -> Result<Arc<Self>, String> {
+        Self::spawn_options_with_fork_cut(options, None).await
+    }
+
+    /// Start a session and, for a fork launch, cut the new branch at `entry`.
+    ///
+    /// This is a separate entry point instead of two more `SessionOptions`
+    /// fields: `SessionOptions` is public and re-exported, so a new required
+    /// field breaks `cargo package` for every already-published dependent
+    /// (`rpi-mcp-server` verifies its tarball against the released
+    /// `rpi-extcore` from the registry).
+    pub async fn spawn_options_with_fork_cut(
+        options: SessionOptions,
+        fork_cut: Option<&str>,
+    ) -> Result<Arc<Self>, String> {
         let launch_guard = startup::LaunchGuard::acquire(&options)?;
         let launch_options = options.clone();
         let resource_file = resources::StartupFile::prepare(&options).await?;
@@ -780,6 +794,12 @@ impl HostSession {
             command.arg("--session").arg(path);
         } else if let Some(source) = &options.fork_source {
             command.arg("--fork").arg(source);
+            if let Some(entry) = fork_cut {
+                // `at` includes the selected message, matching a message-level
+                // fork action that must keep the assistant reply it started from.
+                command.arg("--fork-entry").arg(entry);
+                command.arg("--fork-position").arg("at");
+            }
         } else {
             command.arg("--session-id").arg(session_id);
         }

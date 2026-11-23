@@ -896,24 +896,26 @@ async fn fork_session_owned(
     }
     fork_options.session_id = requested_id.clone();
     fork_options.fork_source = Some(source_id.to_owned());
-    let session = match HostSession::spawn_options(fork_options).await {
-        Ok(session) => session,
-        Err(error) => {
-            return (
-                ReplyKind::HostUnavailable,
-                json!({"error": error, "code": "host_start_failed"}),
-            )
-                .into_reply()
-        }
-    };
+    let session =
+        match HostSession::spawn_options_with_fork_cut(fork_options, entry_id.as_deref()).await {
+            Ok(session) => session,
+            Err(error) => {
+                return (
+                    ReplyKind::HostUnavailable,
+                    json!({"error": error, "code": "host_start_failed"}),
+                )
+                    .into_reply()
+            }
+        };
     let state_response = session
         .send(json!({"type": "get_state", "id": uuid::Uuid::new_v4().to_string()}))
         .await;
-    let actual_id = match state_response {
-        Ok(response) if response["success"] == true => {
-            response["data"]["sessionId"].as_str().map(str::to_owned)
-        }
-        _ => None,
+    let (actual_id, forked_leaf) = match &state_response {
+        Ok(response) if response["success"] == true => (
+            response["data"]["sessionId"].as_str().map(str::to_owned),
+            response["data"]["leafId"].as_str().map(str::to_owned),
+        ),
+        _ => (None, None),
     };
     let Some(actual_id) = actual_id else {
         session.shutdown().await;
@@ -923,6 +925,27 @@ async fn fork_session_owned(
         )
             .into_reply();
     };
+    // `--fork-entry`/`--fork-position at` make the requested entry the new
+    // branch leaf. A native host that predates those flags stores them as
+    // unknown extension options and forks the whole source branch instead, so
+    // verify the launch actually cut where the caller asked. Failing closed is
+    // required: publishing a full copy as a message fork would report a
+    // `forkEntryId` the transcript does not branch at.
+    if let Some(target) = entry_id.as_deref() {
+        if forked_leaf.as_deref() != Some(target) {
+            session.shutdown().await;
+            return (
+                ReplyKind::InvalidInput,
+                json!({
+                    "error": format!(
+                        "native host did not fork at entry {target}; it requires --fork-entry/--fork-position support"
+                    ),
+                    "code": "invalid_fork_entry"
+                }),
+            )
+                .into_reply();
+        }
+    }
     if !tool_program_queries::valid_id(&actual_id)
         || state.registry.read().await.get(&actual_id).is_some()
         || state.sessions.read().await.contains_key(&actual_id)
@@ -943,49 +966,6 @@ async fn fork_session_owned(
             json!({"error":"forked host destination identity unavailable"}),
         )
             .into_reply();
-    }
-    if let Some(target) = entry_id.as_deref() {
-        let navigation = session
-            .send(json!({
-                "type": "navigate",
-                "id": uuid::Uuid::new_v4().to_string(),
-                "targetId": target,
-            }))
-            .await;
-        match navigation {
-            Err(error) => {
-                session.shutdown().await;
-                return (ReplyKind::HostUnavailable, json!({"error":error})).into_reply();
-            }
-            Ok(response) => {
-                let failed = response.get("success") == Some(&Value::Bool(false))
-                    || response
-                        .get("data")
-                        .and_then(|data| data.get("outcome"))
-                        .and_then(Value::as_str)
-                        == Some("failed");
-                if failed {
-                    session.shutdown().await;
-                    return (
-                        ReplyKind::InvalidInput,
-                        json!({
-                            "error": response
-                                .get("error")
-                                .and_then(Value::as_str)
-                                .or_else(|| {
-                                    response
-                                        .get("data")
-                                        .and_then(|data| data.get("error"))
-                                        .and_then(Value::as_str)
-                                })
-                                .unwrap_or("fork target could not be reached"),
-                            "code": "invalid_fork_entry"
-                        }),
-                    )
-                        .into_reply();
-                }
-            }
-        }
     }
     let prepared = resources::prepare_fork_selection(
         state,
