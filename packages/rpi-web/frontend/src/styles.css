@@ -3809,17 +3809,13 @@ details[open] > summary:before {
     --composer-pad-x: 14px;
   }
   .slash-menu {
-    /* `dvh` tracks the *layout* viewport, which mobile browsers do not shrink
-       when a soft keyboard opens. Cap the palette against VisualViewport too,
-       so it stays below the toolbar while the keyboard is up. */
+    /* Soft keyboards report viewport geometry inconsistently across mobile
+       browsers. The workspace measures the live toolbar-to-composer gap and
+       publishes it here, so the palette always stays inside the visible area
+       and scrolls internally instead of hiding behind the toolbar. */
     max-height: min(44dvh, 340px, var(--slash-keyboard-max-height, 340px));
     overflow-y: auto;
     overscroll-behavior: contain;
-  }
-  .composer-area.soft-keyboard-open .slash-menu {
-    /* The workspace publishes the live gap above the composer while the
-       keyboard is open; the palette scrolls inside that gap. */
-    max-height: var(--slash-keyboard-max-height, 340px);
   }
   .slash-item {
     flex-wrap: wrap;

@@ -942,45 +942,50 @@ export default function App() {
     },
     [],
   );
-  // Mobile browsers keep `innerHeight`/`dvh` fixed while a soft keyboard is
-  // open; `VisualViewport.height` is the only reliable live size. Record the
-  // shrink so the slash palette can shrink with it instead of extending under
-  // (and being painted over by) the top toolbar.
-  const [softKeyboardOpen, setSoftKeyboardOpen] = useState(false);
+  // Keep the slash palette inside the space that is actually visible above
+  // the composer. Browser soft keyboards do not all report the same geometry:
+  // Chromium keeps `innerHeight` fixed and shrinks VisualViewport, while some
+  // mobile browsers shrink both (or keep VisualViewport.height stale). Always
+  // measure the live DOM boxes, and update on every plausible viewport/layout
+  // change instead of trying to infer whether a keyboard is open.
   useEffect(() => {
-    const viewport = window.visualViewport;
-    if (!viewport) return;
     const measure = () => {
-      const layoutHeight =
-        window.innerHeight || document.documentElement.clientHeight;
-      const open = layoutHeight - viewport.height > 120;
       const root = document.querySelector<HTMLElement>(".workspace");
-      if (open && root) {
-        // The palette ends just above the composer. Bound it by the space
-        // actually visible between that composer and the lower of the layout
-        // toolbar and the visual viewport's scrolled top edge.
-        const composer = root.querySelector<HTMLElement>(".composer");
-        const toolbar = root.querySelector<HTMLElement>(".toolbar");
-        const visibleTop = Math.max(
-          toolbar?.getBoundingClientRect().bottom ?? 0,
-          viewport.offsetTop,
-        );
-        const available = composer
-          ? Math.floor(composer.getBoundingClientRect().top - visibleTop - 8)
-          : 340;
-        root.style.setProperty(
-          "--slash-keyboard-max-height",
-          `${Math.max(96, Math.min(340, available))}px`,
-        );
-      }
-      setSoftKeyboardOpen(open);
+      if (!root) return;
+      const composer = root.querySelector<HTMLElement>(".composer");
+      const toolbar = root.querySelector<HTMLElement>(".toolbar");
+      const composerTop = composer?.getBoundingClientRect().top;
+      const toolbarBottom = toolbar?.getBoundingClientRect().bottom ?? 0;
+      const visibleTop = Math.max(
+        toolbarBottom,
+        window.visualViewport?.offsetTop ?? 0,
+      );
+      const available =
+        composerTop === undefined
+          ? 340
+          : Math.floor(composerTop - visibleTop - 8);
+      // Some mobile browsers shrink the layout viewport without updating
+      // VisualViewport.offsetTop. Bound the palette by the live visual height
+      // as well: even if that offset is stale, the menu stays short enough to
+      // leave the toolbar and the first commands visible.
+      const visualHeight = window.visualViewport?.height;
+      const visualBound = visualHeight ? Math.floor(visualHeight * 0.45) : 340;
+      root.style.setProperty(
+        "--slash-keyboard-max-height",
+        `${Math.max(96, Math.min(340, available, visualBound))}px`,
+      );
     };
+    const schedule = () => requestAnimationFrame(measure);
     measure();
-    viewport.addEventListener("resize", measure);
-    viewport.addEventListener("scroll", measure);
+    window.visualViewport?.addEventListener("resize", schedule);
+    window.visualViewport?.addEventListener("scroll", schedule);
+    window.addEventListener("resize", schedule);
+    window.addEventListener("scroll", schedule, true);
     return () => {
-      viewport.removeEventListener("resize", measure);
-      viewport.removeEventListener("scroll", measure);
+      window.visualViewport?.removeEventListener("resize", schedule);
+      window.visualViewport?.removeEventListener("scroll", schedule);
+      window.removeEventListener("resize", schedule);
+      window.removeEventListener("scroll", schedule, true);
     };
   }, []);
   const draftBySession = useRef(loadDrafts());
@@ -6644,10 +6649,7 @@ export default function App() {
               </button>
             )}
 
-            <form
-              className={`composer-area${softKeyboardOpen ? " soft-keyboard-open" : ""}`}
-              onSubmit={submit}
-            >
+            <form className="composer-area" onSubmit={submit}>
               {slashMatches.length > 0 && (
                 <div className="slash-menu">
                   {slashMatches.map((command) => (
