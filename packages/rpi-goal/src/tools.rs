@@ -101,7 +101,7 @@ pub fn run_goal(params: &Value) -> Result<String, String> {
             ))
         }
         "complete" => {
-            let goal = ops::complete()?;
+            let goal = ops::complete_by_model()?;
             Ok(render::envelope(
                 "complete",
                 render::completed_markdown(&goal),

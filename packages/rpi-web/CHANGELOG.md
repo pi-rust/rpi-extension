@@ -2,6 +2,16 @@
 
 ## [Unreleased]
 
+## [0.1.86](https://github.com/pi-rust/rpi-extension/compare/rpi-web-v0.1.85...rpi-web-v0.1.86) - 2026-11-23
+
+### Other
+
+- updated the following local packages: rpi-httpcore
+
+### Fixed
+
+- *(web)* acknowledge a steering send in the composer: while the queued message is being accepted the send button shows a spinning "Sending…" state instead of flipping straight back to the bare stop square
+
 ## [0.1.74](https://github.com/pi-rust/rpi-extension/compare/rpi-web-v0.1.73...rpi-web-v0.1.74) - 2026-11-20
 
 ### Fixed

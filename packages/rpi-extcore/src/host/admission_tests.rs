@@ -1,4 +1,19 @@
 use super::*;
+
+#[test]
+fn resume_without_pending_work_releases_only_its_unaccepted_intent() {
+    let state = Arc::new(StdMutex::new(ExecutionAdmission::default()));
+    let ticket = ExecutionTicket::register(&state, &json!({"type":"resume_pending","id":"resume"}))
+        .unwrap()
+        .unwrap();
+    assert!(ticket.published());
+    state.lock().unwrap().observe(&json!({
+        "type":"response", "command":"resume_pending", "id":"resume", "success":true,
+        "data":{"resumed":false}
+    }));
+    assert!(!state.lock().unwrap().unsettled());
+}
+
 #[test]
 fn correlated_rejection_settlement_and_unsent_rollback_never_clear_other_execution() {
     let state = Arc::new(StdMutex::new(ExecutionAdmission::default()));

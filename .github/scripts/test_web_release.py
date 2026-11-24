@@ -1,6 +1,7 @@
 import argparse
 import importlib.util
 import json
+import re
 from pathlib import Path
 import tempfile
 import unittest
@@ -59,6 +60,23 @@ class WebReleaseTests(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     web.publish(args)
                 upload.assert_not_called()
+
+    def test_preview_tags_are_publishable(self):
+        # Preview releases use `rpi-web-vX.Y.Z-preview`. The validator must
+        # accept that shape (and still reject unknown suffixes), otherwise the
+        # only way to ship a preview is to bypass this script.
+        for tag, expected in [
+            ("rpi-web-v0.1.0", True),
+            ("rpi-web-v0.1.89-preview", True),
+            ("rpi-web-v0.1.89-rc", False),
+            ("rpi-web-v0.1.89-preview-2", False),
+            ("0.1.89-preview", False),
+        ]:
+            self.assertEqual(
+                bool(re.fullmatch(r"rpi-web-v\d+\.\d+\.\d+(?:-preview)?", tag)),
+                expected,
+                tag,
+            )
 
     def test_missing_platform_is_rejected(self):
         with tempfile.TemporaryDirectory() as directory:

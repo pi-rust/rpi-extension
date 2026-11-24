@@ -1,4 +1,8 @@
 #![forbid(unsafe_code)]
+// The `export_plugin!`/`execute_handler!` macros generate `extern "C"` entry
+// points that dereference the caller-supplied API pointer; the SDK's `guard`
+// wrapper owns the safety contract (same allow as the other extension crates).
+#![allow(clippy::not_unsafe_ptr_arg_deref)]
 
 use rpi_plugin_sdk::handles::ToolHandles;
 use rpi_plugin_sdk::{
@@ -402,5 +406,29 @@ mod tests {
         .unwrap();
         assert!(out.contains("false"));
         fs::remove_dir_all(dir).ok();
+    }
+    // ---- adversarial probes (2026-11-23 review): glob matcher semantics ----
+    #[test]
+    fn adv_glob_star_does_not_cross_slashes_documented_or_not() {
+        // This matcher treats `*` as crossing `/` (classic glob would not).
+        // Document actual behavior: `bash(npm *)` matches `npm run anything/evil`.
+        assert!(rule_matches("bash(npm *)", "bash", "npm run anything/evil"));
+        // An exact-prefix deny with star suffix blocks everything after prefix.
+        assert!(rule_matches("bash(git *)", "bash", "git push --force"));
+        assert!(!rule_matches("bash(git *)", "bash", "hg push --force"));
+        // Case-insensitive tool match.
+        assert!(rule_matches("BASH(git *)", "bash", "git status"));
+    }
+
+    #[test]
+    fn adv_deny_wins_over_allow_even_if_allow_listed() {
+        let (tool, target) = ("bash", "rm -rf /");
+        let rules = Rules {
+            allow: vec!["bash(rm *)".into()],
+            deny: vec!["bash(rm -rf *)".into()],
+        };
+        let denied = rules.deny.iter().any(|r| rule_matches(r, tool, target));
+        assert!(denied, "deny must match");
+        // check() computes: denied => allowed=false regardless of allow.
     }
 }

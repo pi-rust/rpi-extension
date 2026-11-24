@@ -439,6 +439,89 @@ test("conversation supports immersive full-screen viewing and Escape exit", asyn
   await expect(page.locator(".toolbar")).toBeVisible();
 });
 
+test("mobile fullscreen hides browser chrome but keeps the composer visible", async ({
+  browser,
+}) => {
+  const context = await browser.newContext({
+    isMobile: true,
+    hasTouch: true,
+    viewport: { width: 390, height: 844 },
+  });
+  try {
+    const page = await context.newPage();
+    await page.addInitScript(() => {
+      const state = { entered: 0, exited: 0 };
+      (window as Window & { fullscreenProbe?: typeof state }).fullscreenProbe =
+        state;
+      Object.defineProperty(Element.prototype, "requestFullscreen", {
+        configurable: true,
+        value: () => {
+          state.entered++;
+          Object.defineProperty(document, "fullscreenElement", {
+            configurable: true,
+            value: document.documentElement,
+          });
+          document.dispatchEvent(new Event("fullscreenchange"));
+          return Promise.resolve();
+        },
+      });
+      Object.defineProperty(Document.prototype, "exitFullscreen", {
+        configurable: true,
+        value: () => {
+          state.exited++;
+          Object.defineProperty(document, "fullscreenElement", {
+            configurable: true,
+            value: null,
+          });
+          document.dispatchEvent(new Event("fullscreenchange"));
+          return Promise.resolve();
+        },
+      });
+    });
+    const embeddedHost = new MockHost(page);
+    await embeddedHost.install();
+    try {
+      await start(page, embeddedHost);
+      const workspace = page.locator(".workspace");
+      expect(await page.evaluate(() => matchMedia("(pointer: coarse)").matches)).toBe(true);
+      expect(await page.locator(".composer-area").isVisible()).toBe(true);
+
+      await page.getByRole("button", { name: "Fullscreen", exact: true }).click();
+      expect(
+        await page.evaluate(
+          () =>
+            (window as Window & { fullscreenProbe: { entered: number } })
+              .fullscreenProbe.entered,
+        ),
+      ).toBe(1);
+      // The page itself must stay intact: no CSS immersive state, composer present.
+      await expect(workspace).not.toHaveClass(/workspace--immersive/);
+      await expect(page.locator(".composer-area")).toBeVisible();
+      await expect(page.locator(".toolbar")).toBeVisible();
+      await expect(
+        page.getByRole("button", { name: "Exit fullscreen", exact: true }),
+      ).toBeVisible();
+
+      await page
+        .getByRole("button", { name: "Exit fullscreen", exact: true })
+        .click();
+      expect(
+        await page.evaluate(
+          () =>
+            (window as Window & { fullscreenProbe: { exited: number } })
+              .fullscreenProbe.exited,
+        ),
+      ).toBe(1);
+      await expect(page.locator(".composer-area")).toBeVisible();
+    } finally {
+      await embeddedHost.dispose();
+      expect(embeddedHost.unexpected).toEqual([]);
+    }
+  } finally {
+    await context.close();
+  }
+});
+
 test("open finishes before a bounded snapshot, and snapshot paints/connects before state", async ({
   page,
   host,
@@ -812,7 +895,9 @@ test("legacy status-less snapshot paints but state seeds status before replay an
   expect(host.count(A, "events")).toBe(0);
   await expect(abort(page)).toHaveCount(0);
   metadata.release();
-  await expect(abort(page)).toBeEnabled();
+  // A draft is present, so the running composer offers Send, not Stop.
+  await expect(send(page)).toBeEnabled();
+  await expect(abort(page)).toHaveCount(0);
   await received(host, A, "events");
   expect(
     host.calls
@@ -820,7 +905,7 @@ test("legacy status-less snapshot paints but state seeds status before replay an
       .url.searchParams.get("after"),
   ).toBe("11");
   await hydrated(page, host);
-  await expect(abort(page)).toBeEnabled();
+  await expect(send(page)).toBeEnabled();
 });
 
 test("without get_messages capability initialization waits for state and never requests a snapshot", async ({

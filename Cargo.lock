@@ -2589,7 +2589,7 @@ dependencies = [
 
 [[package]]
 name = "rpi-codemode"
-version = "0.1.16"
+version = "0.1.17"
 dependencies = [
  "rpi-plugin-sdk 0.3.20",
  "rquickjs",
@@ -2670,7 +2670,7 @@ dependencies = [
 
 [[package]]
 name = "rpi-http"
-version = "0.2.4"
+version = "0.2.5"
 dependencies = [
  "axum",
  "rpi-httpcore",
@@ -2681,7 +2681,7 @@ dependencies = [
 
 [[package]]
 name = "rpi-httpcore"
-version = "0.1.24"
+version = "0.1.25"
 dependencies = [
  "axum",
  "futures-util",
@@ -2704,11 +2704,13 @@ name = "rpi-im-message"
 version = "0.1.15"
 dependencies = [
  "feishu-sdk",
+ "futures-util",
  "regex",
  "rpi-plugin-sdk 0.3.20",
  "rustls",
  "serde_json",
  "tokio",
+ "tokio-tungstenite 0.29.0",
  "wait-timeout",
 ]
 
@@ -2724,7 +2726,7 @@ dependencies = [
 
 [[package]]
 name = "rpi-lens"
-version = "0.1.16"
+version = "0.1.17"
 dependencies = [
  "rpi-plugin-sdk 0.3.20",
  "serde_json",
@@ -2817,7 +2819,7 @@ dependencies = [
 
 [[package]]
 name = "rpi-orchestrator"
-version = "0.1.16"
+version = "0.1.17"
 dependencies = [
  "rpi-plugin-sdk 0.3.20",
  "serde_json",
@@ -2846,7 +2848,7 @@ dependencies = [
 
 [[package]]
 name = "rpi-permissions"
-version = "0.1.9"
+version = "0.1.10"
 dependencies = [
  "rpi-plugin-sdk 0.3.20",
  "serde_json",
@@ -2944,7 +2946,7 @@ dependencies = [
 
 [[package]]
 name = "rpi-subagents"
-version = "0.1.16"
+version = "0.1.17"
 dependencies = [
  "rpi-plugin-sdk 0.3.20",
  "serde_json",
@@ -2972,7 +2974,7 @@ dependencies = [
 
 [[package]]
 name = "rpi-tts"
-version = "0.1.16"
+version = "0.1.17"
 dependencies = [
  "futures-util",
  "native-tls",
@@ -2998,7 +3000,7 @@ dependencies = [
 
 [[package]]
 name = "rpi-voice"
-version = "0.3.15"
+version = "0.3.16"
 dependencies = [
  "cpal",
  "hound",
@@ -3016,7 +3018,7 @@ dependencies = [
 
 [[package]]
 name = "rpi-web"
-version = "0.1.74"
+version = "0.1.86"
 dependencies = [
  "axum",
  "rpi-extcore",
@@ -3031,7 +3033,7 @@ dependencies = [
 
 [[package]]
 name = "rpi-webfetch"
-version = "0.1.9"
+version = "0.1.10"
 dependencies = [
  "reqwest 0.12.28",
  "rpi-plugin-sdk 0.3.20",

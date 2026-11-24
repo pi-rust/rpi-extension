@@ -1,6 +1,6 @@
 # 🚀 rpi 飞书智能消息助手上线 — 让 AI 深度融入你的飞书工作流
 
-> 基于 rpi 的飞书/Lark 长连接消息扩展，实现智能对话、自动应答，让 AI 成为群里的"智能成员"
+> 基于 rpi 的飞书/Lark 与企业微信长连接消息扩展，实现智能对话、自动应答，让 AI 成为群里的"智能成员"
 
 ---
 
@@ -14,11 +14,11 @@
 
 ### 🔌 持久长连接，稳定可靠
 
-基于飞书官方 Rust SDK 的 WebSocket 长连接，配合自动重连 (`autoReconnect`) 机制，确保消息不丢失、连接不断线。即使在网络波动时，系统也能自动恢复。
+基于飞书官方 Rust SDK 的 WebSocket 长连接，配合自动重连 (`autoReconnect`) 机制降低网络波动影响；断线期间的事件、确认状态与投递结果仍可能不确定，不能保证消息绝不丢失。
 
 ### 🎛️ 灵活配置，多账号支持
 
-支持多 profile 配置，可轻松管理多个飞书机器人：
+支持多 profile 配置，可轻松管理多个飞书或企业微信机器人：
 
 ```json
 {
@@ -40,6 +40,13 @@
 }
 ```
 
+### 💬 企业微信智能机器人
+
+配置 `"provider": "wecom"` 即接入企业微信智能机器人长连接，只需 Bot ID 与
+Secret，无需公网回调地址。支持单聊/群聊收消息、被动回复、主动推送、
+自动应答和 `/new`、`/sessions`、`/session` 会话切换；详细字段见
+`packages/rpi-im-message/README.md`。
+
 ### 🖥️ 无头模式，服务端部署友好
 
 ```bash
@@ -50,8 +57,8 @@ rpi --im-message-server --im-profile feishu-main
 
 ### 🔒 安全可控，细粒度权限
 
-- `allowChats` — 白名单限制机器人响应的群组
-- `mentionRequired` — 控制是否只在 @机器人 时回复
+- `allowChats` — 限制机器人接收哪些会话的消息（不限制主动发送目标）
+- `mentionRequired` — 仅飞书：控制是否只在 @机器人 时接收；企业微信需在管理端配置
 - 支持环境变量存储密钥，避免敏感信息泄露到配置文件
 
 ---
@@ -150,14 +157,16 @@ rpi --im-message-server
 
 | 字段 | 类型 | 说明 |
 |------|------|------|
-| `provider` | string | 消息平台，目前支持 `feishu` |
-| `domain` | string | 域名，`feishu` 或 `lark` |
+| `provider` | string | 消息平台：`feishu`（默认）或 `wecom` |
+| `domain` | string | `feishu`/`lark`，企业微信固定 `wecom` |
+| `botId` / `botIdEnv` | string | 企业微信智能机器人 Bot ID（或环境变量名） |
+| `botSecret` / `botSecretEnv` | string | 企业微信智能机器人 Secret（或环境变量名，推荐） |
 | `appId` | string | 飞书应用 App ID |
 | `appSecret` | string | 应用密钥（不推荐写入配置文件） |
 | `appSecretEnv` | string | 存储密钥的环境变量名（推荐） |
 | `transport` | string | 连接方式：`long_connection` |
 | `allowChats` | array | 允许响应的会话 ID 白名单 |
-| `mentionRequired` | bool | 是否仅在 @机器人 时回复 |
+| `mentionRequired` | bool | 是否仅在 @机器人 时接收（仅飞书；企业微信需在管理端配置） |
 | `autoReply` | bool | 是否自动回复消息（默认 false） |
 | `autoReconnect` | bool | 断线后是否自动重连（默认 true） |
 | `maxQueueSize` | int | 消息队列最大容量（默认 256） |

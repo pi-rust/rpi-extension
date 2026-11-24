@@ -60,6 +60,8 @@ pub struct RunTracker {
     kind: RunKind,
     compact_settled: bool,
     accepted: bool,
+    correlated: bool,
+    execution: Option<String>,
     messages: MessageProjection,
     stream_error: Option<String>,
 }
@@ -75,6 +77,8 @@ impl RunTracker {
             kind,
             compact_settled: false,
             accepted: false,
+            correlated: false,
+            execution: None,
             messages: MessageProjection::default(),
             stream_error: None,
         }
@@ -84,6 +88,11 @@ impl RunTracker {
     /// Compact summaries intentionally have no durable message identity.
     pub fn require_message_ids(&mut self, required: bool) {
         self.messages.require_message_ids(required);
+    }
+
+    /// Enable only when advertised by the native ready handshake.
+    pub fn require_execution_identity(&mut self, required: bool) {
+        self.correlated = required;
     }
 
     pub fn observe(&mut self, event: &Value, cancelled: bool) -> RunProgress {
@@ -110,6 +119,21 @@ impl RunTracker {
                 self.accepted = true;
             }
             return progress;
+        }
+        if self.correlated && !matches!(event["type"].as_str(), Some("host_closed" | "session_end"))
+        {
+            if event["requestId"] != self.id || event["lane"] != "main" {
+                return progress;
+            }
+            if event["type"] == "execution_started" {
+                if let Some(execution) = event["executionId"].as_str() {
+                    self.execution = Some(execution.into());
+                }
+                return progress;
+            }
+            if !self.accepted || self.execution.as_deref() != event["executionId"].as_str() {
+                return progress;
+            }
         }
         if self.kind == RunKind::Compact {
             if event["type"] == "agent_settled" && self.accepted {
@@ -146,6 +170,7 @@ impl RunTracker {
             return progress;
         }
         if event["type"] == "agent_settled" && self.accepted {
+            self.compact_settled = true;
             if let Some(error) = self.stream_error.take() {
                 progress.outcome = Some(Err(error));
                 return progress;
@@ -199,6 +224,7 @@ mod tests {
 
     include!("run_compact_tests.rs");
     include!("run_identity_tests.rs");
+    include!("run_execution_tests.rs");
 
     #[test]
     fn acceptance_is_correlated_and_settlement_repairs_the_tail() {

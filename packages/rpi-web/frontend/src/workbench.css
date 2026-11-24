@@ -20,7 +20,11 @@
   background: transparent;
   transition: background 0.15s;
 }
-.workspace-splitter:hover::after,
+@media (hover: hover) {
+  .workspace-splitter:hover::after {
+    background: var(--blue);
+  }
+}
 .workspace-splitter:focus-visible::after,
 .workspace-splitter:active::after {
   background: var(--blue);
@@ -365,7 +369,13 @@
   line-height: 1;
   white-space: nowrap;
 }
-.jump-to-bottom:hover:not(:disabled),
+@media (hover: hover) {
+  .jump-to-bottom:hover:not(:disabled) {
+    border-color: var(--text);
+    background: var(--hover);
+    color: var(--text);
+  }
+}
 .jump-to-bottom:focus-visible {
   border-color: var(--text);
   background: var(--hover);
@@ -407,6 +417,7 @@
 }
 .workspace .composer-area {
   padding: 10px 22px 18px;
+  --composer-pad-x: 22px;
 }
 .workspace .toolbar {
   height: 56px;
@@ -472,6 +483,7 @@
   }
   .workspace .composer-area {
     padding: 8px 12px 14px;
+    --composer-pad-x: 12px;
   }
   .workspace .conversation-column .welcome {
     padding: 40px 0 12px;

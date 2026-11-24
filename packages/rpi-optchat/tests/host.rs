@@ -493,7 +493,7 @@ fn a_tree_move_drops_the_cache_so_the_new_branch_is_read() {
 }
 
 #[test]
-fn an_entry_renderer_reply_covers_optchat_entries_only() {
+fn an_entry_renderer_hides_optchat_entries_only() {
     let _guard = start();
     let handler = RENDERER.lock().unwrap().expect("entry renderer registered");
     let render = |value: Value| {
@@ -507,13 +507,23 @@ fn an_entry_renderer_reply_covers_optchat_entries_only() {
         rpi_plugin_sdk::callbacks::free_string(output);
         (rc, text)
     };
-    let (rc, text) = render(json!({
-        "customType": "optchat-node",
-        "data": {"l": 1, "i": 0, "text": "a model written line"},
-    }));
-    assert_eq!(rc, 0);
-    assert!(text.contains("OptChat summary 1+0"), "{text}");
-    assert!(text.contains("a model written line"), "{text}");
+    for value in [
+        json!({"customType": "optchat-entry", "data": {
+            "i": 0, "kind": "user", "text": "legacy captured prompt", "date": "2026-01-01T00:00:00Z"
+        }}),
+        json!({"customType": "optchat-node", "data": {"l": 1, "i": 0, "text": "a model written line"}}),
+        json!({"customType": "optchat-view", "data": {"parts": []}}),
+        json!({"customType": "optchat-profile", "data": {"name": "work"}}),
+        json!({"customType": "optchat-config", "data": {"enabled": false}}),
+        json!({"customType": "optchat-entry", "data": null}),
+    ] {
+        let (rc, text) = render(value);
+        assert_eq!(rc, 0);
+        assert_eq!(
+            serde_json::from_str::<Value>(&text).unwrap(),
+            json!({"display": false})
+        );
+    }
 
     let (rc, text) = render(json!({"customType": "goal", "data": {"active": true}}));
     assert_eq!(rc, 1, "another extension's entry must fall through");

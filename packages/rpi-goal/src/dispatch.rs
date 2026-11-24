@@ -160,7 +160,11 @@ fn run() {
 enum Plan {
     Idle,
     Wait(Instant),
-    Send(Box<Goal>, u64),
+    /// The prompt to send. `Some((action, token))` overrides the standard
+    /// continuation with the verifier-directed next action queued by
+    /// `_verify-result`; the token lets fold-back clear only the action this run
+    /// actually served.
+    Send(Box<Goal>, u64, Option<(String, u64)>),
     Stop(Status, String, Option<&'static str>),
 }
 
@@ -195,7 +199,7 @@ fn step() -> Option<Instant> {
             stop(status, &reason, cause);
             None
         }
-        Plan::Send(goal, revision) => {
+        Plan::Send(goal, revision, verdict_prompt) => {
             // A pause or replacement may have committed after `evaluate`
             // released the state lock. Check again before touching the host so
             // a stale plan cannot start a run for a stopped or replaced goal.
@@ -207,7 +211,7 @@ fn step() -> Option<Instant> {
             if !dispatch_is_current(&goal, revision) {
                 return None;
             }
-            dispatch(&goal, revision);
+            dispatch(&goal, revision, verdict_prompt);
             None
         }
     }
@@ -271,10 +275,17 @@ fn evaluate(goals: Goals, settings: settings::Settings, tools_available: bool) -
     if goal.active_since.is_none() {
         goal.start_clock(now);
     }
+    // A queued verifier next action replaces the generic continuation prompt.
+    // It stays in state (with its token) until the run's fold-back consumes
+    // exactly that version, so a newer verdict is never dropped by an older run.
+    let verdict_prompt = goal
+        .pending_next_action
+        .clone()
+        .map(|action| (action, goal.pending_next_action_seq));
     let mut next = goals.clone();
     next.active = Some(goal.clone());
     let revision = state::queue(&next);
-    Plan::Send(Box::new(goal), revision)
+    Plan::Send(Box::new(goal), revision, verdict_prompt)
 }
 
 /// Whether a plan created by `evaluate` is still the current intent. The
@@ -292,15 +303,28 @@ fn dispatch_is_current(goal: &Goal, revision: u64) -> bool {
 
 /// Send one continuation and fold the outcome back into state. The call blocks
 /// until the run ends, so the settlement that follows is already queued.
-fn dispatch(goal: &Goal, revision: u64) {
+fn dispatch(goal: &Goal, revision: u64, verdict_prompt: Option<(String, u64)>) {
     if !dispatch_is_current(goal, revision) {
         return;
     }
     let first = goal.iteration <= 1;
-    let prompt = if first {
-        prompts::kickoff(goal)
-    } else {
-        prompts::continuation(goal, goal.iteration)
+    let served_verdict = verdict_prompt.clone();
+    let prompt = match verdict_prompt {
+        Some((action, _token)) => {
+            let verdict =
+                goal.verifications
+                    .last()
+                    .cloned()
+                    .unwrap_or(crate::state::GoalVerification {
+                        outcome: crate::state::VerdictOutcome::NotSatisfied,
+                        reason: None,
+                        next_action: Some(action),
+                        at_ms: state::now_ms(),
+                    });
+            prompts::verdict_continuation(goal, &verdict)
+        }
+        None if first => prompts::kickoff(goal),
+        None => prompts::continuation(goal, goal.iteration),
     };
     AUTOMATIC.store(true, Ordering::SeqCst);
     let result = crate::call_runtime(
@@ -347,6 +371,14 @@ fn dispatch(goal: &Goal, revision: u64) {
                                 let mut active = active;
                                 active.last_outcome = Some(other.to_string());
                                 active.updated_at = state::now_ms();
+                                // The verifier-directed run has been served; a
+                                // completed/aborted/errored run keeps it queued
+                                // so `/goal resume` re-runs it. Clear only the
+                                // exact version this run served — a newer verdict
+                                // that arrived during the run must survive.
+                                if let Some((_, token)) = &served_verdict {
+                                    active.clear_pending_next_action_if_served(*token);
+                                }
                                 goals.active = Some(active);
                                 state::queue(&goals);
                                 true

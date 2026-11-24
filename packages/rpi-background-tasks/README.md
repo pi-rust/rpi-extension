@@ -114,6 +114,46 @@ session — and is tracked separately. It does not weaken the ownership
 guarantee: one session can never *see or control* another's jobs through the
 tools, only observe stray records in its transcript.
 
+## Host bridge (`/jobs` command face)
+
+Only the model can call tools, so an embedding host that surfaces background
+work in its own UI (a status panel Stop button) needs a way to cancel without a
+model turn. The `/jobs` slash command mirrors the tool actions:
+
+```
+/jobs list                 — this session's live jobs (same text as the tool)
+/jobs tail <jobId> [lines] — trailing output of one job
+/jobs kill <jobId>         — stop a job (same settle + persist path as the tool)
+```
+
+Session scoping uses the host's **live branch context**, never caller input or
+persisted snapshot rows. Tool arguments get `__rpi.sessionId` injected by the
+engine; command envelopes carry no host context, so the command face asks
+`GetSessionBranch` for the active `sessionId` and compares it with the live
+job's owner. Snapshot membership is deliberately **not** authoritative: a fork
+inherits its parent's snapshot entries, and `AppendEntry` has a write-visibility
+window where a snapshot can land in whichever session is active at commit time.
+
+- **Only the host's active session is actionable.** A panel for a non-active
+  session must switch to that session before invoking `/jobs`; command envelopes
+  do not identify a separate panel session. Cross-session errors name the active
+  session and ask the caller to switch rather than treating snapshots as authority.
+- A job owned by another session is refused even when its row (and snapshot) is
+  visible in the same process. `tail`/`kill` use the same guard.
+- The host must implement `GetSessionBranch` with `filtered: true` and a nonempty
+  live `sessionId` in the same response; SDK ABI compatibility alone does not
+  guarantee these fields. Hosts without this capability fail closed and callers
+  must use the `jobs` tool from the session itself.
+- Command registration is optional: if the host omits or rejects it, the
+  `background` and `jobs` tools remain available (rejection logs a diagnostic).
+- After a process reload the live table is empty: `list` reports no jobs and
+  `kill` says the id is untracked rather than replaying stale snapshots.
+- Because the check is live, a job spawned during an active run is stoppable
+  immediately — no need to wait for its start snapshot to commit.
+A `kill` always settles the row and appends the `cancelled` snapshot through
+the same `settle` path the tool uses — a supervisor reading the branch sees the
+cancellation even when the kill came from the host.
+
 ## Lifecycle
 
 - **Cancelling the tool call** does not kill a started job. `background` returns

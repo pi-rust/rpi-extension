@@ -64,6 +64,20 @@ fn main() {
         r#"{{"type":"ready","protocol":"rpi","supportedCommands":["get_state","get_resource_state","get_messages","get_queue","get_session_branch","set_model","set_thinking_level","navigate","execute_command"],"resourceState":{resource}}}"#
     ));
     std::fs::write(format!("started-{id}"), std::process::id().to_string()).unwrap();
+    // A legacy host predates --fork-entry: it keeps the flags as unknown
+    // extension options and forks the whole branch. The `ignore-fork-entry`
+    // fixture flag reproduces that so the service fail-closed check is covered.
+    let legacy_fork = Path::new("ignore-fork-entry").exists();
+    let fork_entry = arg("--fork-entry").filter(|_| !legacy_fork);
+    if let Some(entry) = &fork_entry {
+        std::fs::write(format!("fork-entry-{id}"), entry).unwrap();
+        std::fs::write(
+            format!("fork-position-{id}"),
+            arg("--fork-position").unwrap_or_else(|| "at".into()),
+        )
+        .unwrap();
+    }
+    let fork_leaf = fork_entry.clone();
     let watched_id = id.clone();
     std::thread::spawn(move || loop {
         std::thread::sleep(Duration::from_millis(20));
@@ -84,7 +98,11 @@ fn main() {
         let mut success = true;
         let data = match kind.as_str() {
             "get_state" => format!(
-                r#"{{"sessionId":"{id}","model":"{model}","provider":"{provider}","thinkingLevel":"{thinking}","activeOperation":null,"queue":{{"steeringCount":0,"followUpCount":0}}}}"#
+                r#"{{"sessionId":"{id}","model":"{model}","provider":"{provider}","thinkingLevel":"{thinking}","leafId":{},"activeOperation":null,"queue":{{"steeringCount":0,"followUpCount":0}}}}"#,
+                match &fork_leaf {
+                    Some(entry) => format!("\"{entry}\""),
+                    None => "null".to_string(),
+                }
             ),
             "get_resource_state" => {
                 reads += 1;

@@ -24,6 +24,7 @@ import {
   Code2,
   Copy,
   Database,
+  Download,
   Files,
   Gauge,
   GitBranch,
@@ -50,6 +51,11 @@ import {
   VolumeX,
   X,
 } from "lucide-react";
+import { useInstallApp } from "./installApp";
+import { FilePreview } from "./FilePreview";
+import { readPreviewLink } from "./previewLink";
+import type { ProjectFileLink } from "./messageLinks";
+import { speakableText, splitForSpeech } from "./speech";
 import { MarkdownBody } from "./MarkdownBody";
 import { ShellCommand } from "./ShellCommand";
 import { SessionAnswerBadge, SessionIssueBadge } from "./SessionIssueBadge";
@@ -210,6 +216,22 @@ function loadDrafts(): Map<string, string> {
   } catch {
     return new Map();
   }
+}
+
+/**
+ * 50 ms of silence: enough for a gesture-initiated play to unlock the shared
+ * audio element without making a sound.
+ */
+const SILENT_AUDIO =
+  "data:audio/wav;base64,UklGRrQBAABXQVZFZm10IBAAAAABAAEAQB8AAEAfAAABAAgAZGF0YZABAACAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICA";
+
+/** `play()` outside a gesture is rejected by autoplay policies. */
+function isAutoplayBlocked(cause: unknown) {
+  if (!(cause instanceof DOMException)) return false;
+  return (
+    cause.name === "NotAllowedError" ||
+    /user gesture|not allowed by the user agent|autoplay/i.test(cause.message)
+  );
 }
 
 function saveDrafts(drafts: Map<string, string>) {
@@ -675,6 +697,15 @@ function isFailedOutcome(outcome: string) {
   );
 }
 
+function hasUserTurn(session: SessionSummary) {
+  return Boolean(
+    session.title?.trim() ||
+    session.lastTurnEndedAt ||
+    session.latestSettlement ||
+    session.lastSeq > 0,
+  );
+}
+
 type SettlementIdentity = NonNullable<SessionSummary["latestSettlement"]>;
 const SESSION_NOTIFICATION_SUCCESS_TIMEOUT_MS = 6_000;
 const SESSION_NOTIFICATION_ERROR_TIMEOUT_MS = 12_000;
@@ -734,6 +765,20 @@ export default function App() {
   const [sessionId, setSessionId] = useState("");
   const [timelineOpen, setTimelineOpen] = useState(false);
   const [immersive, setImmersive] = useState(false);
+  const isMobileViewport = () =>
+    window.matchMedia("(pointer: coarse)").matches ||
+    // A coarse pointer is the reliable signal, but some Android browsers report
+    // a fine pointer (desktop or stylus modes) while still running on a phone.
+    // Their soft keyboard must insert newlines instead of sending.
+    /Android|iPhone|iPad|iPod|Mobile|HarmonyOS|HuaweiBrowser/i.test(
+      navigator.userAgent,
+    );
+  // Mobile keeps the whole page visible (including the composer) and only
+  // asks the browser to hide its own chrome. Desktop keeps the CSS immersive
+  // reading mode; the two paths are deliberately independent.
+  const [browserFullscreen, setBrowserFullscreen] = useState(false);
+  const browserFullscreenRef = useRef(false);
+  const immersiveActionsRef = useRef<{ exit: () => void } | null>(null);
   useEffect(() => {
     setTimelineOpen(false);
   }, [sessionId]);
@@ -741,11 +786,25 @@ export default function App() {
   useEffect(() => {
     if (!immersive) return;
     const onKeyDown = (event: KeyboardEvent) => {
-      if (event.key === "Escape") exitImmersive();
+      if (event.key === "Escape") immersiveActionsRef.current?.exit();
     };
     document.addEventListener("keydown", onKeyDown);
     return () => document.removeEventListener("keydown", onKeyDown);
   }, [immersive]);
+
+  // Only observes browser fullscreen we requested. A system gesture or Esc
+  // that leaves fullscreen just resets the toggle; page UI is never hidden.
+  useEffect(() => {
+    const onChange = () => {
+      const active = Boolean(document.fullscreenElement);
+      if (!active && browserFullscreenRef.current) {
+        browserFullscreenRef.current = false;
+        setBrowserFullscreen(false);
+      }
+    };
+    document.addEventListener("fullscreenchange", onChange);
+    return () => document.removeEventListener("fullscreenchange", onChange);
+  }, []);
   const [projects, setProjects] = useState<Project[]>([]);
   const [projectsRoot, setProjectsRoot] = useState("");
   const [projectDialog, setProjectDialog] = useState(false);
@@ -757,6 +816,12 @@ export default function App() {
   const [deletePending, setDeletePending] = useState(false);
   const deleteInFlight = useRef(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
+  /** Preview restored from `?file=…`; the dialog itself keeps the URL current. */
+  const [linkedPreview, setLinkedPreview] = useState<ProjectFileLink | null>(
+    null,
+  );
+  const install = useInstallApp();
+  const [installHint, setInstallHint] = useState(false);
   const [toolNameMode, setToolNameMode] = useState<ToolNameMode>(() => {
     try {
       return localStorage.getItem(TOOL_NAME_MODE_KEY) === "mapped"
@@ -801,6 +866,9 @@ export default function App() {
     null,
   );
   const sessionListValue = useRef<SessionSummary[] | null>(null);
+  // Untouched session per project: `createSession` reuses the entry for the
+  // project it is asked to open instead of borrowing another project's chat.
+  const lastEmptySessionId = useRef(new Map<string, string>());
   const sessionListInitialized = useRef(false);
   const sessionTitles = useRef(new Map<string, string>());
   const notifiedSettlements = useRef(new Set<string>());
@@ -874,6 +942,52 @@ export default function App() {
     },
     [],
   );
+  // Keep the slash palette inside the space that is actually visible above
+  // the composer. Browser soft keyboards do not all report the same geometry:
+  // Chromium keeps `innerHeight` fixed and shrinks VisualViewport, while some
+  // mobile browsers shrink both (or keep VisualViewport.height stale). Always
+  // measure the live DOM boxes, and update on every plausible viewport/layout
+  // change instead of trying to infer whether a keyboard is open.
+  useEffect(() => {
+    const measure = () => {
+      const root = document.querySelector<HTMLElement>(".workspace");
+      if (!root) return;
+      const composer = root.querySelector<HTMLElement>(".composer");
+      const toolbar = root.querySelector<HTMLElement>(".toolbar");
+      const composerTop = composer?.getBoundingClientRect().top;
+      const toolbarBottom = toolbar?.getBoundingClientRect().bottom ?? 0;
+      const visibleTop = Math.max(
+        toolbarBottom,
+        window.visualViewport?.offsetTop ?? 0,
+      );
+      const available =
+        composerTop === undefined
+          ? 340
+          : Math.floor(composerTop - visibleTop - 8);
+      // Some mobile browsers shrink the layout viewport without updating
+      // VisualViewport.offsetTop. Bound the palette by the live visual height
+      // as well: even if that offset is stale, the menu stays short enough to
+      // leave the toolbar and the first commands visible.
+      const visualHeight = window.visualViewport?.height;
+      const visualBound = visualHeight ? Math.floor(visualHeight * 0.45) : 340;
+      root.style.setProperty(
+        "--slash-keyboard-max-height",
+        `${Math.max(96, Math.min(340, available, visualBound))}px`,
+      );
+    };
+    const schedule = () => requestAnimationFrame(measure);
+    measure();
+    window.visualViewport?.addEventListener("resize", schedule);
+    window.visualViewport?.addEventListener("scroll", schedule);
+    window.addEventListener("resize", schedule);
+    window.addEventListener("scroll", schedule, true);
+    return () => {
+      window.visualViewport?.removeEventListener("resize", schedule);
+      window.visualViewport?.removeEventListener("scroll", schedule);
+      window.removeEventListener("resize", schedule);
+      window.removeEventListener("scroll", schedule, true);
+    };
+  }, []);
   const draftBySession = useRef(loadDrafts());
   const transcriptRef = useRef<HTMLDivElement>(null);
   const followingRef = useRef(true);
@@ -913,6 +1027,29 @@ export default function App() {
   const [queueItems, setQueueItems] = useState<QueueItem[]>([]);
   const [queueOpen, setQueueOpen] = useState(true);
   const [queueRunning, setQueueRunning] = useState(false);
+  // "Send now" acknowledgement, scoped to the queue panel's per-entry send
+  // button (not the composer button): after the HTTP round trip the message
+  // is only sent once the run delivers it, so the entry's button keeps its
+  // spinner until the user message is printed (or the queue read stops
+  // listing the entry), then flashes a check for a moment.
+  const [sendNowPending, setSendNowPending] = useState<{
+    sessionId: string;
+    entryId: string;
+    text: string;
+    queuedAt: number;
+  } | null>(null);
+  // Mirror for event callbacks that must match without re-rendering first.
+  const sendNowPendingRef = useRef<{
+    sessionId: string;
+    entryId: string;
+    text: string;
+    queuedAt: number;
+  } | null>(null);
+  const [sendNowSent, setSendNowSent] = useState<{
+    sessionId: string;
+    entryId: string;
+  } | null>(null);
+  const sendNowSentTimer = useRef<number | null>(null);
   const pendingQueueItems = queueItems.filter((item) =>
     isEditableQueueItem(item),
   );
@@ -998,6 +1135,33 @@ export default function App() {
     workbenchOpen: boolean;
   } | null>(null);
 
+  // Mobile: hide only the browser's own chrome (URL bar / bottom toolbar) by
+  // requesting fullscreen on the document. No page panel is hidden, so the
+  // composer stays visible. iOS Safari and WebViews without the native
+  // callback simply reject and leave the page unchanged.
+  async function toggleBrowserFullscreen() {
+    try {
+      if (document.fullscreenElement) {
+        await document.exitFullscreen?.();
+        browserFullscreenRef.current = false;
+        setBrowserFullscreen(false);
+      } else if (document.documentElement.requestFullscreen) {
+        await document.documentElement.requestFullscreen();
+        browserFullscreenRef.current = true;
+        setBrowserFullscreen(true);
+      }
+    } catch {
+      browserFullscreenRef.current = false;
+      setBrowserFullscreen(false);
+    }
+  }
+
+  function toggleView() {
+    if (isMobileViewport()) void toggleBrowserFullscreen();
+    else if (immersive) exitImmersive();
+    else enterImmersive();
+  }
+
   function enterImmersive() {
     immersiveSnapshot.current = {
       sidebar,
@@ -1025,6 +1189,7 @@ export default function App() {
     setTraceOpen(snapshot.traceOpen);
     setWorkbenchOpen(snapshot.workbenchOpen);
   }
+  immersiveActionsRef.current = { exit: exitImmersive };
   const traceButtonRef = useRef<HTMLButtonElement>(null);
   const [seen, setSeen] = useState(0);
   const [settleTick, setSettleTick] = useState(0);
@@ -1266,6 +1431,20 @@ export default function App() {
   const [thinkingPreferenceFailures, setThinkingPreferenceFailures] = useState<
     Record<string, string>
   >({});
+  // Runtime failures are notifications, not modal state: the user must be able
+  // to acknowledge a preference that cannot be applied to a freshly-created
+  // session and keep chatting with the native default.
+  const dismissRuntimeFailure = (
+    clear: React.Dispatch<React.SetStateAction<Record<string, string>>>,
+    session: string,
+  ) => {
+    clear((previous) => {
+      if (!(session in previous)) return previous;
+      const next = { ...previous };
+      delete next[session];
+      return next;
+    });
+  };
   // Capture the origin before I/O; successful old-session writes belong to its
   // project even if navigation happens while the command is in flight.
   const onModelSelected: ModelSelected = (model) => {
@@ -1300,6 +1479,19 @@ export default function App() {
           delete next[session];
           return next;
         });
+        // A successful explicit model choice repairs the remembered model,
+        // so stop advertising that part of an earlier restore failure.
+        setSessionRuntimeFailures((previous) => {
+          const failure = previous[session];
+          if (!failure) return previous;
+          const remaining = { ...failure };
+          delete remaining.provider;
+          delete remaining.modelId;
+          const next = { ...previous };
+          if (Object.keys(remaining).length) next[session] = remaining;
+          else delete next[session];
+          return next;
+        });
       }
       return current;
     };
@@ -1329,6 +1521,16 @@ export default function App() {
       setThinkingPreferenceFailures((prior) => {
         const next = { ...prior };
         delete next[session];
+        return next;
+      });
+      setSessionRuntimeFailures((previous) => {
+        const failure = previous[session];
+        if (!failure?.thinkingLevel) return previous;
+        const remaining = { ...failure };
+        delete remaining.thinkingLevel;
+        const next = { ...previous };
+        if (Object.keys(remaining).length) next[session] = remaining;
+        else delete next[session];
         return next;
       });
     }
@@ -1453,45 +1655,158 @@ export default function App() {
   const ttsAudio = useRef<HTMLAudioElement | null>(null);
   const ttsUrl = useRef<string | null>(null);
   const ttsAbort = useRef<AbortController | null>(null);
+  const ttsUnlocked = useRef(false);
   const autoReadLast = useRef("");
   const autoReadSettlement = useRef(0);
+  /**
+   * Browsers that require a gesture (Safari) allow later programmatic playback
+   * once one element has been started inside a gesture; a silent clip is enough
+   * and the element is then reused for every chunk. A fresh element per chunk
+   * would be blocked with "play() can only be initiated by a user gesture".
+   */
+  const unlockAudio = useCallback(async () => {
+    if (ttsUnlocked.current) return;
+    const audio = ttsAudio.current ?? new Audio();
+    ttsAudio.current = audio;
+    audio.src = SILENT_AUDIO;
+    try {
+      await audio.play();
+      ttsUnlocked.current = true;
+      // Retract only the silent clip: a real chunk may have taken the element.
+      if (audio.src === SILENT_AUDIO) audio.pause();
+    } catch {
+      // Blocked: keep the element so the next gesture can try again.
+    }
+  }, []);
+  useEffect(() => {
+    const gestures: Array<keyof WindowEventMap> = [
+      "pointerdown",
+      "keydown",
+      "touchstart",
+    ];
+    for (const gesture of gestures)
+      window.addEventListener(gesture, unlockAudio, {
+        capture: true,
+        passive: true,
+      });
+    return () => {
+      for (const gesture of gestures)
+        window.removeEventListener(gesture, unlockAudio, { capture: true });
+    };
+  }, [unlockAudio]);
   const stopReading = useCallback(() => {
     ttsAbort.current?.abort();
     ttsAbort.current = null;
-    ttsAudio.current?.pause();
-    ttsAudio.current = null;
+    // Keep the element: it may already be unlocked, and a new one would need
+    // another gesture on Safari. Never pause the silent unlock clip either —
+    // that aborts its own play() and can undo the unlock.
+    const audio = ttsAudio.current;
+    if (audio && audio.src !== SILENT_AUDIO) audio.pause();
     if (ttsUrl.current) URL.revokeObjectURL(ttsUrl.current);
     ttsUrl.current = null;
     setReadingRowId(null);
   }, []);
+  /**
+   * Play one synthesized chunk on the shared element and resolve when it ends
+   * or the run is cancelled. Each chunk's object URL is revoked when it ends.
+   */
+  const playSpeech = useCallback(
+    (blob: Blob, signal: AbortSignal) =>
+      new Promise<void>((resolve, reject) => {
+        const url = URL.createObjectURL(blob);
+        const audio = ttsAudio.current ?? new Audio();
+        ttsAudio.current = audio;
+        ttsUrl.current = url;
+        const settle = (error?: unknown) => {
+          audio.onended = null;
+          audio.onerror = null;
+          signal.removeEventListener("abort", cancel);
+          if (ttsUrl.current === url) ttsUrl.current = null;
+          URL.revokeObjectURL(url);
+          if (error) reject(error);
+          else resolve();
+        };
+        const cancel = () => {
+          audio.pause();
+          settle();
+        };
+        audio.onended = () => settle();
+        audio.onerror = () => settle(new Error("audio playback failed"));
+        signal.addEventListener("abort", cancel, { once: true });
+        audio.src = url;
+        void audio.play().catch(settle);
+      }),
+    [],
+  );
   const speakMessage = useCallback(
     async (rowId: string, text: string) => {
       if (readingRowId === rowId) {
         stopReading();
         return;
       }
+      // Stop first: pausing the element in the same tick would cancel the
+      // gesture-initiated silent play that unlocks it.
       stopReading();
+      // Started synchronously inside the click; awaited before the first chunk.
+      const unlocked = unlockAudio();
+      // Only prose is spoken, and only a sentence or two per request: the first
+      // chunk can start playing while later chunks are still being synthesized.
+      const chunks = splitForSpeech(speakableText(text));
+      if (chunks.length === 0) {
+        note(translate(language, "nothingToRead"));
+        return;
+      }
       const controller = new AbortController();
       ttsAbort.current = controller;
+      // Show Stop immediately: the first chunk must not look like a dead button.
+      setReadingRowId(rowId);
+      const voice =
+        language === "zh" ? "zh-CN-XiaoxiaoNeural" : "en-US-AriaNeural";
+      // Edge synthesis fails intermittently; one short retry keeps a long
+      // reading from dying on a single blip. Client errors are not retried.
+      const fetchChunk = async (index: number) => {
+        for (let attempt = 0; ; attempt += 1) {
+          try {
+            return await api.tts(chunks[index], voice, controller.signal);
+          } catch (cause) {
+            const retryable =
+              !(cause instanceof ApiError) || cause.status >= 500;
+            if (controller.signal.aborted || !retryable || attempt >= 1)
+              throw cause;
+            await new Promise((resolve) => window.setTimeout(resolve, 400));
+            if (controller.signal.aborted) throw cause;
+          }
+        }
+      };
+      let next = fetchChunk(0);
       try {
-        const voice =
-          language === "zh" ? "zh-CN-XiaoxiaoNeural" : "en-US-AriaNeural";
-        const blob = await api.tts(text, voice, controller.signal);
-        if (controller.signal.aborted) return;
-        const url = URL.createObjectURL(blob);
-        const audio = new Audio(url);
-        ttsUrl.current = url;
-        ttsAudio.current = audio;
-        setReadingRowId(rowId);
-        audio.onended = stopReading;
-        audio.onerror = stopReading;
-        await audio.play();
+        for (let index = 0; index < chunks.length; index += 1) {
+          const blob = await next;
+          if (controller.signal.aborted) return;
+          // Keep one chunk of synthesis ahead of playback. A prefetch that
+          // nobody awaits (stop) must not surface as an unhandled rejection.
+          if (index + 1 < chunks.length) {
+            next = fetchChunk(index + 1);
+            void next.catch(() => {});
+          }
+          // A gesture-gated browser must have finished the silent unlock before
+          // the first chunk asks to play.
+          await unlocked;
+          if (controller.signal.aborted) return;
+          await playSpeech(blob, controller.signal);
+          if (controller.signal.aborted) return;
+        }
       } catch (cause) {
-        if (!controller.signal.aborted) setError(errorText(cause));
-        stopReading();
+        if (controller.signal.aborted) return;
+        // Autoplay policies are not a failure: say what to do next.
+        if (isAutoplayBlocked(cause))
+          note(translate(language, "autoplayBlocked"));
+        else setError(errorText(cause));
+      } finally {
+        if (ttsAbort.current === controller) stopReading();
       }
     },
-    [language, readingRowId, stopReading],
+    [language, note, playSpeech, readingRowId, stopReading, unlockAudio],
   );
   useEffect(() => {
     try {
@@ -1640,8 +1955,34 @@ export default function App() {
     if (previouslyBusy.current && !busy) void refreshProjectRoots();
     previouslyBusy.current = busy;
   }, [busy, refreshProjectRoots]);
+  // Keep the mirror in sync after every render so callbacks reading
+  // sendNowPendingRef.current see the latest pending entry.
+  sendNowPendingRef.current = sendNowPending;
+  const markSendNowSent = useCallback((sessionId: string, entryId: string) => {
+    setSendNowPending(null);
+    sendNowPendingRef.current = null;
+    setSendNowSent({ sessionId, entryId });
+    if (sendNowSentTimer.current !== null)
+      window.clearTimeout(sendNowSentTimer.current);
+    sendNowSentTimer.current = window.setTimeout(() => {
+      sendNowSentTimer.current = null;
+      setSendNowSent(null);
+    }, 1600);
+  }, []);
+  useEffect(
+    () => () => {
+      if (sendNowSentTimer.current !== null)
+        window.clearTimeout(sendNowSentTimer.current);
+    },
+    [],
+  );
   const composerAbort =
     busy && supported.has("abort") && !loadingSession && !connectionFailed;
+  // While a run is active the main button is Stop for an empty composer and
+  // Send for a draft: touch keyboards use Enter for a newline, so the icon is
+  // the only way to queue a follow-up from the same field.
+  const composerDraftReady = draft.trim().length > 0 || attachments.length > 0;
+  const composerRunningSend = composerAbort && composerDraftReady;
   const composerContinue =
     !busy &&
     status !== "closed" &&
@@ -1662,6 +2003,7 @@ export default function App() {
     (status === "awaiting_input" ? "waitingForAnswer" : status) as MessageKey,
   );
   const current = sessions.find((session) => session.sessionId === sessionId);
+  const hostVersion = capabilities?.hostVersion?.trim() ?? "";
   const sidebarSessions = useMemo(
     () =>
       sessions.map((entry) =>
@@ -1800,6 +2142,7 @@ export default function App() {
           setStatus("running");
           setInterrupted(false);
           setFailedRun(false);
+          setError("");
           break;
         case "agent_settled": {
           setRows(stopToolTimers);
@@ -1940,6 +2283,12 @@ export default function App() {
                   )
                 : previous,
             );
+            // The host just delivered this queued message: the send-now
+            // acknowledgement for it succeeds here (the message is printed
+            // into the conversation, which is what "sent" means).
+            const sentNow = sendNowPendingRef.current;
+            if (sentNow && sentNow.text.trim() === text.trim())
+              markSendNowSent(sentNow.sessionId, sentNow.entryId);
             const prefix = `u${seq}`;
             currentUser.current = prefix;
             const initial = rowsFromUser(event.message, prefix);
@@ -2116,6 +2465,7 @@ export default function App() {
     sessionListRevision.current++;
     sessionListRequest.current = null;
     sessionListValue.current = null;
+    lastEmptySessionId.current.clear();
     sessionListInitialized.current = false;
     sessionTitles.current.clear();
     notifiedSettlements.current.clear();
@@ -2210,6 +2560,29 @@ export default function App() {
             }
             sessionListInitialized.current = true;
             sessionListValue.current = list;
+            // Reconcile the per-project tracking with the authoritative list:
+            // keep a tracked entry that is still untouched, otherwise adopt the
+            // oldest listed untouched chat and forget projects that lost theirs.
+            for (const [project, id] of [...lastEmptySessionId.current]) {
+              if (
+                !list.some(
+                  (entry) =>
+                    entry.sessionId === id &&
+                    (entry.projectId ?? "") === project &&
+                    !entry.archived &&
+                    !entry.deleting &&
+                    !hasUserTurn(entry),
+                )
+              )
+                lastEmptySessionId.current.delete(project);
+            }
+            for (const entry of list) {
+              if (entry.archived || entry.deleting || hasUserTurn(entry))
+                continue;
+              const project = entry.projectId ?? "";
+              if (!lastEmptySessionId.current.has(project))
+                lastEmptySessionId.current.set(project, entry.sessionId);
+            }
             setSessions(list);
             return list;
           },
@@ -2242,9 +2615,28 @@ export default function App() {
       try {
         setError("");
         const preference = readModelPreference(targetProject);
-        const created = await api.createSession(targetProject || undefined);
+        // Keep exactly one untouched session per project: login, the New
+        // session button and `/new` all land on the same empty chat until the
+        // user actually sends a prompt. An untouched session has no title,
+        // settlement or transcript activity, so it is safe to reuse — but only
+        // for the project it belongs to, or the sidebar's "New session in
+        // <project>" would silently open a chat in a different project.
+        const emptyId = lastEmptySessionId.current.get(targetProject ?? "");
+        const existing = sessionListValue.current?.find(
+          (entry) =>
+            entry.sessionId === emptyId &&
+            !entry.archived &&
+            !entry.deleting &&
+            !hasUserTurn(entry) &&
+            (entry.projectId ?? "") === (targetProject ?? ""),
+        );
+        const reusedProject = existing?.projectId;
+        const created = existing
+          ? { sessionId: existing.sessionId, status: existing.status }
+          : await api.createSession(targetProject || undefined);
         // Settle the preference before publishing the session or its composer.
         // A failure must not discard the newly-created, reachable session.
+        // Re-applying a saved preference to a reused empty chat is best effort.
         if (preference) {
           const { thinkingLevel, ...model } = preference;
           const hasModel = Boolean(preference.provider && preference.modelId);
@@ -2283,9 +2675,10 @@ export default function App() {
           return;
         }
         navigationRevision.current++;
-        if (targetProject) {
-          projectRef.current = targetProject;
-          setProjectId(targetProject);
+        const nextProject = reusedProject ?? targetProject;
+        if (nextProject) {
+          projectRef.current = nextProject;
+          setProjectId(nextProject);
         }
         activeSessionRef.current = created.sessionId;
         setSessionId(created.sessionId);
@@ -2335,6 +2728,11 @@ export default function App() {
         event.preventDefault();
         setSettingsOpen(true);
       }
+      if (key === "f" && event.shiftKey && isMobileViewport()) {
+        event.preventDefault();
+        if (sessionId) void toggleBrowserFullscreen();
+        return;
+      }
       if (key === "f") {
         event.preventDefault();
         if (activeSessionRef.current) setMessageSearchOpen(true);
@@ -2342,7 +2740,7 @@ export default function App() {
     };
     window.addEventListener("keydown", keydown);
     return () => window.removeEventListener("keydown", keydown);
-  }, [createSession, authChecked, authRequired, authenticated]);
+  }, [createSession, authChecked, authRequired, authenticated, sessionId]);
 
   useEffect(() => {
     if (!authChecked || (authRequired && !authenticated)) return;
@@ -2456,15 +2854,18 @@ export default function App() {
                   project.id === session.projectId && !project.archived,
               )),
         );
+        const empty = reusable.find((session) => !hasUserTurn(session));
         const match =
           (blockedRequest ? undefined : requestedSession) ??
           reusable.find(
             (session) => session.sessionId === activeSessionRef.current,
           ) ??
-          reusable.sort((a, b) => b.updatedAt - a.updatedAt)[0];
+          reusable
+            .filter((session) => hasUserTurn(session))
+            .sort((a, b) => b.updatedAt - a.updatedAt)[0];
         const blocked =
           blockedRequest ??
-          (!match
+          (!match && !empty
             ? sessionSelectionError(
                 list.find((session) => session.archived || session.deleting),
               )
@@ -2472,15 +2873,20 @@ export default function App() {
         const selectionChanges =
           match && match.sessionId !== activeSessionRef.current;
         if (match) select(match.sessionId, match.projectId);
+        else if (empty) select(empty.sessionId, empty.projectId);
         else if (blocked) {
           select("");
           setLoadingSession(false);
-        } else await createSession();
+        } else await createSession(projectRef.current || undefined);
         if (blocked) {
           const message = errorText(blocked);
           initialSelectionError.current = selectionChanges ? message : "";
           setError(message);
         }
+        // A `?file=…` deep link opens its preview once the session exists; the
+        // dialog keeps the URL in sync from there on.
+        const linked = readPreviewLink(window.location.search);
+        if (linked) setLinkedPreview(linked);
       } catch (cause) {
         if (cancelled) return;
         setStatus("error");
@@ -2536,6 +2942,9 @@ export default function App() {
     sendingRevision.current++;
     sendingRef.current = false;
     setSending(false);
+    setSendNowPending(null);
+    sendNowPendingRef.current = null;
+    setSendNowSent(null);
     setLevels([]);
     setSeen(0);
     setError(initialSelectionError.current);
@@ -2974,6 +3383,24 @@ export default function App() {
             ? previous.filter(isEditableQueueItem)
             : items,
         );
+        // A "send now" entry disappears from the host's list exactly when it
+        // is delivered to the run. If the message_start event was missed, the
+        // queue read is the recovery signal that ends the wait and flashes
+        // the sent check; the grace period keeps a read that raced the
+        // enqueue from ending the acknowledgement before the host lists it.
+        const pendingNow = sendNowPendingRef.current;
+        if (
+          pendingNow &&
+          pendingNow.sessionId === id &&
+          Date.now() - pendingNow.queuedAt > 2_000 &&
+          !queueSubmission.current.has(id) &&
+          !items.some(
+            (item) =>
+              (item.text ?? "").trim() === pendingNow.text.trim() &&
+              item.status === "queued",
+          )
+        )
+          markSendNowSent(pendingNow.sessionId, pendingNow.entryId);
       } catch (cause) {
         // A revoked session must log out exactly like any other read.
         if (cause instanceof ApiError && cause.status === 401) {
@@ -3408,6 +3835,16 @@ export default function App() {
     }
   }
 
+  // Some clipboard providers expose a pasted path as a File whose name is the
+  // path itself. `file://` URLs and paths whose first segment is `file` are
+  // references, not uploadable documents: the upload endpoint always rejects
+  // them. Real file names such as `file.txt` are unaffected.
+  function isPathLikePastedFile(file: File): boolean {
+    const name = file.name.trim();
+    if (/^file:\/\//i.test(name)) return true;
+    return /^file(?:[\\/]|$)/i.test(name);
+  }
+
   async function uploadFiles(files: FileList | File[] | null) {
     const batch = Array.from(files ?? []);
     const scope = uploadScope.current;
@@ -3612,30 +4049,6 @@ export default function App() {
       }
     }
   }
-
-  // Some soft keyboards emit beforeinput without an Enter keydown. Listen to
-  // the native event: React's synthetic before-input normalization can omit
-  // inputType. Rebind after renders to use the current draft/session and to
-  // handle the textarea mounting after authentication.
-  useEffect(() => {
-    const input = composerInputRef.current;
-    if (!input) return;
-    const onBeforeInput = (event: InputEvent) => {
-      if (
-        !window.matchMedia("(pointer: coarse)").matches ||
-        !["insertLineBreak", "insertParagraph"].includes(event.inputType) ||
-        event.isComposing ||
-        composerComposing.current ||
-        composerShiftEnter.current ||
-        !event.cancelable
-      )
-        return;
-      event.preventDefault();
-      void submit();
-    };
-    input.addEventListener("beforeinput", onBeforeInput);
-    return () => input.removeEventListener("beforeinput", onBeforeInput);
-  });
 
   async function resumePending() {
     if (
@@ -4017,6 +4430,14 @@ export default function App() {
             ]
           : []),
       ]);
+      // The HTTP round trip only accepted the message; keep this entry's
+      // button spinning until the run delivers it and the message is printed.
+      setSendNowPending({
+        sessionId: targetSession,
+        entryId: item.entryId,
+        text: item.text.trim(),
+        queuedAt: Date.now(),
+      });
       if (!running)
         await commandData(targetSession, "prompt", {
           message: item.text.trim(),
@@ -4032,6 +4453,8 @@ export default function App() {
       );
       setRunActive(priorActive);
       setError(errorText(cause));
+      setSendNowPending(null);
+      sendNowPendingRef.current = null;
       await refreshDiagnostics(targetSession);
     } finally {
       queueRunSubmission.current.delete(targetSession);
@@ -4281,6 +4704,11 @@ export default function App() {
       // messages back (`steer` + `followUp`). Dropping that reply is what made
       // staged input disappear after a stop, so put it back in the composer.
       const reclaimed = [...(result.steer ?? []), ...(result.followUp ?? [])];
+      // A stop drains the native queue: a pending send-now acknowledgement has
+      // nothing left to wait for.
+      setSendNowPending(null);
+      sendNowPendingRef.current = null;
+      setSendNowSent(null);
       if (reclaimed.length === 0) return;
       const queuedText = reclaimed
         .map((message) => message.text ?? "")
@@ -4303,6 +4731,9 @@ export default function App() {
       setError(errorText(cause));
       // A trampled abort reply can still have drained the native queue, so read
       // the host's list instead of showing rows that may already be gone.
+      setSendNowPending(null);
+      sendNowPendingRef.current = null;
+      setSendNowSent(null);
       if (targetSession === activeSessionRef.current)
         void refreshQueue(targetSession);
     }
@@ -4333,7 +4764,11 @@ export default function App() {
     }
   }
 
-  function select(id: string, selectedProjectId?: string) {
+  function select(
+    id: string,
+    selectedProjectId?: string,
+    options: { keepSidebarOpen?: boolean } = {},
+  ) {
     pendingNotificationContinue.current = null;
     // refreshSessions publishes this ref before React renders: URL initialization
     // and post-mutation fallbacks must guard against that latest list too.
@@ -4343,7 +4778,8 @@ export default function App() {
     const blocked = sessionSelectionError(known);
     if (blocked) {
       setError(errorText(blocked));
-      if (window.innerWidth < 768) setSidebar(false);
+      if (!options.keepSidebarOpen && window.innerWidth < 768)
+        setSidebar(false);
       return;
     }
     const nextProject = selectedProjectId ?? known?.projectId;
@@ -4352,7 +4788,8 @@ export default function App() {
       (!nextProject || projectRef.current === nextProject)
     ) {
       setPanel(false);
-      if (window.innerWidth < 768) setSidebar(false);
+      if (!options.keepSidebarOpen && window.innerWidth < 768)
+        setSidebar(false);
       return;
     }
     if (
@@ -4370,13 +4807,15 @@ export default function App() {
       setProjectId(nextProject);
     }
     setLoadingSession(Boolean(id));
+    // A preview restored from `?file=` belongs to the view that asked for it.
+    setLinkedPreview(null);
     rowsSessionRef.current = id;
     setRows(id ? (rowsBySession.current.get(id) ?? []) : []);
     followingRef.current = true;
     setFollowing(true);
     setSessionId(id);
     setPanel(false);
-    if (window.innerWidth < 768) setSidebar(false);
+    if (!options.keepSidebarOpen && window.innerWidth < 768) setSidebar(false);
     const url = new URL(location.href);
     if (id) url.searchParams.set("session", id);
     else url.searchParams.delete("session");
@@ -4441,7 +4880,15 @@ export default function App() {
                 !entry.archived &&
                 !entry.deleting,
             );
-            select(next?.sessionId ?? "", next?.projectId ?? session.projectId);
+            // Archiving from the sidebar should leave the menu open so
+            // repeated session management does not need a reopen each time.
+            select(
+              next?.sessionId ?? "",
+              next?.projectId ?? session.projectId,
+              {
+                keepSidebarOpen: true,
+              },
+            );
           }
         } catch (cause) {
           if (
@@ -4449,11 +4896,6 @@ export default function App() {
             navigation === navigationRevision.current
           )
             setError(retirementError(cause));
-          if (
-            navigation === navigationRevision.current &&
-            window.innerWidth < 768
-          )
-            setSidebar(false);
         }
       },
     );
@@ -4495,11 +4937,12 @@ export default function App() {
           !entry.archived &&
           !entry.deleting,
       );
-      select(next?.sessionId ?? "", next?.projectId ?? session.projectId);
+      select(next?.sessionId ?? "", next?.projectId ?? session.projectId, {
+        keepSidebarOpen: true,
+      });
     } catch (cause) {
       if (navigation !== navigationRevision.current) return;
       setError(retirementError(cause, true));
-      if (window.innerWidth < 768) setSidebar(false);
     } finally {
       deleteInFlight.current = false;
       setDeletePending(false);
@@ -4782,6 +5225,13 @@ export default function App() {
               <ListTodo size={14} /> {t("queue")}
             </span>
             <span className="panel-heading-actions">
+              {sendNowSent?.sessionId === sessionId && (
+                <Check
+                  size={14}
+                  className="queue-send-now-sent-check"
+                  aria-label={t("sentNow")}
+                />
+              )}
               <strong>{queueItems.length}</strong>
               {actions.has("queue_status") && (
                 <button
@@ -4825,13 +5275,30 @@ export default function App() {
                     supported.has("cancel_queued") && (
                       <button
                         type="button"
-                        className="icon-button queue-send-now"
+                        className={`icon-button queue-send-now${
+                          sendNowSent?.entryId === item.entryId &&
+                          sendNowSent?.sessionId === sessionId
+                            ? " queue-send-now-sent"
+                            : ""
+                        }`}
                         title={t("sendNow")}
                         aria-label={`${t("sendNow")}: ${item.text}`}
                         onClick={() => void sendQueuedNow(item.entryId)}
-                        disabled={queueRunning}
+                        disabled={
+                          queueRunning ||
+                          (sendNowPending?.entryId === item.entryId &&
+                            sendNowPending?.sessionId === sessionId) ||
+                          (sendNowSent?.entryId === item.entryId &&
+                            sendNowSent?.sessionId === sessionId)
+                        }
                       >
-                        {queueRunning ? (
+                        {sendNowPending?.entryId === item.entryId &&
+                        sendNowPending?.sessionId === sessionId ? (
+                          <Loader2 size={13} className="spin" />
+                        ) : sendNowSent?.entryId === item.entryId &&
+                          sendNowSent?.sessionId === sessionId ? (
+                          <Check size={13} />
+                        ) : queueRunning ? (
                           <Loader2 size={13} className="spin" />
                         ) : (
                           <Play size={13} />
@@ -5219,6 +5686,14 @@ export default function App() {
           }}
         />
       )}
+      {linkedPreview && project && (
+        <FilePreview
+          project={project}
+          file={linkedPreview}
+          language={language}
+          onClose={() => setLinkedPreview(null)}
+        />
+      )}
       {settingsOpen && (
         <Modal
           language={language}
@@ -5336,6 +5811,14 @@ export default function App() {
                   v{displayedVersion(capabilities)}
                 </span>
               )}
+              {hostVersion && (
+                <span
+                  className="brand-version brand-host-version"
+                  title={t("hostVersionTitle", { version: hostVersion })}
+                >
+                  {t("hostVersion", { version: hostVersion })}
+                </span>
+              )}
               <button
                 className="icon-button mobile-only"
                 aria-label={t("closeSidebar")}
@@ -5371,6 +5854,38 @@ export default function App() {
               onMetadata={updateSessionMetadata}
             />
             <div className="sidebar-bottom slim-bottom">
+              {install.available && (
+                <div className="slim-install">
+                  <button
+                    type="button"
+                    className="slim-settings slim-install-button"
+                    title={t("installApp")}
+                    onClick={() => {
+                      // A captured browser prompt installs directly; iOS and
+                      // browsers without that event get the manual route.
+                      if (install.canPrompt) void install.promptInstall();
+                      else setInstallHint((open) => !open);
+                    }}
+                  >
+                    <Download size={14} />
+                    <span>{t("installApp")}</span>
+                  </button>
+                  <button
+                    type="button"
+                    className="slim-install-dismiss"
+                    aria-label={t("installAppDismiss")}
+                    title={t("installAppDismiss")}
+                    onClick={install.dismiss}
+                  >
+                    <X size={12} />
+                  </button>
+                  {installHint && (
+                    <p className="slim-install-hint" role="status">
+                      {t("installAppHint")}
+                    </p>
+                  )}
+                </div>
+              )}
               <button
                 type="button"
                 className="slim-settings"
@@ -5463,12 +5978,32 @@ export default function App() {
           <div className="toolbar-actions">
             <button
               type="button"
-              className={`icon-button ${immersive ? "selected" : ""}`}
+              className={`icon-button ${
+                (isMobileViewport() ? browserFullscreen : immersive)
+                  ? "selected"
+                  : ""
+              }`}
               disabled={!sessionId}
-              aria-label={t("immersiveView")}
-              title={t("immersiveView")}
-              aria-pressed={immersive}
-              onClick={enterImmersive}
+              aria-label={t(
+                isMobileViewport()
+                  ? browserFullscreen
+                    ? "exitFullscreenView"
+                    : "fullscreenView"
+                  : immersive
+                    ? "exitImmersiveView"
+                    : "immersiveView",
+              )}
+              title={t(
+                isMobileViewport()
+                  ? browserFullscreen
+                    ? "exitFullscreenView"
+                    : "fullscreenView"
+                  : immersive
+                    ? "exitImmersiveView"
+                    : "immersiveView",
+              )}
+              aria-pressed={isMobileViewport() ? browserFullscreen : immersive}
+              onClick={toggleView}
             >
               <Maximize2 size={17} aria-hidden="true" />
             </button>
@@ -5479,18 +6014,6 @@ export default function App() {
               >
                 <span className="status-dot" /> {connectionLabel}
               </span>
-            )}
-            {actions.has("fork") && (
-              <button
-                type="button"
-                disabled={!sessionId || forkPending}
-                className="icon-button toolbar-fork"
-                title={t("forkSession")}
-                aria-label={t("forkSession")}
-                onClick={() => void forkCurrent()}
-              >
-                <GitBranch size={16} />
-              </button>
             )}
             {actions.has("clone") && (
               <button
@@ -5715,6 +6238,15 @@ export default function App() {
             >
               {language === "zh" ? "运行时设置" : "Runtime settings"}
             </button>
+            <button
+              className="icon-button"
+              aria-label={t("dismiss")}
+              onClick={() =>
+                dismissRuntimeFailure(setThinkingPreferenceFailures, sessionId)
+              }
+            >
+              <X size={14} />
+            </button>
           </div>
         )}
         {modelPreferenceFailures[sessionId] && (
@@ -5733,6 +6265,15 @@ export default function App() {
               }}
             >
               {language === "zh" ? "运行时设置" : "Runtime settings"}
+            </button>
+            <button
+              className="icon-button"
+              aria-label={t("dismiss")}
+              onClick={() =>
+                dismissRuntimeFailure(setModelPreferenceFailures, sessionId)
+              }
+            >
+              <X size={14} />
             </button>
           </div>
         )}
@@ -5997,6 +6538,10 @@ export default function App() {
                                   language={language}
                                   onSpeak={speakMessage}
                                   readingRowId={readingRowId}
+                                  onFork={(entryId) =>
+                                    void forkCurrent(entryId)
+                                  }
+                                  forkPending={forkPending}
                                   assistantStreamRevision={
                                     assistantStreamRevision
                                   }
@@ -6159,15 +6704,33 @@ export default function App() {
                               supported.has("cancel_queued") && (
                                 <button
                                   type="button"
-                                  className="icon-button queue-send-now"
+                                  className={`icon-button queue-send-now${
+                                    sendNowSent?.entryId === item.entryId &&
+                                    sendNowSent?.sessionId === sessionId
+                                      ? " queue-send-now-sent"
+                                      : ""
+                                  }`}
                                   aria-label={`${t("sendNow")}: ${item.text}`}
                                   title={t("sendNow")}
                                   onClick={() =>
                                     void sendQueuedNow(item.entryId)
                                   }
-                                  disabled={queueRunning}
+                                  disabled={
+                                    queueRunning ||
+                                    (sendNowPending?.entryId === item.entryId &&
+                                      sendNowPending?.sessionId ===
+                                        sessionId) ||
+                                    (sendNowSent?.entryId === item.entryId &&
+                                      sendNowSent?.sessionId === sessionId)
+                                  }
                                 >
-                                  {queueRunning ? (
+                                  {sendNowPending?.entryId === item.entryId &&
+                                  sendNowPending?.sessionId === sessionId ? (
+                                    <Loader2 size={13} className="spin" />
+                                  ) : sendNowSent?.entryId === item.entryId &&
+                                    sendNowSent?.sessionId === sessionId ? (
+                                    <Check size={13} />
+                                  ) : queueRunning ? (
                                     <Loader2 size={13} className="spin" />
                                   ) : (
                                     <Play size={13} />
@@ -6259,14 +6822,38 @@ export default function App() {
                         if (file) files.push(file);
                       }
                     }
-                    if (!files.length) return; // Keep native text paste/selection.
+                    // A pasted `file://` URL or local path is text, not an
+                    // upload. Prefer the browser's native text paste so the
+                    // current selection is replaced normally; providers that
+                    // expose only a path File get an explicit text insert.
+                    if (!files.length) return;
+                    const pathFiles = files.filter(isPathLikePastedFile);
+                    if (pathFiles.length) {
+                      const text = clipboard.getData("text/plain");
+                      if (!text) {
+                        event.preventDefault();
+                        const insert = pathFiles
+                          .map((file) => file.name)
+                          .join("\n");
+                        const start = event.currentTarget.selectionStart;
+                        const end = event.currentTarget.selectionEnd;
+                        updateDraft(
+                          draft.slice(0, start) + insert + draft.slice(end),
+                          sessionId,
+                        );
+                      }
+                      const realFiles = files.filter(
+                        (file) => !isPathLikePastedFile(file),
+                      );
+                      if (realFiles.length) void uploadFiles(realFiles);
+                      return;
+                    }
                     event.preventDefault();
                     void uploadFiles(files);
                   }}
                   onChange={(event) => {
                     updateDraft(event.target.value, sessionId);
                   }}
-                  enterKeyHint="send"
                   onCompositionStart={() => {
                     composerComposing.current = true;
                   }}
@@ -6283,20 +6870,26 @@ export default function App() {
                   onKeyDown={(event) => {
                     composerShiftEnter.current = event.shiftKey;
                     if (
-                      event.key === "Enter" &&
-                      !event.shiftKey &&
-                      !composerComposing.current &&
-                      !event.nativeEvent.isComposing &&
-                      event.nativeEvent.keyCode !== 229
+                      event.key !== "Enter" ||
+                      event.shiftKey ||
+                      // Touch keyboards have no Shift; Enter inserts a newline.
+                      isMobileViewport() ||
+                      composerComposing.current ||
+                      event.nativeEvent.isComposing ||
+                      event.nativeEvent.keyCode === 229
                     ) {
-                      event.preventDefault();
-                      void submit();
+                      return;
                     }
+                    event.preventDefault();
+                    void submit();
                   }}
                   placeholder={t("sendPlaceholder")}
                   disabled={!sessionId}
                   aria-label={t("sendPlaceholder")}
                   aria-keyshortcuts="Shift+Enter"
+                  // Tell soft keyboards this field takes newlines; a "send"
+                  // hint makes long-press Enter send instead of breaking lines.
+                  enterKeyHint={isMobileViewport() ? "enter" : undefined}
                 />
                 <div className="composer-footer">
                   <div className="composer-options">
@@ -6356,52 +6949,49 @@ export default function App() {
                     )}
                   </div>
                   <div className="composer-controls">
-                    {composerAbort &&
-                      supported.has("queue_message") &&
-                      !queueEditId &&
-                      (draft.trim().length > 0 || attachments.length > 0) && (
-                        // Touch keyboards keep Enter as a newline, so a run in
-                        // progress needs an explicit way to queue the message.
-                        <button
-                          type="submit"
-                          className="send-button composer-action-queue"
-                          aria-label={t("queue")}
-                          title={t("queue")}
-                          disabled={sending || uploading}
-                        >
-                          <ArrowUp size={17} aria-hidden="true" />
-                        </button>
-                      )}
                     <button
-                      type={composerAbort ? "button" : "submit"}
-                      className={`send-button${composerAbort ? " composer-action-stop" : composerContinue ? " composer-action-continue" : ""}`}
+                      // Never `submit`: an implicit form submit turns a soft
+                      // keyboard's Enter into "send" on some Android IMEs, which
+                      // makes long-press-for-newline impossible. The button and
+                      // the desktop Enter handler both call `submit()` instead.
+                      type="button"
+                      className={`send-button${composerAbort && !composerRunningSend ? " composer-action-stop" : composerContinue ? " composer-action-continue" : ""}`}
                       aria-label={
-                        composerAbort
-                          ? t("abort")
-                          : composerContinue
-                            ? t("continue")
-                            : t("send")
+                        composerRunningSend
+                          ? t("send")
+                          : composerAbort
+                            ? t("abort")
+                            : composerContinue
+                              ? t("continue")
+                              : t("send")
                       }
                       title={
-                        composerAbort
-                          ? t("abort")
-                          : composerContinue
-                            ? t("continue")
-                            : t("send")
+                        composerRunningSend
+                          ? t("send")
+                          : composerAbort
+                            ? t("abort")
+                            : composerContinue
+                              ? t("continue")
+                              : t("send")
                       }
                       disabled={
                         (!localSlash && (loadingSession || connectionFailed)) ||
                         (!composerAbort &&
                           ((!composerContinue &&
+                            !composerRunningSend &&
                             !draft.trim() &&
                             attachments.length === 0) ||
                             !sessionId ||
                             sending ||
                             uploading))
                       }
-                      onClick={composerAbort ? () => void abort() : undefined}
+                      onClick={
+                        composerAbort && !composerRunningSend
+                          ? () => void abort()
+                          : () => void submit()
+                      }
                     >
-                      {composerAbort ? (
+                      {composerAbort && !composerRunningSend ? (
                         <span className="stop-indicator" aria-hidden="true" />
                       ) : composerContinue ? (
                         <Play size={17} aria-hidden="true" />
@@ -7010,6 +7600,8 @@ const RowView = memo(function RowView({
   todoHistory,
   onSpeak,
   readingRowId,
+  onFork,
+  forkPending,
   assistantStreamRevision,
   thinkingStreaming,
 }: {
@@ -7018,6 +7610,8 @@ const RowView = memo(function RowView({
   todoHistory?: ToolRow[];
   onSpeak?: (rowId: string, text: string) => void;
   readingRowId?: string | null;
+  onFork?: (entryId: string) => void;
+  forkPending?: boolean;
   /** Changes when a streaming assistant turn starts or ends. */
   assistantStreamRevision?: number;
   thinkingStreaming?: boolean;
@@ -7069,20 +7663,7 @@ const RowView = memo(function RowView({
     // height while the assistant message is streaming; the completed block
     // keeps the existing disclosure behavior.
     if (thinkingStreaming)
-      return (
-        <div className="thinking-row thinking-row-streaming">
-          <div className="thinking-row-heading">
-            <Sparkles size={13} /> {t("thinking")}
-          </div>
-          <div className="thinking-row-viewport">
-            <MarkdownBody
-              text={row.text}
-              language={language}
-              streaming={thinkingStreaming}
-            />
-          </div>
-        </div>
-      );
+      return <StreamingThinkingRow text={row.text} language={language} t={t} />;
     return (
       <details className="thinking-row">
         <summary>
@@ -7104,11 +7685,51 @@ const RowView = memo(function RowView({
       language={language}
       onSpeak={onSpeak}
       reading={readingRowId === row.id}
+      onFork={onFork}
+      forkPending={forkPending}
       streaming={thinkingStreaming}
       streamKey={`${row.id}:${assistantStreamRevision ?? 0}`}
     />
   );
 });
+
+function StreamingThinkingRow({
+  text,
+  language,
+  t,
+}: {
+  text: string;
+  language: Language;
+  t: (key: MessageKey) => string;
+}) {
+  const viewportRef = useRef<HTMLDivElement>(null);
+  const followingRef = useRef(true);
+  // New streamed text lands at the bottom. Follow it unless the reader
+  // deliberately scrolled up; returning to the bottom resumes following.
+  useLayoutEffect(() => {
+    const node = viewportRef.current;
+    if (!node || !followingRef.current) return;
+    node.scrollTop = node.scrollHeight;
+  }, [text]);
+  return (
+    <div className="thinking-row thinking-row-streaming">
+      <div className="thinking-row-heading">
+        <Sparkles size={13} /> {t("thinking")}
+      </div>
+      <div
+        ref={viewportRef}
+        className="thinking-row-viewport"
+        onScroll={(event) => {
+          const node = event.currentTarget;
+          followingRef.current =
+            node.scrollHeight - node.scrollTop - node.clientHeight < 24;
+        }}
+      >
+        <MarkdownBody text={text} language={language} streaming />
+      </div>
+    </div>
+  );
+}
 
 function ToolRowView({
   row,
@@ -7266,6 +7887,8 @@ function MessageRow({
   language,
   onSpeak,
   reading,
+  onFork,
+  forkPending,
   streaming = false,
   streamKey = "",
 }: {
@@ -7273,6 +7896,8 @@ function MessageRow({
   language: Language;
   onSpeak?: (rowId: string, text: string) => void;
   reading?: boolean;
+  onFork?: (entryId: string) => void;
+  forkPending?: boolean;
   streaming?: boolean;
   streamKey?: string;
 }) {
@@ -7311,23 +7936,31 @@ function MessageRow({
         <div className="message-actions">
           <button
             type="button"
-            className="message-copy message-copy-markdown"
+            className="message-copy message-copy-markdown message-action-icon"
             onClick={() => void copyMarkdown()}
             aria-label={copiedMarkdown ? t("copied") : t("copyMarkdown")}
             title={copiedMarkdown ? t("copied") : t("copyMarkdown")}
           >
-            {copiedMarkdown ? <Check size={12} /> : <Copy size={12} />}
-            <span>{copiedMarkdown ? t("copied") : t("copyMarkdown")}</span>
+            {copiedMarkdown ? <Check size={14} /> : <Copy size={14} />}
           </button>
           <button
             type="button"
-            className="message-copy message-copy-markdown"
+            className="message-copy message-copy-markdown message-action-icon"
+            disabled={!row.entryId || forkPending}
+            onClick={() => row.entryId && onFork?.(row.entryId)}
+            aria-label={t("forkHere")}
+            title={t("forkHere")}
+          >
+            <GitBranch size={14} />
+          </button>
+          <button
+            type="button"
+            className="message-copy message-copy-markdown message-action-icon"
             onClick={() => onSpeak?.(row.id, row.text)}
             aria-label={reading ? t("stopReading") : t("readAloud")}
             title={reading ? t("stopReading") : t("readAloud")}
           >
-            {reading ? <VolumeX size={12} /> : <Volume2 size={12} />}
-            <span>{reading ? t("stopReading") : t("readAloud")}</span>
+            {reading ? <VolumeX size={14} /> : <Volume2 size={14} />}
           </button>
         </div>
       )}

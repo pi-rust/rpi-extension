@@ -22,6 +22,12 @@ pub(super) async fn capabilities(State(state): State<AppState>) -> Json<Value> {
     if let Some(version) = state.service_version {
         value["version"] = json!(version);
     }
+    // The native host has no version in its `ready` frame, so the service
+    // probes the configured binary once (bounded, cached) and reports it here.
+    // A missing or older host just omits the field.
+    if let Some(version) = state.backend.host_version().await {
+        value["hostVersion"] = json!(version);
+    }
     value["sessionIdleTimeoutSeconds"] = match state.session_idle_timeout_seconds {
         Some(seconds) => json!(seconds),
         None => Value::Null,
@@ -77,11 +83,16 @@ pub(super) async fn tts(
             audio,
         )
             .into_response(),
-        Ok(Err(_error)) => (
-            StatusCode::BAD_GATEWAY,
-            Json(json!({"error":"TTS synthesis failed"})),
-        )
-            .into_response(),
+        Ok(Err(error)) => {
+            // The synthesizer's reason is the only clue when a chunk fails;
+            // the spoken text and voice stay out of the log.
+            eprintln!("rpi-web: TTS synthesis failed: {error}");
+            (
+                StatusCode::BAD_GATEWAY,
+                Json(json!({"error":"TTS synthesis failed"})),
+            )
+                .into_response()
+        }
         Err(_error) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(json!({"error":"TTS worker failed"})),

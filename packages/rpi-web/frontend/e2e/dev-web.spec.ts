@@ -1349,8 +1349,429 @@ test("recent chats sort by last completed turn, not recent activity", async ({
   const titles = page
     .getByRole("region", { name: "Recent chats" })
     .locator(".recent-session-link .session-title");
-  await expect(titles.first()).toHaveAttribute("data-title", "Recent session 2");
+  await expect(titles.first()).toHaveAttribute(
+    "data-title",
+    "Recent session 2",
+  );
   await expect(titles.nth(1)).toHaveAttribute("data-title", "Recent session 1");
+});
+
+test("recent chats pin running sessions above completed-turn recency", async ({
+  page,
+}) => {
+  const rows = [
+    {
+      sessionId: "session-1",
+      title: "Running session",
+      // Oldest finished turn: without the pin this row would sort last.
+      status: "running",
+      lastTurnEndedAt: 1_000,
+      updatedAt: 1_700_000_000_100,
+    },
+    {
+      sessionId: "session-2",
+      title: "Finished session",
+      status: "ready",
+      lastTurnEndedAt: 9_000,
+      updatedAt: 1_700_000_000_101,
+    },
+  ];
+  await mockHost(page);
+  // Register after the shared fixture: the newest handler wins, so these rows
+  // (not its generated ones) drive the recent list.
+  await page.route("**/api/v1/sessions", async (route: Route) => {
+    if (route.request().method() !== "GET") return route.continue();
+    return route.fulfill({
+      status: 200,
+      json: {
+        sessions: rows.map((row) => ({
+          projectId: "project-a",
+          tags: [],
+          createdAt: 1_700_000_000_000,
+          lastSeq: 4,
+          error: null,
+          relation: null,
+          parentSessionId: null,
+          forkEntryId: null,
+          latestSettlement: null,
+          pinned: false,
+          archived: false,
+          ...row,
+        })),
+      },
+    });
+  });
+  await page.goto("/");
+  const titles = page
+    .getByRole("region", { name: "Recent chats" })
+    .locator(".recent-session-link .session-title");
+  await expect(titles.first()).toHaveAttribute("data-title", "Running session");
+  await expect(titles.nth(1)).toHaveAttribute("data-title", "Finished session");
+});
+
+test("the workspace exposes an installable manifest and icons", async ({
+  page,
+  request,
+}) => {
+  const manifest = await request.get("/manifest.webmanifest");
+  expect(manifest.status()).toBe(200);
+  expect(manifest.headers()["content-type"]).toContain(
+    "application/manifest+json",
+  );
+  const body = (await manifest.json()) as {
+    display: string;
+    start_url: string;
+    scope: string;
+    icons: Array<{ src: string; sizes: string; type: string }>;
+  };
+  expect(body.display).toBe("standalone");
+  expect(body.start_url).toBe("/");
+  expect(body.scope).toBe("/");
+  expect(body.icons.map((icon) => icon.sizes)).toEqual(
+    expect.arrayContaining(["192x192", "512x512"]),
+  );
+  for (const icon of body.icons) {
+    const response = await request.get(icon.src);
+    expect(response.status(), icon.src).toBe(200);
+    expect(response.headers()["content-type"], icon.src).toContain("image/png");
+  }
+  // The page must reference the manifest, or the browser never reads it.
+  const html = await (await page.goto("/")).text();
+  expect(html).toContain('rel="manifest"');
+});
+
+test("install entry opens the browser prompt and hides once installed", async ({
+  page,
+}) => {
+  await mockHost(page);
+  await page.goto("/");
+  const install = page.getByRole("button", {
+    name: "Install app",
+    exact: true,
+  });
+  await expect(install).toHaveCount(0);
+  await page.evaluate(() => {
+    const event = new Event("beforeinstallprompt") as Event & {
+      prompt: () => Promise<void>;
+      userChoice: Promise<{ outcome: string; platform: string }>;
+    };
+    const scope = window as unknown as { __installPrompted: boolean };
+    scope.__installPrompted = false;
+    event.prompt = async () => {
+      scope.__installPrompted = true;
+    };
+    event.userChoice = Promise.resolve({
+      outcome: "accepted",
+      platform: "web",
+    });
+    window.dispatchEvent(event);
+  });
+  await expect(install).toBeVisible();
+  await page.screenshot({
+    path: test.info().outputPath("install-entry.png"),
+  });
+  await install.click();
+  await expect
+    .poll(() =>
+      page.evaluate(
+        () =>
+          (window as unknown as { __installPrompted: boolean })
+            .__installPrompted,
+      ),
+    )
+    .toBe(true);
+  // An accepted install retires the entry without waiting for a reload.
+  await expect(install).toHaveCount(0);
+});
+
+test("the install entry can be dismissed and stays hidden", async ({
+  page,
+}) => {
+  await mockHost(page);
+  await page.goto("/");
+  await page.evaluate(() => {
+    const event = new Event("beforeinstallprompt") as Event & {
+      prompt: () => Promise<void>;
+      userChoice: Promise<{ outcome: string; platform: string }>;
+    };
+    event.prompt = async () => {};
+    event.userChoice = Promise.resolve({
+      outcome: "dismissed",
+      platform: "web",
+    });
+    window.dispatchEvent(event);
+  });
+  const dismiss = page.getByRole("button", {
+    name: "Hide the install prompt",
+    exact: true,
+  });
+  await expect(dismiss).toBeVisible();
+  await dismiss.click();
+  await expect(dismiss).toHaveCount(0);
+  expect(
+    await page.evaluate(() =>
+      localStorage.getItem("rpi-web-install-dismissed"),
+    ),
+  ).toBe("1");
+  await page.reload({ waitUntil: "domcontentloaded" });
+  await expect(
+    page.getByRole("button", { name: "Install app", exact: true }),
+  ).toHaveCount(0);
+});
+
+test("the sidebar reports the native host version beside the build", async ({
+  page,
+}) => {
+  await mockHost(page);
+  // Newest handler wins: this overrides the shared capabilities fixture.
+  await page.route("**/api/v1/capabilities", (route) =>
+    route.fulfill({ json: { ...capabilities, hostVersion: "0.24.0" } }),
+  );
+  await page.goto("/");
+  const host = page.locator(".brand-host-version");
+  await expect(host).toHaveText("host 0.24.0");
+  await expect(host).toHaveAttribute("title", "Native rpi host version 0.24.0");
+  await expect(page.locator(".brand-version").first()).toHaveText("v9.9.9");
+  await page.screenshot({
+    path: test.info().outputPath("host-version.png"),
+  });
+});
+
+test("an older service with no host version keeps a single build pill", async ({
+  page,
+}) => {
+  await mockHost(page);
+  await page.goto("/");
+  await expect(page.locator(".brand-version").first()).toHaveText("v9.9.9");
+  await expect(page.locator(".brand-host-version")).toHaveCount(0);
+});
+
+/**
+ * No media decoding in the test browser: a fake element records itself and the
+ * test drives chunk boundaries by calling `onended` itself.
+ */
+async function installFakeAudio(page: Page) {
+  await page.addInitScript(() => {
+    const scope = window as unknown as { __audios: FakeAudio[] };
+    scope.__audios = [];
+    class FakeAudio {
+      onended: (() => void) | null = null;
+      onerror: (() => void) | null = null;
+      constructor() {
+        scope.__audios.push(this);
+      }
+      play() {
+        return Promise.resolve();
+      }
+      pause() {}
+    }
+    window.Audio = FakeAudio as unknown as typeof Audio;
+  });
+}
+
+/** Finish the chunk that is currently "playing" so the loop asks for the next. */
+async function endCurrentChunk(page: Page) {
+  await page.evaluate(() =>
+    (
+      window as unknown as {
+        __audios: Array<{ onended?: (() => void) | null }>;
+      }
+    ).__audios
+      .at(-1)
+      ?.onended?.(),
+  );
+}
+
+test("read aloud speaks prose chunks in order and stops with the button", async ({
+  page,
+}) => {
+  // Every paragraph is long enough to stay its own request: fragments are
+  // merged by `splitForSpeech`, which this test must not rely on.
+  const reply = [
+    "第一段说明这条回复会被分成多段朗读，第一段到这里结束。",
+    "",
+    "```ts",
+    "const answer = 42;",
+    "```",
+    "",
+    "第二段提到 [链接](https://example.com/docs)，这一段也不会被省略。",
+    "",
+    "第三段继续补充一些内容，让每个分段的长度都超过最小请求阈值。",
+    "",
+    "第四段结束，这里再补一句话，保证这一段也足够长。",
+  ].join("\n");
+  await installFakeAudio(page);
+  const spoken: string[] = [];
+  await mockHost(page, {
+    snapshotMessages: [
+      {
+        entryId: "message-3",
+        role: "assistant",
+        content: [{ type: "text", text: reply }],
+        timestamp: 1_700_000_000_000,
+      },
+    ],
+  });
+  await page.route("**/api/v1/tts", async (route) => {
+    const body = route.request().postDataJSON() as { text: string };
+    spoken.push(body.text);
+    return route.fulfill({
+      status: 200,
+      contentType: "audio/mpeg",
+      body: "chunk",
+    });
+  });
+  await page.goto("/");
+  const read = page.getByRole("button", {
+    name: "Read aloud",
+    exact: true,
+  });
+  await expect(read).toBeVisible();
+  await read.click();
+  // The button reflects the run immediately, before any audio exists.
+  await expect(
+    page.getByRole("button", { name: "Stop reading", exact: true }),
+  ).toBeVisible();
+  await expect.poll(() => spoken.length).toBeGreaterThanOrEqual(2);
+  // The first request is prose only: no fenced code, links or URLs.
+  expect(spoken[0]).toContain("第一段说明这条回复");
+  expect(spoken[0]).not.toContain("const answer");
+  expect(spoken[0]).not.toContain("```");
+  expect(spoken[0].length).toBeLessThan(reply.length);
+  const joined = spoken.join("\n");
+  expect(joined).not.toContain("example.com");
+  expect(joined).toContain("第二段提到 链接，这一段也不会被省略。");
+  // One shared element carries every chunk: a new element per chunk would be
+  // blocked by gesture-gated browsers ("play() ... user gesture").
+  expect(
+    await page.evaluate(
+      () => (window as unknown as { __audios: unknown[] }).__audios.length,
+    ),
+  ).toBe(1);
+  // Stopping freezes the queue even if the browser reports another end.
+  await page.getByRole("button", { name: "Stop reading", exact: true }).click();
+  const stopped = spoken.length;
+  await page.evaluate(() =>
+    (
+      window as unknown as {
+        __audios: Array<{ onended?: (() => void) | null }>;
+      }
+    ).__audios
+      .at(-1)
+      ?.onended?.(),
+  );
+  await page.waitForTimeout(200);
+  expect(spoken.length).toBe(stopped);
+  await expect(
+    page.getByRole("button", { name: "Read aloud", exact: true }),
+  ).toBeVisible();
+});
+
+test("a transient synthesis failure is retried instead of ending the reading", async ({
+  page,
+}) => {
+  await installFakeAudio(page);
+  const reply = [
+    `${"第一段完整而且足够长的正文。".repeat(2)}`,
+    "",
+    `${"第二段完整而且足够长的正文。".repeat(2)}`,
+    "",
+    `${"第三段完整而且足够长的正文。".repeat(2)}`,
+  ].join("\n");
+  const bodies: string[] = [];
+  let attempts = 0;
+  await mockHost(page, {
+    snapshotMessages: [
+      {
+        entryId: "message-3",
+        role: "assistant",
+        content: [{ type: "text", text: reply }],
+        timestamp: 1_700_000_000_000,
+      },
+    ],
+  });
+  await page.route("**/api/v1/tts", async (route) => {
+    attempts += 1;
+    bodies.push((route.request().postDataJSON() as { text: string }).text);
+    // The second chunk fails once, then succeeds on the retry.
+    if (attempts === 2)
+      return route.fulfill({
+        status: 502,
+        json: { error: "TTS synthesis failed" },
+      });
+    return route.fulfill({
+      status: 200,
+      contentType: "audio/mpeg",
+      body: "chunk",
+    });
+  });
+  await page.goto("/");
+  await page.getByRole("button", { name: "Read aloud", exact: true }).click();
+  // The prefetched chunk failed and was re-requested with the same text.
+  await expect.poll(() => attempts).toBe(3);
+  expect(bodies[1]).toBe(bodies[2]);
+  // A recovered blip is not a failure: reading stays active and no banner shows.
+  await expect(
+    page.getByRole("button", { name: "Stop reading", exact: true }),
+  ).toBeVisible();
+  await expect(page.getByRole("alert")).toHaveCount(0);
+  await endCurrentChunk(page);
+  await expect.poll(() => attempts).toBe(4);
+});
+
+test("blocked autoplay explains the gesture instead of failing", async ({
+  page,
+}) => {
+  // Reproduce the gesture-gated browser: every play() is rejected.
+  await page.addInitScript(() => {
+    class BlockedAudio {
+      onended: (() => void) | null = null;
+      onerror: (() => void) | null = null;
+      src = "";
+      play() {
+        return Promise.reject(
+          new DOMException(
+            "play() can only be initiated by a user gesture.",
+            "NotAllowedError",
+          ),
+        );
+      }
+      pause() {}
+    }
+    window.Audio = BlockedAudio as unknown as typeof Audio;
+  });
+  const spoken: string[] = [];
+  await mockHost(page, {
+    snapshotMessages: [
+      {
+        entryId: "message-3",
+        role: "assistant",
+        content: [{ type: "text", text: "第一段说明。" }],
+        timestamp: 1_700_000_000_000,
+      },
+    ],
+  });
+  await page.route("**/api/v1/tts", async (route) => {
+    spoken.push("chunk");
+    return route.fulfill({
+      status: 200,
+      contentType: "audio/mpeg",
+      body: "chunk",
+    });
+  });
+  await page.goto("/");
+  await page.getByRole("button", { name: "Read aloud", exact: true }).click();
+  // A policy rejection is guidance, not a red failure banner.
+  await expect(
+    page
+      .locator(".transcript-note")
+      .filter({ hasText: "The browser blocked audio playback" }),
+  ).toBeVisible();
+  await expect(page.getByRole("alert")).toHaveCount(0);
+  await expect(
+    page.getByRole("button", { name: "Read aloud", exact: true }),
+  ).toBeVisible();
+  expect(spoken.length).toBe(1);
 });
 
 test("details jump is right-aligned in the slim metrics strip (#306)", async ({
@@ -1776,16 +2197,63 @@ test("a message typed during a run queues as a follow-up without a kind selector
     .toEqual([{ message: "Change course now", deliverAs: "followUp" }]);
 });
 
+test.describe("huawei browser that reports a fine pointer", () => {
+  // HuaweiBrowser can advertise a desktop-like pointer while running on a phone;
+  // the UA still marks it as mobile so Enter keeps newline semantics.
+  test.use({
+    userAgent:
+      "Mozilla/5.0 (Linux; Android 12; ELS-AN00) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/114.0.0.0 Mobile Safari/537.36 HuaweiBrowser/14.0.0.302",
+  });
+
+  test("Enter inserts a newline instead of sending", async ({ page }) => {
+    await mockHost(page);
+    const commands: string[] = [];
+    await page.route(
+      `**/api/v1/sessions/${sessionId}/commands`,
+      async (route) => {
+        commands.push(route.request().postDataJSON().type);
+        return route.fallback();
+      },
+    );
+    await page.setViewportSize({ width: 390, height: 844 });
+    await page.goto("/");
+    const input = page.getByRole("textbox", {
+      name: "Send a prompt, or type / for commands…",
+    });
+    await input.fill("继续补充需求");
+    await input.press("Enter");
+    await expect(input).toHaveValue("继续补充需求\n");
+    expect(commands).not.toContain("prompt");
+    // The send button is still the explicit way to send.
+    await page
+      .getByRole("button", { name: "Send message", exact: true })
+      .click();
+    await expect.poll(() => commands).toContain("prompt");
+  });
+});
+
 test.describe("touch composer", () => {
   test.use({ hasTouch: true });
 
-  for (const sendVia of [
-    "Enter",
-    "insertLineBreak",
-    "insertParagraph",
-    "button",
-  ]) {
-    test(`a running task queues from a touch keyboard via ${sendVia}`, async ({
+  test("composer never offers an implicit submit on touch", async ({
+    page,
+  }) => {
+    await mockHost(page);
+    await page.goto("/");
+    // A submit button turns some Android IMEs' Enter into "send", which makes
+    // long-press-for-newline impossible; the send button is type=button.
+    await expect(
+      page.locator('form.composer-area button[type="submit"]'),
+    ).toHaveCount(0);
+    const input = page.getByRole("textbox", {
+      name: "Send a prompt, or type / for commands…",
+    });
+    // Soft keyboards should show a newline key, not a send key.
+    await expect(input).toHaveAttribute("enterkeyhint", "enter");
+  });
+
+  for (const sendVia of ["Enter", "insertLineBreak", "insertParagraph"]) {
+    test(`touch ${sendVia} inserts a newline while a task is running`, async ({
       page,
     }) => {
       await mockHost(page);
@@ -1815,18 +2283,21 @@ test.describe("touch composer", () => {
       const input = page.getByRole("textbox", {
         name: "Send a prompt, or type / for commands…",
       });
-      const queueButton = page.getByRole("button", {
-        name: "Queue",
+      const sendButton = page.getByRole("button", {
+        name: "Send message",
         exact: true,
       });
-      // Nothing queued yet: only the stop action is offered.
+      // Nothing typed: only the stop action is offered.
       await expect(
         page.getByRole("button", { name: "Abort", exact: true }),
       ).toBeEnabled();
-      await expect(queueButton).toHaveCount(0);
-      await expect(input).toHaveAttribute("enterkeyhint", "send");
+      await expect(sendButton).toHaveCount(0);
+      await expect(input).not.toHaveAttribute("enterkeyhint", "send");
       await input.fill("继续补充需求");
-      await expect(queueButton).toBeVisible();
+      await expect(sendButton).toBeVisible();
+      await expect(
+        page.getByRole("button", { name: "Abort", exact: true }),
+      ).toHaveCount(0);
       // Shift+Enter and IME confirmation must not submit, even on touch devices.
       await input.press("Shift+Enter");
       await expect(input).toHaveValue("继续补充需求\n");
@@ -1852,10 +2323,8 @@ test.describe("touch composer", () => {
       await input.fill("继续补充需求");
       if (sendVia === "Enter") {
         await input.press("Enter");
-      } else if (sendVia === "button") {
-        await queueButton.click();
       } else {
-        // Soft keyboards can send only beforeinput, with no keydown event.
+        // Soft keyboards inject newlines without an Enter keydown.
         const allowed = await input.evaluate(
           (element, inputType) =>
             element.dispatchEvent(
@@ -1867,13 +2336,24 @@ test.describe("touch composer", () => {
             ),
           sendVia,
         );
-        expect(allowed).toBe(false);
+        expect(allowed).toBe(true);
       }
+      // Enter is a newline on touch, so nothing is queued. The synthetic
+      // beforeinput cases only check that the default is not prevented;
+      // dispatching them does not perform the browser's native insertion.
+      if (sendVia === "Enter")
+        await expect(input).toHaveValue("继续补充需求\n");
+      await expect.poll(() => queued).toEqual([]);
+      // The main button is the explicit send entry point.
+      await sendButton.click();
       await expect
         .poll(() => queued)
         .toEqual([{ message: "继续补充需求", deliverAs: "followUp" }]);
       await expect(input).toHaveValue("");
-      await expect(queueButton).toHaveCount(0);
+      await expect(sendButton).toHaveCount(0);
+      await expect(
+        page.getByRole("button", { name: "Abort", exact: true }),
+      ).toBeEnabled();
     });
   }
 });
@@ -1941,6 +2421,90 @@ test("send now steers a waiting message into the running task", async ({
         entryId: "queue-2",
       },
     ]);
+});
+
+test("send now flashes a sent check only after delivery", async ({ page }) => {
+  await mockHost(page);
+  let release!: () => void;
+  const gate = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  let delivered = false;
+  let reads = 0;
+  await page.route(`**/api/v1/sessions/${sessionId}/events**`, (route) =>
+    route.fulfill({
+      contentType: "text/event-stream",
+      body: 'id: 5\nevent: agent_start\ndata: {"type":"agent_start"}\n\n',
+    }),
+  );
+  await page.route(
+    `**/api/v1/sessions/${sessionId}/commands`,
+    async (route) => {
+      const body = route.request().postDataJSON();
+      if (body.type === "queue_message") {
+        await gate;
+        return route.fulfill({
+          json: response(
+            { accepted: true, entryId: "steered-now", queue: "steer" },
+            body.type,
+          ),
+        });
+      }
+      if (body.type === "cancel_queued")
+        return route.fulfill({ json: response({ accepted: true }, body.type) });
+      if (body.type === "get_queue") {
+        reads += 1;
+        const items =
+          delivered || reads <= 1
+            ? []
+            : [
+                {
+                  entryId: "queue-2",
+                  queue: "followUp",
+                  status: "queued",
+                  text: "pending",
+                },
+              ];
+        return route.fulfill({
+          json: response({ items, count: items.length }, body.type),
+        });
+      }
+      return route.fallback();
+    },
+  );
+  await page.goto("/");
+  await expect(
+    page.getByRole("button", { name: "Abort", exact: true }),
+  ).toBeEnabled();
+  await openRuntimePanel(page);
+  const sendNow = page
+    .locator(".inspector .queue-item")
+    .getByRole("button", { name: "Send now: pending", exact: true });
+  await sendNow.click();
+  // While the queueing request is in flight the entry's button spins.
+  await expect(sendNow.locator("svg.spin")).toBeVisible();
+  release();
+  // Accepted but not yet delivered: the spinner persists on this entry's
+  // button (the composer button stays untouched).
+  await expect(sendNow.locator("svg.spin")).toBeVisible();
+  await expect(
+    page.getByRole("button", { name: "Abort", exact: true }),
+  ).toBeEnabled();
+  await page.waitForTimeout(1700);
+  // The queue read keeps listing the entry, so the wait continues.
+  await expect(sendNow.locator("svg.spin")).toBeVisible();
+  // Deliver: flip the fixture so the queue read stops listing the entry.
+  delivered = true;
+  // The delivery lands: the queue panel heading flashes a green check
+  // ("Sent") while the delivered entry leaves the list.
+  const sentCheck = page
+    .locator(".panel-heading-actions .queue-send-now-sent-check")
+    .first();
+  await expect(sentCheck).toBeVisible({ timeout: 8000 });
+  await expect(sentCheck).toHaveClass(/queue-send-now-sent-check/);
+  // The check is a flash: it disappears once the confirmation ends.
+  await expect(sentCheck).toHaveCount(0, { timeout: 4000 });
+  expect(reads).toBeGreaterThan(1);
 });
 
 test("a delivered queued message leaves the list", async ({ page }) => {
@@ -2460,6 +3024,32 @@ test.describe("clipboard attachment upload", () => {
     await expect(page.locator(".composer textarea")).toHaveValue(
       "Please inspect",
     );
+  });
+
+  for (const path of ["file:///tmp/note.md", "file/notes.txt"]) {
+    test(`pastes a path starting with file (${path}) as text`, async ({
+      page,
+    }) => {
+      await mockHost(page);
+      const names = await uploadMock(page);
+      await ready(page);
+      // Some clipboard providers expose the path as a file with no text/plain.
+      expect(await pasteFiles(page, [document(path)])).toBe(true);
+      await expect(page.locator(".composer textarea")).toHaveValue(
+        `Please inspect${path}`,
+      );
+      await expect(page.locator(".composer-attachment")).toHaveCount(0);
+      expect(names).toEqual([]);
+    });
+  }
+
+  test("still uploads a real document named file.txt", async ({ page }) => {
+    await mockHost(page);
+    const names = await uploadMock(page);
+    await ready(page);
+    expect(await pasteFiles(page, [document("file.txt")])).toBe(true);
+    await expect(page.locator(".composer-attachment")).toHaveCount(1);
+    expect(names).toEqual(["file.txt"]);
   });
 
   test("keeps native text paste and selection replacement without any upload", async ({
@@ -3674,11 +4264,35 @@ test("streaming thinking does not resize the transcript", async ({ page }) => {
       .locator(".thinking-row-viewport")
       .evaluate((node) => node.clientHeight),
   ).toBe(viewportHeight);
+  const viewport = row.locator(".thinking-row-viewport");
   expect(
-    await row
-      .locator(".thinking-row-viewport")
-      .evaluate((node) => node.scrollHeight > node.clientHeight),
+    await viewport.evaluate((node) => node.scrollHeight > node.clientHeight),
   ).toBe(true);
+  // The visual focus follows newly streamed text to the bottom.
+  await expect
+    .poll(() =>
+      viewport.evaluate(
+        (node) => node.scrollHeight - node.scrollTop - node.clientHeight,
+      ),
+    )
+    .toBeLessThan(24);
+  // A reader scrolling up pauses following; returning to the bottom resumes.
+  await viewport.evaluate((node) => {
+    node.scrollTop = 0;
+    node.dispatchEvent(new Event("scroll", { bubbles: true }));
+  });
+  await expect.poll(() => viewport.evaluate((node) => node.scrollTop)).toBe(0);
+  await viewport.evaluate((node) => {
+    node.scrollTop = node.scrollHeight;
+    node.dispatchEvent(new Event("scroll", { bubbles: true }));
+  });
+  await expect
+    .poll(() =>
+      viewport.evaluate(
+        (node) => node.scrollHeight - node.scrollTop - node.clientHeight,
+      ),
+    )
+    .toBeLessThan(24);
 });
 
 // The indicator is out of flow, so the only thing keeping it off the transcript
@@ -4019,6 +4633,67 @@ test("delayed diagnostics from another chat cannot replace the active chat queue
   await expect(page.locator(".queue-item")).not.toContainText("Old chat queue");
 });
 
+for (const width of [375, 1280]) {
+  test(`session management keeps the sidebar expanded at ${width}px`, async ({
+    page,
+  }) => {
+    await page.setViewportSize({ width, height: 844 });
+    await mockHost(page, { additionalSessions: 1 });
+    await page.goto("/");
+    const sidebar = page.locator("aside.sidebar.open");
+    if (width < 768) {
+      await expect(sidebar).toHaveCount(0);
+      await page
+        .getByRole("button", { name: "Toggle sidebar", exact: true })
+        .click();
+    }
+    await expect(sidebar).toBeVisible();
+
+    await clickRowAction(page, "Session actions: Mock session");
+    await page.getByRole("menuitem", { name: "Archive", exact: true }).click();
+    await expect(sidebar).toBeVisible();
+    await expect(
+      page.locator(".project-session-link").filter({ hasText: "Mock session" }),
+    ).toHaveCount(0);
+
+    if (width < 768) {
+      await page.getByRole("button", { name: "Close sidebar" }).click();
+      await expect(sidebar).toHaveCount(0);
+      await page
+        .getByRole("button", { name: "Switch session", exact: true })
+        .click();
+      await page
+        .locator(".mobile-session-option")
+        .filter({ hasText: "Recent session 1" })
+        .click();
+      await page
+        .getByRole("button", { name: "Toggle sidebar", exact: true })
+        .click();
+    } else {
+      await page
+        .locator(".project-session-link")
+        .filter({ hasText: "Recent session 1" })
+        .click();
+    }
+    await expect(page.locator(".toolbar h1")).toHaveText("Recent session 1");
+    await expect(sidebar).toBeVisible();
+    await clickRowAction(page, "Session actions: Recent session 1");
+    await page
+      .getByRole("menuitem", { name: "Delete permanently", exact: true })
+      .click();
+    await page
+      .getByRole("dialog", { name: "Delete session permanently" })
+      .getByRole("button", { name: "Delete permanently", exact: true })
+      .click();
+    await expect(sidebar).toBeVisible();
+    await expect(
+      page
+        .locator(".project-session-link")
+        .filter({ hasText: "Recent session 1" }),
+    ).toHaveCount(0);
+  });
+}
+
 test("archiving a previous chat does not navigate away from a newly selected chat", async ({
   page,
 }) => {
@@ -4069,6 +4744,92 @@ test("archiving a previous chat does not navigate away from a newly selected cha
     page.getByRole("heading", { name: "New session" }),
   ).toBeVisible();
   expect(page.url()).toBe(activeUrl);
+});
+
+test("an empty session is reused instead of creating another one", async ({
+  page,
+}) => {
+  const emptySession = {
+    ...session,
+    sessionId: "empty-session",
+    title: null,
+    lastSeq: 0,
+    lastTurnEndedAt: null,
+    latestSettlement: null,
+    createdAt: 1_700_000_000_000,
+    updatedAt: 1_700_000_000_000,
+  };
+  await mockHost(page);
+  await page.route("**/api/v1/sessions", async (route: Route) => {
+    if (route.request().method() === "GET")
+      return route.fulfill({ json: { sessions: [emptySession] } });
+    throw new Error("an untouched session must not create another session");
+  });
+  await page.route("**/api/v1/sessions/empty-session/open", (route) =>
+    route.fulfill({ json: emptySession }),
+  );
+  await page.goto("/");
+  await expect(page.locator(".toolbar h1")).toHaveText("New session");
+  await expect.poll(() => page.url()).toContain("session=empty-session");
+  let created = 0;
+  page.on("request", (request) => {
+    if (
+      request.url().endsWith("/api/v1/sessions") &&
+      request.method() === "POST"
+    )
+      created++;
+  });
+  await page
+    .getByRole("button", { name: "New session", exact: false })
+    .first()
+    .click();
+  await expect(page.locator(".toolbar h1")).toHaveText("New session");
+  expect(page.url()).toContain("session=empty-session");
+  await page.waitForTimeout(250);
+  expect(created).toBe(0);
+});
+
+test("an untouched session in another project is not reused", async ({
+  page,
+}) => {
+  // Project-scoped "New session in <project>" must open a chat in that project.
+  // A single global empty session would silently switch the project instead.
+  const emptyInA = {
+    ...session,
+    sessionId: "empty-a",
+    projectId: "project-a",
+    title: null,
+    lastSeq: 0,
+    lastTurnEndedAt: null,
+    latestSettlement: null,
+    createdAt: 1_700_000_000_000,
+    updatedAt: 1_700_000_000_000,
+  };
+  const createdInB = {
+    ...emptyInA,
+    sessionId: "empty-b",
+    projectId: "project-b",
+    createdAt: 1_700_000_000_500,
+  };
+  await mockHost(page);
+  let created = 0;
+  await page.route("**/api/v1/sessions", async (route: Route) => {
+    if (route.request().method() === "GET")
+      return route.fulfill({ json: { sessions: [emptyInA] } });
+    created++;
+    return route.fulfill({ status: 201, json: createdInB });
+  });
+  await page.route("**/api/v1/sessions/empty-a/open", (route) =>
+    route.fulfill({ json: emptyInA }),
+  );
+  await page.route("**/api/v1/sessions/empty-b/open", (route) =>
+    route.fulfill({ json: createdInB }),
+  );
+  await page.goto("/");
+  await expect.poll(() => page.url()).toContain("session=empty-a");
+  await clickRowAction(page, "New session in: rpi-package");
+  await expect.poll(() => created).toBe(1);
+  await expect.poll(() => page.url()).toContain("session=empty-b");
 });
 
 test("a failed session list does not create a replacement chat", async ({
@@ -4497,8 +5258,10 @@ test.describe("mobile fork regression", () => {
   const forkEntryId = "chosen-history-leaf";
   const forkError = "Mock fork failed without changing the selection";
   const toolbarFork = (page: Page) => page.locator(".toolbar-fork");
+  const messageFork = (page: Page) =>
+    page.locator(".message.assistant .message-actions").last().locator("button").nth(1);
   const historyFork = (page: Page) =>
-    page.getByTitle("Fork from this point", { exact: true });
+    page.locator(".history-actions button").first();
   const titleDialog = (page: Page) =>
     page.getByRole("dialog", { name: "Name the new fork", exact: true });
 
@@ -4551,6 +5314,11 @@ test.describe("mobile fork regression", () => {
               entryId: `message-${id}`,
               content: `Transcript: ${id}`,
             },
+            {
+              role: "assistant",
+              entryId: `assistant-${id}`,
+              content: [{ type: "text", text: `Answer: ${id}` }],
+            },
           ],
         },
       });
@@ -4592,10 +5360,11 @@ test.describe("mobile fork regression", () => {
   }
 
   async function assertLocked(page: Page, locked: boolean) {
-    for (const button of [toolbarFork(page), historyFork(page)]) {
+    for (const button of [messageFork(page), historyFork(page)]) {
       if (locked) await expect(button).toBeDisabled();
       else await expect(button).toBeEnabled();
     }
+    await expect(toolbarFork(page)).toHaveCount(0);
   }
 
   async function navigate(
@@ -4639,8 +5408,9 @@ test.describe("mobile fork regression", () => {
       await page.setViewportSize({ width, height: 844 });
       const mock = await host(page);
       await page.goto("/?session=session-1");
-      const button = toolbarFork(page);
-      await expect(button).toHaveAccessibleName("Fork current session");
+      await expect(toolbarFork(page)).toHaveCount(0);
+      const button = messageFork(page);
+      await expect(button).toHaveAccessibleName("Fork from this point");
       await expect(button).toBeVisible();
       await expect(button).toBeEnabled();
       const clone = page.getByRole("button", {
@@ -4651,9 +5421,9 @@ test.describe("mobile fork regression", () => {
       else await expect(clone).toBeVisible();
       const bounds = await button.boundingBox();
       expect(bounds).not.toBeNull();
-      // Phones retain the existing 32px touch target; desktop uses compact icons.
-      expect(bounds!.width).toBeGreaterThanOrEqual(width < 768 ? 32 : 28);
-      expect(bounds!.height).toBeGreaterThanOrEqual(width < 768 ? 32 : 28);
+      // Message actions use compact icon buttons at every viewport.
+      expect(bounds!.width).toBeGreaterThanOrEqual(24);
+      expect(bounds!.height).toBeGreaterThanOrEqual(24);
       expect(bounds!.x).toBeGreaterThanOrEqual(0);
       expect(bounds!.y).toBeGreaterThanOrEqual(0);
       expect(bounds!.x + bounds!.width).toBeLessThanOrEqual(width);
@@ -4682,7 +5452,7 @@ test.describe("mobile fork regression", () => {
     });
   }
 
-  for (const origin of ["toolbar", "history"] as const) {
+  for (const origin of ["message", "history"] as const) {
     test(`${origin} fork is single-flight through title and API, preserving source and chosen entry`, async ({
       page,
     }) => {
@@ -4697,13 +5467,14 @@ test.describe("mobile fork regression", () => {
         // Same-task activation covers the ref guard before React publishes the
         // disabled state; another entry point must not replace the first prompt.
         await page.evaluate((origin) => {
-          const toolbar =
-            document.querySelector<HTMLButtonElement>(".toolbar-fork")!;
+          const message = document.querySelectorAll<HTMLButtonElement>(
+            ".message.assistant .message-actions button",
+          )[1]!;
           const history = document.querySelector<HTMLButtonElement>(
             ".history-actions button",
           )!;
-          const first = origin === "toolbar" ? toolbar : history;
-          const second = origin === "toolbar" ? history : toolbar;
+          const first = origin === "message" ? message : history;
+          const second = origin === "message" ? history : message;
           first.click();
           second.click();
           first.click();
@@ -4718,7 +5489,7 @@ test.describe("mobile fork regression", () => {
         await expect.poll(() => mock.requests.length).toBe(1);
         await expect(titleDialog(page)).toHaveCount(0);
         await assertLocked(page, true);
-        await toolbarFork(page).evaluate((button: HTMLButtonElement) =>
+        await messageFork(page).evaluate((button: HTMLButtonElement) =>
           button.click(),
         );
         await historyFork(page).evaluate((button: HTMLButtonElement) =>
@@ -4730,7 +5501,9 @@ test.describe("mobile fork regression", () => {
             source: sessionId,
             body: {
               title: "Chosen fork title",
-              ...(origin === "history" ? { entryId: forkEntryId } : {}),
+              ...(origin === "message"
+                ? { entryId: "assistant-session-1" }
+                : { entryId: forkEntryId }),
             },
           },
         ]);
@@ -4742,7 +5515,7 @@ test.describe("mobile fork regression", () => {
         await expect(page.locator(".message.user")).toContainText(
           "Transcript: fork-new",
         );
-        await expect(toolbarFork(page)).toBeEnabled();
+        await expect(messageFork(page)).toBeEnabled();
         expect(mock.requests).toHaveLength(1);
       } finally {
         mock.release();
@@ -4778,7 +5551,7 @@ test.describe("mobile fork regression", () => {
         await expect(page.locator(".message.user")).toContainText(
           "Transcript: session-1",
         );
-        await toolbarFork(page).click();
+        await messageFork(page).click();
         await expect(titleDialog(page)).toBeVisible();
         await assertLocked(page, true);
         await titleDialog(page)
@@ -4792,7 +5565,7 @@ test.describe("mobile fork regression", () => {
     });
   }
 
-  for (const origin of ["toolbar", "history"] as const) {
+  for (const origin of ["message", "history"] as const) {
     for (const outcome of ["cancel", "submit"] as const) {
       test(`${origin} fork unlocks when a keyboard-opened clone replaces its prompt (${outcome})`, async ({
         page,
@@ -4820,7 +5593,7 @@ test.describe("mobile fork regression", () => {
         await page.goto("/?session=session-1");
         await openHistory(page);
         await (
-          origin === "toolbar" ? toolbarFork(page) : historyFork(page)
+          origin === "message" ? messageFork(page) : historyFork(page)
         ).click();
         await expect(titleDialog(page)).toBeVisible();
         await titleDialog(page)
@@ -4832,19 +5605,9 @@ test.describe("mobile fork regression", () => {
           name: "Clone current session",
           exact: true,
         });
-        // The modal currently has no focus trap/inert background. Exercise real
-        // desktop Tab + Enter activation, not a pointer through its backdrop.
-        for (
-          let tabs = 0;
-          tabs < 80 &&
-          !(await clone.evaluate(
-            (button) => button === document.activeElement,
-          ));
-          tabs++
-        ) {
-          await page.keyboard.press("Tab");
-        }
-        await expect(clone).toBeFocused();
+        // The modal has no focus trap/inert background. Exercise real keyboard
+        // activation of the top-bar clone, not a pointer through its backdrop.
+        await clone.focus();
         await page.keyboard.press("Enter");
         const cloneDialog = page.getByRole("dialog", {
           name: "Name the cloned session",
@@ -4881,7 +5644,7 @@ test.describe("mobile fork regression", () => {
         await assertLocked(page, false);
         // Retry through the opposite entry point proves the shared ref lock cleared.
         await (
-          origin === "toolbar" ? historyFork(page) : toolbarFork(page)
+          origin === "message" ? historyFork(page) : messageFork(page)
         ).click();
         await expect(titleDialog(page)).toBeVisible();
         await assertLocked(page, true);
@@ -4912,7 +5675,7 @@ test.describe("mobile fork regression", () => {
     }) => {
       const mock = await host(page);
       await page.goto("/?session=session-1");
-      await toolbarFork(page).click();
+      await messageFork(page).click();
       await expect(titleDialog(page)).toBeVisible();
       await navigate(page, destination, true);
       await titleDialog(page).getByRole("textbox").fill("Stale fork title");
@@ -4921,9 +5684,7 @@ test.describe("mobile fork regression", () => {
         .click();
       await expect(titleDialog(page)).toHaveCount(0);
       await chooseLanguage(page, "zh");
-      if (destination === "session")
-        await expect(toolbarFork(page)).toBeEnabled();
-      else await expect(toolbarFork(page)).toBeDisabled();
+      await expect(toolbarFork(page)).toHaveCount(0);
       expect(mock.requests).toEqual([]);
       await expect(page.locator(".toolbar .breadcrumb")).toContainText(
         destination === "project" ? "rpi-package" : "Other chat",
@@ -4941,7 +5702,7 @@ test.describe("mobile fork regression", () => {
         });
         try {
           await page.goto("/?session=session-1");
-          await toolbarFork(page).click();
+          await messageFork(page).click();
           await titleDialog(page).getByRole("textbox").fill("Late fork title");
           await titleDialog(page)
             .getByRole("button", { name: "Submit", exact: true })
@@ -4966,7 +5727,7 @@ test.describe("mobile fork regression", () => {
             await expect(page.locator(".message.user")).toContainText(
               "Transcript: session-2",
             );
-            await expect(toolbarFork(page)).toBeEnabled();
+            await expect(messageFork(page)).toBeEnabled();
           }
           await expect(page.locator(".error-banner")).toHaveCount(0);
           await expect(page.getByRole("dialog")).toHaveCount(0);
@@ -4974,7 +5735,10 @@ test.describe("mobile fork regression", () => {
             {
               method: "POST",
               source: sessionId,
-              body: { title: "Late fork title" },
+              body: {
+                title: "Late fork title",
+                entryId: "assistant-session-1",
+              },
             },
           ]);
         } finally {
@@ -4989,7 +5753,20 @@ for (const action of ["fork", "clone"] as const) {
   test(`a late ${action} response preserves subsequent project navigation`, async ({
     page,
   }) => {
-    await mockHost(page);
+    await mockHost(page, {
+      snapshotMessages: [
+        {
+          role: "user",
+          entryId: "late-action-user",
+          content: [{ type: "text", text: "A late action" }],
+        },
+        {
+          role: "assistant",
+          entryId: "late-action-assistant",
+          content: [{ type: "text", text: "A late answer" }],
+        },
+      ],
+    });
     let release!: () => void;
     const held = new Promise<void>((resolve) => {
       release = resolve;
@@ -5007,13 +5784,19 @@ for (const action of ["fork", "clone"] as const) {
       },
     );
     await page.goto("/");
-    await page
-      .getByRole("button", {
-        name:
-          action === "fork" ? "Fork current session" : "Clone current session",
-        exact: true,
-      })
-      .click();
+    if (action === "fork") {
+      await page
+        .locator(".message.assistant .message-actions button")
+        .nth(1)
+        .click();
+    } else {
+      await page
+        .getByRole("button", {
+          name: "Clone current session",
+          exact: true,
+        })
+        .click();
+    }
     await page.getByRole("dialog").getByRole("textbox").fill("Derived chat");
     await page
       .getByRole("dialog")
@@ -18049,11 +18832,11 @@ test.describe("retirement", () => {
   });
 });
 
-test("mobile composer sends on Enter and keeps Shift+Enter for newlines", async ({
+test("mobile composer keeps Enter and Shift+Enter as newlines", async ({
   browser,
 }) => {
   let prompts = 0;
-  // A coarse pointer must not disable Enter submission.
+  // A coarse pointer makes Enter a newline; the icon button is the send path.
   const context = await browser.newContext({
     ...devices["iPhone 13"],
     baseURL: process.env.BASE_URL ?? "http://127.0.0.1:4191",
@@ -18076,6 +18859,11 @@ test("mobile composer sends on Enter and keeps Shift+Enter for newlines", async 
   await expect(input).toHaveValue("first line\nsecond line");
   expect(prompts).toBe(0);
   await input.press("Enter");
+  await expect(input).toHaveValue("first line\nsecond line\n");
+  expect(prompts).toBe(0);
+  await mobilePage
+    .getByRole("button", { name: "Send message", exact: true })
+    .click();
   await expect.poll(() => prompts).toBe(1);
   await expect(input).toHaveValue("");
   await context.close();

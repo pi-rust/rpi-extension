@@ -2,7 +2,8 @@ use serde_json::{json, Value};
 mod admission;
 mod child;
 mod resources;
-use admission::{ExecutionAdmission, ExecutionTicket};
+mod startup;
+use admission::{ExecutionAdmission, ExecutionProjection, ExecutionTicket};
 pub(crate) use resources::ResourceFence;
 use std::{
     collections::{HashMap, VecDeque},
@@ -27,10 +28,16 @@ async fn read_ready(
     timeout: Duration,
 ) -> Result<Value, String> {
     let mut first_line = String::new();
-    tokio::time::timeout(timeout, reader.take(1024 * 1024).read_line(&mut first_line))
+    let count = tokio::time::timeout(timeout, reader.take(1024 * 1024).read_line(&mut first_line))
         .await
         .map_err(|_| "native rpi host startup timed out".to_string())?
         .map_err(|error| format!("failed to read rpi ready frame: {error}"))?;
+    if count == 0 {
+        return Err("native rpi host closed stdout before ready (EOF)".into());
+    }
+    if count == 1024 * 1024 && !first_line.ends_with('\n') {
+        return Err("rpi ready frame exceeds startup frame limit".into());
+    }
     let ready: Value = serde_json::from_str(first_line.trim())
         .map_err(|error| format!("invalid rpi ready frame: {error}"))?;
     if ready["type"] != "ready" || ready["protocol"] != "rpi" {
@@ -751,6 +758,21 @@ impl HostSession {
     }
 
     pub async fn spawn_options(options: SessionOptions) -> Result<Arc<Self>, String> {
+        Self::spawn_options_with_fork_cut(options, None).await
+    }
+
+    /// Start a session and, for a fork launch, cut the new branch at `entry`.
+    ///
+    /// This is a separate entry point instead of two more `SessionOptions`
+    /// fields: `SessionOptions` is public and re-exported, so a new required
+    /// field breaks `cargo package` for every already-published dependent
+    /// (`rpi-mcp-server` verifies its tarball against the released
+    /// `rpi-extcore` from the registry).
+    pub async fn spawn_options_with_fork_cut(
+        options: SessionOptions,
+        fork_cut: Option<&str>,
+    ) -> Result<Arc<Self>, String> {
+        let launch_guard = startup::LaunchGuard::acquire(&options)?;
         let launch_options = options.clone();
         let resource_file = resources::StartupFile::prepare(&options).await?;
         let session_id = &options.session_id;
@@ -761,6 +783,10 @@ impl HostSession {
         timings.set_session(session_id);
         let mut command = crate::process::background_command(&options.executable);
         command.arg("--mode").arg("rpc");
+        // Declare support per child, never via a process-global environment
+        // mutation. Old native ignores this and advertises legacy semantics;
+        // new native emits correlated autonomous settlements only on opt-in.
+        command.env("RPI_RPC_EXECUTION_LIFECYCLE", "correlated-v1");
         if let Some(file) = &resource_file {
             command.arg(file.flag).arg(&file.path);
         }
@@ -768,6 +794,12 @@ impl HostSession {
             command.arg("--session").arg(path);
         } else if let Some(source) = &options.fork_source {
             command.arg("--fork").arg(source);
+            if let Some(entry) = fork_cut {
+                // `at` includes the selected message, matching a message-level
+                // fork action that must keep the assistant reply it started from.
+                command.arg("--fork-entry").arg(entry);
+                command.arg("--fork-position").arg("at");
+            }
         } else {
             command.arg("--session-id").arg(session_id);
         }
@@ -791,7 +823,17 @@ impl HostSession {
             .current_dir(project)
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::inherit());
+            .stderr(std::process::Stdio::piped());
+        #[cfg(windows)]
+        let stderr = {
+            // Tokio's conversion of a standard Windows pipe still uses
+            // blocking reads. Use an overlapped server pipe for cancellation.
+            let (writer, reader) = startup::windows_stderr_pipe()
+                .await
+                .map_err(|e| format!("failed to create native stderr pipe: {e}"))?;
+            command.stderr(writer);
+            reader
+        };
         let mut child = rpi_mcp_core::ProcessTree::spawn(&mut command.into_std())
             .map_err(|error| format!("failed to start {}: {error}", rpi_bin.display()))?;
         let stdin = tokio::process::ChildStdin::from_std(
@@ -810,14 +852,21 @@ impl HostSession {
                 .ok_or("rpi host stdout unavailable")?,
         )
         .map_err(|e| e.to_string())?;
-        let child_owner = child::NativeChild::start(child);
+        #[cfg(not(windows))]
+        let stderr = tokio::process::ChildStderr::from_std(
+            child
+                .child_mut()
+                .stderr
+                .take()
+                .ok_or("rpi host stderr unavailable")?,
+        )
+        .map_err(|e| e.to_string())?;
+        let child_owner = child::NativeChild::start(child, Some(launch_guard));
+        let diagnostics = startup::StderrCapture::start(stderr, child_owner.exit_signal());
         let mut reader = BufReader::new(stdout);
         let ready = match read_ready(&mut reader, Duration::from_secs(15)).await {
             Ok(ready) => ready,
-            Err(error) => {
-                let _ = child_owner.stop_checked().await;
-                return Err(error);
-            }
+            Err(error) => return Err(diagnostics.failure(error, &child_owner).await),
         };
 
         let (raw_events, _) = broadcast::channel(16_384);
@@ -841,7 +890,7 @@ impl HostSession {
         let history: Arc<Mutex<VecDeque<BufferedEvent>>> = Arc::new(Mutex::new(VecDeque::new()));
         let seq = Arc::new(AtomicU64::new(0));
         let runtime = Arc::new(HostRuntime {
-            execution: Arc::new(StdMutex::new(ExecutionAdmission::default())),
+            execution: Arc::new(StdMutex::new(ExecutionAdmission::from_ready(&ready))),
             raw_events: raw_events.clone(),
             events: events.clone(),
             pending: pending.clone(),
@@ -924,7 +973,7 @@ impl HostSession {
                 {
                     break;
                 }
-                runtime
+                let execution_projection = runtime
                     .execution
                     .lock()
                     .expect("execution admission")
@@ -945,12 +994,13 @@ impl HostSession {
                             Some("prompt" | "compact" | "resume_pending")
                         )
                     {
-                        publish(
+                        publish_with_execution(
                             &events_reader,
                             &history_reader,
                             &state_reader,
                             &seq_reader,
                             json!({"type":"operation_accepted", "command":value["command"]}),
+                            execution_projection,
                         )
                         .await;
                     }
@@ -969,12 +1019,13 @@ impl HostSession {
                         .unwrap()
                         .event(&mut value);
                     let _ = raw_events.send(value.clone());
-                    publish(
+                    publish_with_execution(
                         &events_reader,
                         &history_reader,
                         &state_reader,
                         &seq_reader,
                         value,
+                        execution_projection,
                     )
                     .await;
                 }
@@ -1103,6 +1154,9 @@ impl HostSession {
         self.notify(command).await?;
         let mut run = crate::run::PromptRun::new(events, cancellation, id, kind, lease);
         run.tracker.require_message_ids(self.supports_message_ids());
+        run.tracker.require_execution_identity(
+            self.ready["semantics"]["executionLifecycle"] == "correlated-v1",
+        );
         Ok(run)
     }
     pub async fn abort_run(&self) -> Result<(), String> {
@@ -1196,6 +1250,7 @@ impl HostSession {
         let (commands, outbound) = mpsc::channel(32);
         let pending: Pending = Arc::new(StdMutex::new(HashMap::new()));
         let (raw_events, _) = broadcast::channel(capacity);
+        let execution = ExecutionAdmission::from_ready(&ready);
         let session = Arc::new(Self {
             child_owner: None,
             worker: Arc::new(Mutex::new(None)),
@@ -1215,7 +1270,7 @@ impl HostSession {
             usage_gate: Mutex::new(()),
             configuration_owner: Mutex::new(std::sync::Weak::new()),
             runtime: Arc::new(HostRuntime {
-                execution: Arc::new(StdMutex::new(ExecutionAdmission::default())),
+                execution: Arc::new(StdMutex::new(execution)),
                 raw_events,
                 events: broadcast::channel(capacity).0,
                 pending,
@@ -1777,25 +1832,37 @@ impl TestEvents {
     /// Fixture equivalent of a non-response frame passing through native projection.
     pub async fn send_projected(&self, value: Value) {
         assert_ne!(value["type"], "response");
-        let _ = self.send(value.clone());
-        publish(
+        let (_, execution) = self.send_observed(value.clone());
+        publish_with_execution(
             &self.0.runtime.events,
             &self.0.runtime.history,
             &self.0.runtime.state,
             &self.0.runtime.seq,
             value,
+            execution,
         )
         .await;
     }
 
     pub fn send(&self, value: Value) -> Result<usize, broadcast::error::SendError<Value>> {
+        self.send_observed(value).0
+    }
+
+    fn send_observed(
+        &self,
+        value: Value,
+    ) -> (
+        Result<usize, broadcast::error::SendError<Value>>,
+        Option<ExecutionProjection>,
+    ) {
         if self.0.runtime.route_external(&value).is_err()
             || self.0.runtime.route_file_io(&value).is_err()
         {
             self.0.runtime.fail_closed();
-            return Err(broadcast::error::SendError(value));
+            return (Err(broadcast::error::SendError(value)), None);
         }
-        self.0
+        let execution = self
+            .0
             .runtime
             .execution
             .lock()
@@ -1809,10 +1876,11 @@ impl TestEvents {
                 }
             }
         }
-        match self.0.runtime.raw_events.send(value) {
+        let result = match self.0.runtime.raw_events.send(value) {
             Err(_) if delivered => Ok(0),
             result => result,
-        }
+        };
+        (result, execution)
     }
 }
 
@@ -1823,7 +1891,18 @@ async fn publish(
     history: &Arc<Mutex<VecDeque<BufferedEvent>>>,
     state: &Arc<RwLock<HostState>>,
     seq: &AtomicU64,
+    value: Value,
+) {
+    publish_with_execution(events, history, state, seq, value, None).await;
+}
+
+async fn publish_with_execution(
+    events: &broadcast::Sender<BufferedEvent>,
+    history: &Arc<Mutex<VecDeque<BufferedEvent>>>,
+    state: &Arc<RwLock<HostState>>,
+    seq: &AtomicU64,
     mut value: Value,
+    execution: Option<ExecutionProjection>,
 ) {
     let next = seq.fetch_add(1, Ordering::SeqCst) + 1;
     {
@@ -1833,7 +1912,7 @@ async fn publish(
         state.last_seq = next;
         state.updated_at = now_ms();
         match kind {
-            "agent_start" | "operation_accepted" => {
+            "agent_start" | "operation_accepted" if execution.is_none() => {
                 state.status = "running".into();
                 state.resource_unsettled = true;
             }
@@ -1857,10 +1936,16 @@ async fn publish(
                     state.status = "running".into();
                 }
             }
-            "agent_settled" => {
-                state.status = "ready".into();
-                state.resource_unsettled = false;
-                state.pending_dialogs.clear();
+            "agent_settled" if execution.map_or(true, |p| p.settlement) => {
+                if execution.map_or(true, |p| !p.busy) {
+                    state.status = "ready".into();
+                    state.resource_unsettled = false;
+                    // Correlated hosts close dialogs explicitly. A command's
+                    // completion must not cancel an unrelated plugin question.
+                    if execution.is_none() {
+                        state.pending_dialogs.clear();
+                    }
+                }
                 state.latest_settlement = Some(value.clone());
                 state.last_error = value
                     .get("error")
@@ -1889,6 +1974,17 @@ async fn publish(
             }
             _ => {}
         }
+        if let Some(execution) = execution.filter(|_| kind != "host_closed") {
+            state.resource_unsettled = execution.busy;
+            state.status = if !state.pending_dialogs.is_empty() {
+                "awaiting_input"
+            } else if execution.busy {
+                "running"
+            } else {
+                "ready"
+            }
+            .into();
+        }
     }
     let buffered = BufferedEvent { seq: next, value };
     {
@@ -1909,6 +2005,7 @@ mod tests {
     include!("external_tools_host_tests.rs");
     include!("host_file_io_tests.rs");
     include!("host_retirement_tests.rs");
+    include!("host_execution_tests.rs");
 
     #[tokio::test]
     async fn child_binding_identity_uses_launch_metadata_not_a_ready_wire_field() {

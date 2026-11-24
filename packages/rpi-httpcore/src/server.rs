@@ -74,6 +74,15 @@ pub async fn serve_until(
         session_dir: config.session_dir.clone(),
         registry: config.registry.clone(),
     })?;
+    // Warm the cached native host version so the first `/api/v1/capabilities`
+    // request does not pay for the probe. It is best-effort: a host that cannot
+    // report a version just leaves the field out.
+    tokio::spawn({
+        let backend = backend.clone();
+        async move {
+            let _ = backend.host_version().await;
+        }
+    });
     let hosts = allowed_hosts(&config);
     let password = configured_password(&config);
     let security = Arc::new(Security::new(hosts.clone(), password.as_deref()));

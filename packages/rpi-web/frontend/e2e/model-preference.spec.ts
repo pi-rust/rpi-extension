@@ -387,6 +387,25 @@ test("remembered apply failure keeps a reachable session and actionable notice, 
   );
 });
 
+test("a new session's remembered-model failure can be dismissed", async ({
+  page,
+  host,
+}) => {
+  await start(page);
+  await choose(page);
+  host.failNext = true;
+  await newSession(page);
+  await ready(page, "new2");
+  const alert = page.getByRole("alert").filter({
+    hasText: "Could not apply remembered model chosen/special",
+  });
+  await expect(alert).toBeVisible();
+  await alert.getByRole("button", { name: "Dismiss" }).click();
+  await expect(alert).toHaveCount(0);
+  expect(host.states.new2.provider).toBe("native");
+  expect(await stored(page)).toHaveLength(1);
+});
+
 test("navigation during explicit choice remembers the originating project without stale runtime UI", async ({
   page,
   host,
