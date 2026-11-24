@@ -1263,13 +1263,19 @@ export default function App() {
   const displayedTimings = historical.active
     ? historicalRunTimings
     : runTimings;
+  // A missing or unsupported timing lookup is unknown, not zero work: the
+  // footer shows "—" exactly like cache hit and context, and only an actually
+  // recorded run can produce "0s".
   const sessionWorkMs = useMemo(
     () =>
-      displayedTimings.reduce(
-        (total, timing) =>
-          total + (Number.isFinite(timing.elapsedMs) ? timing.elapsedMs : 0),
-        0,
-      ),
+      displayedTimings.length
+        ? displayedTimings.reduce(
+            (total, timing) =>
+              total +
+              (Number.isFinite(timing.elapsedMs) ? timing.elapsedMs : 0),
+            0,
+          )
+        : null,
     [displayedTimings],
   );
   const runFooters = useMemo(
@@ -7054,10 +7060,14 @@ export default function App() {
                   <span
                     className="composer-metric"
                     title={t("sessionWorkTotal")}
-                    aria-label={`${t("sessionWork")}: ${formatRunDuration(sessionWorkMs)}`}
+                    aria-label={`${t("sessionWork")}: ${sessionWorkMs == null ? "—" : formatRunDuration(sessionWorkMs)}`}
                   >
                     <Timer size={12} aria-hidden="true" />
-                    <strong>{formatRunDuration(sessionWorkMs)}</strong>
+                    <strong>
+                      {sessionWorkMs == null
+                        ? "—"
+                        : formatRunDuration(sessionWorkMs)}
+                    </strong>
                   </span>
                   <button
                     type="button"

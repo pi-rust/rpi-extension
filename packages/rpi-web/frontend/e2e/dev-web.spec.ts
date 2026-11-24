@@ -10385,7 +10385,7 @@ test.describe("run timing regressions", () => {
     ).toBeVisible();
   });
 
-  test("composer footer shows zero total work when native timings are unavailable", async ({
+  test("composer footer shows unknown work when native timings are unavailable", async ({
     page,
   }) => {
     await mockHost(page);
@@ -10396,6 +10396,27 @@ test.describe("run timing regressions", () => {
     await page.goto("/");
     const metrics = page.locator(".composer-metrics.slim-metrics");
     await expect(metrics.getByLabel(/^Cache hit:/)).toBeVisible();
+    // Unknown is not zero: an unavailable lookup must not claim the agent did
+    // no work, so the metric reads exactly like the other unknown metrics.
+    await expect(
+      metrics.getByLabel("Session work: —", { exact: true }),
+    ).toContainText("—");
+  });
+
+  test("composer footer keeps a recorded zero-work session at zero", async ({
+    page,
+  }) => {
+    await mockHost(page);
+    await history(page, [finalMessage("zero-final", "Nothing to do")]);
+    await page.route(timingRoute, (route) =>
+      route.fulfill({
+        json: timingPage([
+          nativeTiming("zero-final", "zero-run", "completed", 0),
+        ]),
+      }),
+    );
+    await page.goto("/");
+    const metrics = page.locator(".composer-metrics.slim-metrics");
     await expect(
       metrics.getByLabel("Session work: 0s", { exact: true }),
     ).toContainText("0s");
