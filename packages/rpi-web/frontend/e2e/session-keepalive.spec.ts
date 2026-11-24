@@ -195,7 +195,12 @@ test("the selected session is touched well inside the advertised idle timeout", 
 test("a hidden tab does not claim to keep the host alive", async ({ page, host }) => {
   await page.goto("/");
   await expect(page.getByText("First session").first()).toBeVisible();
-  await page.clock.runFor(2_000);
+  // The probe interval is a third of the advertised timeout, so 2000ms is
+  // exactly one tick. Advance past it and wait for that request to land: the
+  // route handler records reads in Node, so a probe still in flight here would
+  // be counted as a read issued while hidden and fail this test spuriously.
+  await page.clock.runFor(2_100);
+  await expect.poll(() => host.sessionReads.length).toBeGreaterThan(0);
   const hidden = await page.evaluate(() => {
     Object.defineProperty(document, "hidden", { value: true, configurable: true });
     return document.hidden;
