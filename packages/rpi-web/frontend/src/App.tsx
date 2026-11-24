@@ -942,6 +942,47 @@ export default function App() {
     },
     [],
   );
+  // Mobile browsers keep `innerHeight`/`dvh` fixed while a soft keyboard is
+  // open; `VisualViewport.height` is the only reliable live size. Record the
+  // shrink so the slash palette can shrink with it instead of extending under
+  // (and being painted over by) the top toolbar.
+  const [softKeyboardOpen, setSoftKeyboardOpen] = useState(false);
+  useEffect(() => {
+    const viewport = window.visualViewport;
+    if (!viewport) return;
+    const measure = () => {
+      const layoutHeight =
+        window.innerHeight || document.documentElement.clientHeight;
+      const open = layoutHeight - viewport.height > 120;
+      const root = document.querySelector<HTMLElement>(".workspace");
+      if (open && root) {
+        // The palette ends just above the composer. Bound it by the space
+        // actually visible between that composer and the lower of the layout
+        // toolbar and the visual viewport's scrolled top edge.
+        const composer = root.querySelector<HTMLElement>(".composer");
+        const toolbar = root.querySelector<HTMLElement>(".toolbar");
+        const visibleTop = Math.max(
+          toolbar?.getBoundingClientRect().bottom ?? 0,
+          viewport.offsetTop,
+        );
+        const available = composer
+          ? Math.floor(composer.getBoundingClientRect().top - visibleTop - 8)
+          : 340;
+        root.style.setProperty(
+          "--slash-keyboard-max-height",
+          `${Math.max(96, Math.min(340, available))}px`,
+        );
+      }
+      setSoftKeyboardOpen(open);
+    };
+    measure();
+    viewport.addEventListener("resize", measure);
+    viewport.addEventListener("scroll", measure);
+    return () => {
+      viewport.removeEventListener("resize", measure);
+      viewport.removeEventListener("scroll", measure);
+    };
+  }, []);
   const draftBySession = useRef(loadDrafts());
   const transcriptRef = useRef<HTMLDivElement>(null);
   const followingRef = useRef(true);
@@ -1385,6 +1426,20 @@ export default function App() {
   const [thinkingPreferenceFailures, setThinkingPreferenceFailures] = useState<
     Record<string, string>
   >({});
+  // Runtime failures are notifications, not modal state: the user must be able
+  // to acknowledge a preference that cannot be applied to a freshly-created
+  // session and keep chatting with the native default.
+  const dismissRuntimeFailure = (
+    clear: React.Dispatch<React.SetStateAction<Record<string, string>>>,
+    session: string,
+  ) => {
+    clear((previous) => {
+      if (!(session in previous)) return previous;
+      const next = { ...previous };
+      delete next[session];
+      return next;
+    });
+  };
   // Capture the origin before I/O; successful old-session writes belong to its
   // project even if navigation happens while the command is in flight.
   const onModelSelected: ModelSelected = (model) => {
@@ -4755,8 +4810,7 @@ export default function App() {
     setFollowing(true);
     setSessionId(id);
     setPanel(false);
-    if (!options.keepSidebarOpen && window.innerWidth < 768)
-      setSidebar(false);
+    if (!options.keepSidebarOpen && window.innerWidth < 768) setSidebar(false);
     const url = new URL(location.href);
     if (id) url.searchParams.set("session", id);
     else url.searchParams.delete("session");
@@ -4823,9 +4877,13 @@ export default function App() {
             );
             // Archiving from the sidebar should leave the menu open so
             // repeated session management does not need a reopen each time.
-            select(next?.sessionId ?? "", next?.projectId ?? session.projectId, {
-              keepSidebarOpen: true,
-            });
+            select(
+              next?.sessionId ?? "",
+              next?.projectId ?? session.projectId,
+              {
+                keepSidebarOpen: true,
+              },
+            );
           }
         } catch (cause) {
           if (
@@ -6175,6 +6233,15 @@ export default function App() {
             >
               {language === "zh" ? "运行时设置" : "Runtime settings"}
             </button>
+            <button
+              className="icon-button"
+              aria-label={t("dismiss")}
+              onClick={() =>
+                dismissRuntimeFailure(setThinkingPreferenceFailures, sessionId)
+              }
+            >
+              <X size={14} />
+            </button>
           </div>
         )}
         {modelPreferenceFailures[sessionId] && (
@@ -6193,6 +6260,15 @@ export default function App() {
               }}
             >
               {language === "zh" ? "运行时设置" : "Runtime settings"}
+            </button>
+            <button
+              className="icon-button"
+              aria-label={t("dismiss")}
+              onClick={() =>
+                dismissRuntimeFailure(setModelPreferenceFailures, sessionId)
+              }
+            >
+              <X size={14} />
             </button>
           </div>
         )}
@@ -6457,7 +6533,9 @@ export default function App() {
                                   language={language}
                                   onSpeak={speakMessage}
                                   readingRowId={readingRowId}
-                                  onFork={(entryId) => void forkCurrent(entryId)}
+                                  onFork={(entryId) =>
+                                    void forkCurrent(entryId)
+                                  }
                                   forkPending={forkPending}
                                   assistantStreamRevision={
                                     assistantStreamRevision
@@ -6566,7 +6644,10 @@ export default function App() {
               </button>
             )}
 
-            <form className="composer-area" onSubmit={submit}>
+            <form
+              className={`composer-area${softKeyboardOpen ? " soft-keyboard-open" : ""}`}
+              onSubmit={submit}
+            >
               {slashMatches.length > 0 && (
                 <div className="slash-menu">
                   {slashMatches.map((command) => (

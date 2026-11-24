@@ -202,3 +202,57 @@ for (const [width, height] of [
     expect(box.right).toBeLessThanOrEqual(1);
   });
 }
+
+test("slash menu shrinks above the composer while a soft keyboard is open", async ({
+  page,
+}) => {
+  await page.setViewportSize({ width: 393, height: 851 });
+  await mockHost(page);
+  await page.goto(`/?session=${sessionId}`);
+  const input = page.locator(".composer textarea");
+  await expect(input).toBeVisible();
+  await input.fill("/");
+  const menu = page.locator(".slash-menu");
+  await expect(menu).toBeVisible();
+
+  // Chromium has no soft keyboard: simulate the VisualViewport shrink that
+  // HarmonyOS/Android report when the IME opens.
+  await page.evaluate(() => {
+    // The browser scrolls the visual viewport down so the focused composer
+    // remains above the keyboard; `offsetTop` reflects that shift.
+    Object.defineProperty(window.visualViewport!, "height", {
+      configurable: true,
+      get: () => 430,
+    });
+    Object.defineProperty(window.visualViewport!, "offsetTop", {
+      configurable: true,
+      get: () => 401,
+    });
+    window.visualViewport!.dispatchEvent(new Event("resize"));
+  });
+  await expect(page.locator(".composer-area.soft-keyboard-open")).toBeVisible();
+  const geometry = await page.evaluate(() => {
+    const menuRect = document
+      .querySelector(".slash-menu")!
+      .getBoundingClientRect();
+    const visualTop = window.visualViewport!.offsetTop;
+    const composerRect = document
+      .querySelector(".composer")!
+      .getBoundingClientRect();
+    const toolbarRect = document
+      .querySelector(".toolbar")!
+      .getBoundingClientRect();
+    return {
+      top: menuRect.top,
+      bottom: menuRect.bottom,
+      visualTop,
+      toolbarBottom: toolbarRect.bottom,
+      composerTop: composerRect.top,
+      height: menuRect.height,
+      composerTopGap: composerRect.top - menuRect.bottom,
+    };
+  });
+  expect(geometry.top).toBeGreaterThanOrEqual(geometry.visualTop - 12);
+  expect(geometry.height).toBeLessThan(340);
+  expect(geometry.composerTopGap).toBeGreaterThanOrEqual(0);
+});
