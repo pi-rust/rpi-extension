@@ -18868,3 +18868,84 @@ test("mobile composer keeps Enter and Shift+Enter as newlines", async ({
   await expect(input).toHaveValue("");
   await context.close();
 });
+
+test("startup auto-archives stale sessions by last completed turn", async ({
+  page,
+}) => {
+  const now = Date.now();
+  const sessions = [
+    {
+      ...session,
+      sessionId: "stale-chat",
+      title: "Stale chat",
+      lastTurnEndedAt: now - 20 * 86_400_000,
+    },
+    {
+      ...session,
+      sessionId: "recent-chat",
+      title: "Recent chat",
+      lastTurnEndedAt: now - 2 * 86_400_000,
+    },
+  ];
+  const archived: string[] = [];
+  await page.addInitScript(() => {
+    localStorage.setItem("rpi-web-language", "en");
+    localStorage.setItem(
+      "rpi-session-auto-archive",
+      JSON.stringify({ enabled: true, days: 15 }),
+    );
+  });
+  await mockHost(page, { additionalSessions: 0 });
+  await page.route("**/api/v1/sessions", async (route: Route) => {
+    if (route.request().method() === "GET")
+      return route.fulfill({ json: { sessions } });
+    return route.fallback();
+  });
+  await page.route(/\/sessions\/[^/]+\/metadata$/, async (route: Route) => {
+    const id = new URL(route.request().url()).pathname.split("/")[4];
+    archived.push(id);
+    return route.fallback();
+  });
+  await page.goto("/?session=recent-chat");
+  await expect.poll(() => archived).toEqual(["stale-chat"]);
+  await expect(page.locator(".toolbar .breadcrumb h1")).toHaveText(
+    "Recent chat",
+  );
+});
+
+test("settings replace shortcut hints with session auto-archive controls", async ({
+  page,
+}) => {
+  await page.addInitScript(() => {
+    localStorage.setItem("rpi-web-language", "zh");
+  });
+  await mockHost(page);
+  await page.goto("/");
+  await expect(
+    page.getByRole("button", { name: "新建会话", exact: false }).first(),
+  ).toBeVisible();
+  await page.keyboard.press("Control+,");
+  const settings = page.getByRole("dialog");
+  await expect(settings).toBeVisible();
+  await expect(
+    settings.getByText("自动会话归档", { exact: true }),
+  ).toBeVisible();
+  const enabled = settings.getByLabel("开启", { exact: true });
+  await expect(enabled).toBeChecked();
+  const days = settings.getByLabel("未发生交互天数", { exact: true });
+  await expect(days).toHaveValue("15");
+  await expect(days).toHaveAttribute("min", "1");
+  await expect(days).toHaveAttribute("max", "90");
+  await expect(settings.getByText("Ctrl / ⌘ N")).toHaveCount(0);
+  await days.fill("120");
+  await days.blur();
+  await expect(days).toHaveValue("90");
+  await days.fill("0");
+  await days.blur();
+  await expect(days).toHaveValue("1");
+  await expect(
+    page.evaluate(() =>
+      JSON.parse(localStorage.getItem("rpi-session-auto-archive") ?? "null"),
+    ),
+  ).resolves.toEqual({ enabled: true, days: 1 });
+});

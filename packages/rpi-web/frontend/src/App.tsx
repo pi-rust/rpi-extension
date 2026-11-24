@@ -73,6 +73,15 @@ import {
   writeSessionRuntimePreference,
   type SessionRuntimeChoice,
 } from "./sessionRuntimePreference";
+import {
+  MAX_SESSION_AUTO_ARCHIVE_DAYS,
+  MIN_SESSION_AUTO_ARCHIVE_DAYS,
+  normalizeSessionAutoArchiveDays,
+  readSessionAutoArchivePreference,
+  staleSessionIds,
+  writeSessionAutoArchivePreference,
+  type SessionAutoArchivePreference,
+} from "./sessionAutoArchive";
 import { ResourcePanel } from "./ResourcePanel";
 import { useTheme } from "./useTheme";
 import { useHistoricalMessages } from "./useHistoricalMessages";
@@ -816,6 +825,9 @@ export default function App() {
   const [deletePending, setDeletePending] = useState(false);
   const deleteInFlight = useRef(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
+  const [autoArchive, setAutoArchive] = useState<SessionAutoArchivePreference>(
+    readSessionAutoArchivePreference,
+  );
   /** Preview restored from `?file=…`; the dialog itself keeps the URL current. */
   const [linkedPreview, setLinkedPreview] = useState<ProjectFileLink | null>(
     null,
@@ -2707,6 +2719,9 @@ export default function App() {
     }
   }, [toolNameMode]);
   useEffect(() => {
+    writeSessionAutoArchivePreference(autoArchive);
+  }, [autoArchive]);
+  useEffect(() => {
     const keydown = (event: KeyboardEvent) => {
       if (
         !authChecked ||
@@ -2843,7 +2858,38 @@ export default function App() {
           (session) => session.sessionId === requested,
         );
         const blockedRequest = sessionSelectionError(requestedSession);
-        const reusable = list.filter(
+        let activeList = list;
+        if (autoArchive.enabled) {
+          // Decide before selecting the restored chat: an explicit `?session=`
+          // link and the current in-tab session must survive the sweep.
+          const protectedIds = [requested, activeSessionRef.current].filter(
+            (id): id is string => Boolean(id),
+          );
+          const stale = staleSessionIds(list, {
+            days: autoArchive.days,
+            now: Date.now(),
+            protectedIds,
+          });
+          if (stale.length) {
+            const results = await Promise.allSettled(
+              stale.map((id) => api.sessionMetadata(id, { archived: true })),
+            );
+            const archivedIds = new Set(
+              stale.filter((_, index) => results[index].status === "fulfilled"),
+            );
+            if (archivedIds.size) {
+              activeList = list.map((session) =>
+                archivedIds.has(session.sessionId)
+                  ? { ...session, archived: true }
+                  : session,
+              );
+              const refreshed = await refreshSessions();
+              if (cancelled || !refreshed) return;
+              activeList = refreshed;
+            }
+          }
+        }
+        const reusable = activeList.filter(
           (session) =>
             session.status !== "closed" &&
             !session.archived &&
@@ -2854,9 +2900,12 @@ export default function App() {
                   project.id === session.projectId && !project.archived,
               )),
         );
+        const activeRequestedSession = activeList.find(
+          (session) => session.sessionId === requested,
+        );
         const empty = reusable.find((session) => !hasUserTurn(session));
         const match =
-          (blockedRequest ? undefined : requestedSession) ??
+          (blockedRequest ? undefined : activeRequestedSession) ??
           reusable.find(
             (session) => session.sessionId === activeSessionRef.current,
           ) ??
@@ -2867,7 +2916,9 @@ export default function App() {
           blockedRequest ??
           (!match && !empty
             ? sessionSelectionError(
-                list.find((session) => session.archived || session.deleting),
+                activeList.find(
+                  (session) => session.archived || session.deleting,
+                ),
               )
             : null);
         const selectionChanges =
@@ -2904,6 +2955,8 @@ export default function App() {
     authChecked,
     authRequired,
     authenticated,
+    autoArchive.days,
+    autoArchive.enabled,
     createSession,
     refreshSessions,
   ]);
@@ -5759,15 +5812,63 @@ export default function App() {
                 {t("mappedToolNames")}
               </button>
             </div>
-            <div className="shortcut-list">
-              <span>{t("newSession")}</span>
-              <kbd>Ctrl / ⌘ N</kbd>
-              <span>{language === "zh" ? "搜索会话" : "Search chats"}</span>
-              <kbd>Ctrl / ⌘ K</kbd>
-              <span>{t("messageSearch")}</span>
-              <kbd>Ctrl / ⌘ F</kbd>
-              <span>{t("closeSidebar")}</span>
-              <kbd>Ctrl / ⌘ B</kbd>
+            <div className="auto-archive-settings">
+              <label htmlFor="settings-auto-archive-days">
+                {language === "zh" ? "自动会话归档" : "Auto-archive sessions"}
+              </label>
+              <label
+                className="settings-toggle"
+                htmlFor="settings-auto-archive-enabled"
+              >
+                <input
+                  id="settings-auto-archive-enabled"
+                  type="checkbox"
+                  checked={autoArchive.enabled}
+                  onChange={(event) =>
+                    setAutoArchive((previous) => ({
+                      ...previous,
+                      enabled: event.target.checked,
+                    }))
+                  }
+                />
+                {language === "zh" ? "开启" : "Enabled"}
+              </label>
+              <label
+                className="settings-number-label"
+                htmlFor="settings-auto-archive-days"
+              >
+                {language === "zh"
+                  ? "未发生交互天数"
+                  : "Days without interaction"}
+              </label>
+              <input
+                id="settings-auto-archive-days"
+                className="settings-number"
+                type="number"
+                min={MIN_SESSION_AUTO_ARCHIVE_DAYS}
+                max={MAX_SESSION_AUTO_ARCHIVE_DAYS}
+                step={1}
+                value={autoArchive.days}
+                disabled={!autoArchive.enabled}
+                onChange={(event) =>
+                  setAutoArchive((previous) => ({
+                    ...previous,
+                    days: Number(event.target.value),
+                  }))
+                }
+                onBlur={(event) => {
+                  const days = normalizeSessionAutoArchiveDays(
+                    event.target.value,
+                  );
+                  event.target.value = String(days);
+                  setAutoArchive((previous) => ({ ...previous, days }));
+                }}
+              />
+              <p className="form-hint">
+                {language === "zh"
+                  ? `从会话最后一轮回复完成时间起，${MIN_SESSION_AUTO_ARCHIVE_DAYS}-${MAX_SESSION_AUTO_ARCHIVE_DAYS} 日内未发生任何交互，则在下一次打开页面时归档。`
+                  : `Sessions with no interaction for ${MIN_SESSION_AUTO_ARCHIVE_DAYS}-${MAX_SESSION_AUTO_ARCHIVE_DAYS} days after their last completed turn are archived the next time this page opens.`}
+              </p>
             </div>
             <button
               type="button"
