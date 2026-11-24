@@ -73,7 +73,11 @@ class PrebuiltAssetsTests(unittest.TestCase):
         self.assertEqual(by_name["rpi-web"], assets.WEB_TARGETS)
         for package in metadata["packages"]:
             if package["id"] in metadata["workspace_members"] and any("cdylib" in target["crate_types"] for target in package["targets"]):
-                if package["name"] != "rpi-voice":
+                if package.get("publish") == []:
+                    # Source-only experimental DLLs must opt out of every
+                    # automatic prebuilt target, not invent musl support.
+                    self.assertEqual(by_name[package["name"]], set(), package["name"])
+                elif package["name"] != "rpi-voice":
                     self.assertIn("x86_64-unknown-linux-musl", by_name[package["name"]], package["name"])
 
     def test_crate_metadata_controls_musl_support(self):
