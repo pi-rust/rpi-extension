@@ -245,3 +245,41 @@ test("runtime settings saves a default model and thinking level as one pair", as
     )?.body,
   ).toMatchObject({ level: "high" });
 });
+
+test("a started default choice survives model and thinking changes", async ({
+  page,
+  host,
+}) => {
+  await page.goto("/?session=old");
+  await expect(page.locator(".toolbar .breadcrumb h1")).toHaveText(
+    "Session old",
+  );
+  await openRuntimePanel(page);
+  // Pick a default pair but do not save it yet.
+  await chooseMenuOption(page, "Default model", {
+    label: "Chosen model (chosen)",
+  });
+  await chooseMenuOption(page, "Default thinking level", { label: "high" });
+
+  // Changing the live model/thinking re-fetches the catalog. The panel must
+  // keep the unsaved default pair instead of resetting it to the saved one.
+  await chooseMenuOption(page, "Model", { label: "Native default (native)" });
+  await expect(
+    page.getByRole("button", { name: "Default model", exact: true }),
+  ).toContainText("Chosen model (chosen)");
+  await chooseMenuOption(page, "Thinking level", { label: "off" });
+  await expect(
+    page.getByRole("button", { name: "Default thinking level", exact: true }),
+  ).toContainText("high");
+
+  // Saving still writes the pair the user chose, not the live runtime.
+  await page
+    .getByRole("button", {
+      name: "Save default model and thinking level",
+      exact: true,
+    })
+    .click();
+  expect(await stored(page)).toEqual([
+    { provider: "chosen", modelId: "special", thinkingLevel: "high" },
+  ]);
+});

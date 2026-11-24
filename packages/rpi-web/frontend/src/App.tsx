@@ -8379,6 +8379,9 @@ function RuntimePanel({
   const [levels, setLevels] = useState<string[]>([]);
   const [defaultModelId, setDefaultModelId] = useState("");
   const [defaultThinkingLevel, setDefaultThinkingLevel] = useState("");
+  // The pickers seed from the saved pair, but a choice the user has started
+  // must survive catalog refreshes (runtime model changes, thinking changes).
+  const defaultTouched = useRef(false);
   const context = runtime?.context ?? null;
   const [catalog, setCatalog] = useState<ToolCatalog | null>(null);
   const [providersOpen, setProvidersOpen] = useState(false);
@@ -8395,6 +8398,7 @@ function RuntimePanel({
     setLevels([]);
     setDefaultModelId("");
     setDefaultThinkingLevel("");
+    defaultTouched.current = false;
     setCatalog(null);
     return () => {
       mounted.current = false;
@@ -8412,31 +8416,13 @@ function RuntimePanel({
         if (supported.has("get_available_models"))
           jobs.push(
             api.models(sessionId).then((data) => {
-              if (!cancelled) {
-                const available = data.models ?? [];
-                setModels(available);
-                const remembered = available.find(
-                  (entry) =>
-                    entry.id === preference?.modelId &&
-                    entry.provider === preference?.provider,
-                );
-                setDefaultModelId(remembered ? modelKey(remembered) : "");
-              }
+              if (!cancelled) setModels(data.models ?? []);
             }),
           );
         if (supported.has("get_available_thinking_levels"))
           jobs.push(
             api.thinkingLevels(sessionId).then((data) => {
-              if (!cancelled) {
-                const available = data.levels ?? [];
-                setLevels(available);
-                setDefaultThinkingLevel(
-                  preference?.thinkingLevel &&
-                    available.includes(preference.thinkingLevel)
-                    ? preference.thinkingLevel
-                    : "",
-                );
-              }
+              if (!cancelled) setLevels(data.levels ?? []);
             }),
           );
         if (supported.has("get_available_tools"))
@@ -8453,12 +8439,27 @@ function RuntimePanel({
     return () => {
       cancelled = true;
     };
+  }, [onError, sessionId, supported, runtime?.modelId, runtime?.provider]);
+
+  // Seed the default pair from what this browser remembers, once per session
+  // and after an explicit save. A catalog refresh must not overwrite a choice
+  // the user has already made but not yet saved.
+  useEffect(() => {
+    if (defaultTouched.current) return;
+    const remembered = models.find(
+      (entry) =>
+        entry.id === preference?.modelId &&
+        entry.provider === preference?.provider,
+    );
+    setDefaultModelId(remembered ? modelKey(remembered) : "");
+    setDefaultThinkingLevel(
+      preference?.thinkingLevel && levels.includes(preference.thinkingLevel)
+        ? preference.thinkingLevel
+        : "",
+    );
   }, [
-    onError,
-    sessionId,
-    supported,
-    runtime?.modelId,
-    runtime?.provider,
+    models,
+    levels,
     preference?.provider,
     preference?.modelId,
     preference?.thinkingLevel,
@@ -8568,7 +8569,10 @@ function RuntimePanel({
         disabled={
           !supported.has("set_model") || pending !== "" || models.length === 0
         }
-        onChange={setDefaultModelId}
+        onChange={(value) => {
+          defaultTouched.current = true;
+          setDefaultModelId(value);
+        }}
         options={[
           { value: "", label: "—" },
           ...models.map((entry) => ({
@@ -8588,7 +8592,10 @@ function RuntimePanel({
           pending !== "" ||
           levels.length === 0
         }
-        onChange={setDefaultThinkingLevel}
+        onChange={(value) => {
+          defaultTouched.current = true;
+          setDefaultThinkingLevel(value);
+        }}
         options={[
           { value: "", label: "—" },
           ...levels.map((entry) => ({
@@ -8603,6 +8610,9 @@ function RuntimePanel({
         onClick={() => {
           if (!defaultModel || !defaultThinkingLevel) return;
           onSaveDefault(defaultModel, defaultThinkingLevel);
+          // The saved pair is now the source of truth again, so a later
+          // catalog refresh may re-seed the pickers from it.
+          defaultTouched.current = false;
         }}
       >
         {zh
