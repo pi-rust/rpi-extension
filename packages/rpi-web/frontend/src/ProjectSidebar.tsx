@@ -9,14 +9,16 @@ import {
   Archive,
   ArchiveRestore,
   Check,
+  CheckSquare,
   ChevronDown,
   ChevronRight,
+  Copy,
   Folder,
   FolderOpen,
   FolderPlus,
   GitBranch,
-  GitFork,
   Loader2,
+  LoaderCircle,
   MoreHorizontal,
   Clock3,
   Pin,
@@ -927,6 +929,7 @@ interface SidebarProps {
   creating: boolean;
   canManage: boolean;
   canFork: boolean;
+  canClone: boolean;
   canCreate: boolean;
   onSelectProject: (project: Project) => void;
   onSelectSession: (session: SessionSummary) => void;
@@ -934,6 +937,12 @@ interface SidebarProps {
   onNewProject: () => void;
   onRename: (session: SessionSummary) => void;
   onFork: (session: SessionSummary) => void;
+  onClone: (session: SessionSummary) => void;
+  onBulkMetadata: (
+    sessions: SessionSummary[],
+    patch: { pinned?: boolean; archived?: boolean },
+  ) => Promise<void>;
+  onBulkDelete: (sessions: SessionSummary[]) => Promise<void>;
   onRenameProject: (project: Project) => void;
   onProjectMetadata: (project: Project, archived: boolean) => Promise<void>;
   onEditTags: (session: SessionSummary) => void;
@@ -954,6 +963,7 @@ export function ProjectSidebar({
   creating,
   canManage,
   canFork,
+  canClone,
   canCreate,
   onSelectProject,
   onSelectSession,
@@ -961,6 +971,9 @@ export function ProjectSidebar({
   onNewProject,
   onRename,
   onFork,
+  onClone,
+  onBulkMetadata,
+  onBulkDelete,
   onRenameProject,
   onProjectMetadata,
   onEditTags,
@@ -968,7 +981,7 @@ export function ProjectSidebar({
   onMetadata,
 }: SidebarProps) {
   const zh = language === "zh";
-  const [archived, setArchived] = useState(false);
+  const [archived, setArchivedView] = useState(false);
   const [collapsed, setCollapsed] = useState<Set<string>>(() => {
     try {
       return new Set(
@@ -982,6 +995,9 @@ export function ProjectSidebar({
   });
   const [menu, setMenu] = useState("");
   const [pending, setPending] = useState("");
+  const [selectMode, setSelectMode] = useState(false);
+  const [selected, setSelected] = useState<Set<string>>(() => new Set());
+  const [bulkPending, setBulkPending] = useState(false);
   const [searchOpen, setSearchOpen] = useState(false);
   // The inline recent list is a shortcut; collapsing it gives the project tree
   // its height back without losing cross-project recency.
@@ -1054,6 +1070,45 @@ export function ProjectSidebar({
       setPending("");
     }
   }
+  const selectableSessions = sessions.filter(
+    (session) => !session.archived && !session.deleting,
+  );
+  const selectedSessions = selectableSessions.filter((session) =>
+    selected.has(session.sessionId),
+  );
+  function toggleSelected(id: string) {
+    setSelected((current) => {
+      const next = new Set(current);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+  }
+  function exitSelectMode() {
+    setSelectMode(false);
+    setSelected(new Set());
+  }
+  async function bulkMetadata(patch: { pinned?: boolean; archived?: boolean }) {
+    if (bulkPending || !selectedSessions.length) return;
+    setBulkPending(true);
+    try {
+      await onBulkMetadata(selectedSessions, patch);
+      if (patch.archived && !archived) setArchivedView(true);
+      exitSelectMode();
+    } finally {
+      setBulkPending(false);
+    }
+  }
+  async function bulkDelete() {
+    if (bulkPending || !selectedSessions.length) return;
+    setBulkPending(true);
+    try {
+      await onBulkDelete(selectedSessions);
+      exitSelectMode();
+    } finally {
+      setBulkPending(false);
+    }
+  }
   async function projectMetadata(project: Project, archived: boolean) {
     if (pending) return;
     setPending(`project:${project.id}`);
@@ -1074,16 +1129,18 @@ export function ProjectSidebar({
       session.relation === "clone" ? "clone" : session.relation ? "fork" : null;
     const awaitingAnswer = session.status === "awaiting_input";
     const running = ["running", "starting"].includes(session.status);
+    const selectable = !recent && !session.archived && !session.deleting;
+    const isSelected = selected.has(session.sessionId);
     return (
       <div
         className={
           recent
             ? "recent-session-row"
-            : `project-session${session.sessionId === sessionId ? " active" : ""}`
+            : `project-session${session.sessionId === sessionId ? " active" : ""}${selectMode && isSelected ? " selected" : ""}`
         }
         key={session.sessionId}
         onContextMenu={(event) => {
-          if (recent || (!canManage && !canFork)) return;
+          if (recent || (!canManage && !canFork && !canClone)) return;
           event.preventDefault();
           setMenuPosition({
             top: Math.min(event.clientY, window.innerHeight - 150),
@@ -1092,9 +1149,26 @@ export function ProjectSidebar({
           setMenu(session.sessionId);
         }}
       >
+        {selectMode && selectable && (
+          <button
+            type="button"
+            className="session-select-checkbox"
+            role="checkbox"
+            aria-checked={isSelected}
+            aria-label={`${zh ? "选择会话" : "Select session"}: ${title}`}
+            title={`${zh ? "选择会话" : "Select session"}: ${title}`}
+            onClick={() => toggleSelected(session.sessionId)}
+          >
+            {isSelected && <Check size={12} />}
+          </button>
+        )}
         <button
           className={recent ? "recent-session-link" : "project-session-link"}
-          onClick={() => onSelectSession(session)}
+          onClick={() =>
+            selectMode && selectable
+              ? toggleSelected(session.sessionId)
+              : onSelectSession(session)
+          }
           title={title}
           aria-current={
             !recent && session.sessionId === sessionId ? "page" : undefined
@@ -1133,9 +1207,9 @@ export function ProjectSidebar({
               aria-hidden="true"
             >
               {relationKind === "clone" ? (
-                <GitBranch size={12} />
+                <Copy size={12} />
               ) : (
-                <GitFork size={12} />
+                <GitBranch size={12} />
               )}
             </span>
           )}
@@ -1187,7 +1261,7 @@ export function ProjectSidebar({
             )}
           </time>
         </button>
-        {!recent && (canManage || canFork) && (
+        {!recent && (canManage || canFork || canClone) && !selectMode && (
           <div className="session-menu">
             <button
               className="icon-button session-menu-trigger"
@@ -1225,12 +1299,50 @@ export function ProjectSidebar({
                         onFork(session);
                       }}
                     >
-                      <GitFork size={14} />
+                      <GitBranch size={14} />
                       {translate(language, "fork")}
                     </button>
                   )}
+                  {canClone && (
+                    <button
+                      role="menuitem"
+                      onClick={() => {
+                        setMenu("");
+                        onClone(session);
+                      }}
+                    >
+                      <Copy size={14} />
+                      {translate(language, "clone")}
+                    </button>
+                  )}
+                  {(canClone || canManage) && (
+                    <>
+                      <button
+                        role="menuitem"
+                        onClick={() => {
+                          setMenu("");
+                          setSelectMode(true);
+                          setSelected(new Set([session.sessionId]));
+                        }}
+                      >
+                        <CheckSquare size={14} />
+                        {translate(language, "multiSelect")}
+                      </button>
+                    </>
+                  )}
                   {canManage && (
                     <>
+                      <button
+                        role="menuitem"
+                        onClick={() => {
+                          setMenu("");
+                          setSelectMode(true);
+                          setSelected(new Set([session.sessionId]));
+                        }}
+                      >
+                        <CheckSquare size={14} />
+                        {translate(language, "multiSelect")}
+                      </button>
                       <button
                         role="menuitem"
                         onClick={() => {
@@ -1335,7 +1447,7 @@ export function ProjectSidebar({
     onSelectSession(session);
     // A hit may live in the archived set or a collapsed project; open both so
     // the row is actually visible after the jump.
-    setArchived(Boolean(session.archived));
+    setArchivedView(Boolean(session.archived));
     if (session.projectId) {
       setCollapsed((current) => {
         const next = new Set(current);
@@ -1345,7 +1457,36 @@ export function ProjectSidebar({
     }
   }
   return (
-    <div className="project-navigation">
+    <div className={`project-navigation${selectMode ? " selecting" : ""}`}>
+      {selectMode && (
+        <div className="session-selection-bar" role="toolbar">
+          <span>
+            {translate(language, "selectedCount", {
+              count: selectedSessions.length,
+            })}
+          </span>
+          <button
+            type="button"
+            onClick={() =>
+              setSelected(
+                selectedSessions.length === selectableSessions.length
+                  ? new Set()
+                  : new Set(
+                      selectableSessions.map((session) => session.sessionId),
+                    ),
+              )
+            }
+          >
+            {selectedSessions.length === selectableSessions.length &&
+            selectableSessions.length > 0
+              ? translate(language, "clearSelection")
+              : translate(language, "selectAll")}
+          </button>
+          <button type="button" onClick={exitSelectMode}>
+            {translate(language, "cancel")}
+          </button>
+        </div>
+      )}
       <div className="sidebar-primary-actions">
         <button
           className="sidebar-new-chat"
@@ -1412,7 +1553,7 @@ export function ProjectSidebar({
                   // Last settled turn first; a session with no settled turn
                   // yet competes by its latest activity so a brand-new chat
                   // sits on top instead of below every tracked one.
-                  const key = (session: (typeof b) | (typeof a)) =>
+                  const key = (session: typeof b | typeof a) =>
                     session.lastTurnEndedAt ?? session.updatedAt;
                   return key(b) - key(a);
                 })
@@ -1452,7 +1593,7 @@ export function ProjectSidebar({
                   ? "Archived projects and chats"
                   : "Show archived projects and chats"
             }
-            onClick={() => setArchived(!archived)}
+            onClick={() => setArchivedView(!archived)}
           >
             <Archive size={14} />
           </button>
@@ -1596,7 +1737,7 @@ export function ProjectSidebar({
                   className="icon-button project-new-session"
                   aria-label={`${zh ? "项目内新建会话" : "New session in"}: ${project.name}`}
                   onClick={() => {
-                    setArchived(false);
+                    setArchivedView(false);
                     setCollapsed((current) => {
                       const next = new Set(current);
                       next.delete(project.id);
@@ -1638,6 +1779,39 @@ export function ProjectSidebar({
           );
         })}
       </nav>
+      {selectMode && (
+        <div className="session-bulk-actions" role="toolbar">
+          <button
+            type="button"
+            disabled={bulkPending || !selectedSessions.length}
+            onClick={() => void bulkMetadata({ pinned: true })}
+          >
+            <Pin size={14} />
+            <span>{translate(language, "pin")}</span>
+          </button>
+          <button
+            type="button"
+            disabled={bulkPending || !selectedSessions.length}
+            onClick={() => void bulkMetadata({ archived: true })}
+          >
+            <Archive size={14} />
+            <span>{translate(language, "archive")}</span>
+          </button>
+          <button
+            type="button"
+            className="danger"
+            disabled={bulkPending || !selectedSessions.length}
+            onClick={() => void bulkDelete()}
+          >
+            {bulkPending ? (
+              <LoaderCircle size={14} className="spin" />
+            ) : (
+              <X size={14} />
+            )}
+            <span>{translate(language, "deletePermanently")}</span>
+          </button>
+        </div>
+      )}
       {searchOpen && (
         <SessionSearch
           language={language}

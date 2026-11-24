@@ -1225,6 +1225,105 @@ test("fork is available from a session context menu", async ({ page }) => {
   await expect.poll(() => forkBody).toEqual({ title: "Design fork" });
 });
 
+test("session menu uses clone wording and icon for the clone action", async ({
+  page,
+}) => {
+  await mockHost(page);
+  let cloneBody: { title?: string } | undefined;
+  await page.route("**/api/v1/sessions/session-1/clone", async (route) => {
+    cloneBody = route.request().postDataJSON();
+    return route.fulfill({
+      status: 201,
+      json: {
+        sessionId: "clone-session",
+        sourceSessionId: sessionId,
+        status: "ready",
+      },
+    });
+  });
+  await page.goto("/");
+  await clickRowAction(page, "Session actions: Mock session");
+  await expect(
+    page.getByRole("menuitem", { name: "Fork", exact: true }),
+  ).toBeVisible();
+  const clone = page.getByRole("menuitem", { name: "Clone", exact: true });
+  await expect(clone).toBeVisible();
+  await expect(clone.locator("svg.lucide-copy")).toHaveCount(1);
+  await clone.click();
+  const dialog = page.getByRole("dialog", {
+    name: "Name the cloned session",
+    exact: true,
+  });
+  await dialog.getByRole("textbox").fill("Design clone");
+  await dialog.getByRole("button", { name: "Submit", exact: true }).click();
+  await expect.poll(() => cloneBody).toEqual({ title: "Design clone" });
+});
+
+test("multi-select session actions pin and archive in bulk", async ({
+  page,
+}) => {
+  await mockHost(page, { additionalSessions: 2 });
+  await page.goto("/");
+  await clickRowAction(page, "Session actions: Mock session");
+  await page
+    .getByRole("menuitem", { name: "Multi-select", exact: true })
+    .first()
+    .click();
+  const selectionBar = page.locator(".session-selection-bar");
+  await expect(selectionBar).toContainText("1 selected");
+  await expect(page.getByRole("checkbox")).toHaveCount(3);
+  const secondCheckbox = page.getByRole("checkbox", {
+    name: "Select session: Recent session 1",
+  });
+  await expect(secondCheckbox).toHaveAttribute("aria-checked", "false");
+  await secondCheckbox.click();
+  await expect(selectionBar).toContainText("2 selected");
+
+  await page.getByRole("button", { name: "Pin", exact: true }).click();
+  await expect(page.locator(".project-session .lucide-pin")).toHaveCount(2);
+  await expect(page.locator(".session-selection-bar")).toHaveCount(0);
+  await expect(page.getByRole("checkbox")).toHaveCount(0);
+
+  await clickRowAction(page, "Session actions: Mock session");
+  await page
+    .getByRole("menuitem", { name: "Multi-select", exact: true })
+    .first()
+    .click();
+  await page.getByRole("button", { name: "Select all", exact: true }).click();
+  await expect(selectionBar).toContainText("3 selected");
+  await page.getByRole("button", { name: "Archive", exact: true }).click();
+  await expect(page.locator(".session-selection-bar")).toHaveCount(0);
+  await expect(page.getByRole("checkbox")).toHaveCount(0);
+  await expect(
+    page.getByRole("button", { name: "Show projects", exact: true }),
+  ).toBeVisible();
+});
+
+test("multi-select session actions delete sessions in bulk", async ({
+  page,
+}) => {
+  await mockHost(page, { additionalSessions: 2 });
+  await page.goto("/");
+  await clickRowAction(page, "Session actions: Mock session");
+  await page
+    .getByRole("menuitem", { name: "Multi-select", exact: true })
+    .first()
+    .click();
+  await page
+    .getByRole("checkbox", { name: "Select session: Recent session 1" })
+    .click();
+  await expect(page.locator(".session-selection-bar")).toContainText(
+    "2 selected",
+  );
+  page.once("dialog", (dialog) => void dialog.accept());
+  await page
+    .getByRole("button", { name: "Delete permanently", exact: true })
+    .click();
+  await expect(page.locator(".session-selection-bar")).toHaveCount(0);
+  await expect(page.getByRole("checkbox")).toHaveCount(0);
+  await expect(page.locator(".project-session")).toHaveCount(1);
+});
+
 test("recent chats stay inline as a scrollable sidebar list", async ({
   page,
 }) => {
@@ -5259,7 +5358,11 @@ test.describe("mobile fork regression", () => {
   const forkError = "Mock fork failed without changing the selection";
   const toolbarFork = (page: Page) => page.locator(".toolbar-fork");
   const messageFork = (page: Page) =>
-    page.locator(".message.assistant .message-actions").last().locator("button").nth(1);
+    page
+      .locator(".message.assistant .message-actions")
+      .last()
+      .locator("button")
+      .nth(1);
   const historyFork = (page: Page) =>
     page.locator(".history-actions button").first();
   const titleDialog = (page: Page) =>

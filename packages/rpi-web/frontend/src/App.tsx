@@ -4603,19 +4603,22 @@ export default function App() {
     await forkSession({ sessionId, title: current?.title ?? null }, entryId);
   }
 
-  async function cloneCurrent() {
-    if (!sessionId || !actions.has("clone")) return;
+  async function cloneSession(
+    source: Pick<SessionSummary, "sessionId" | "title">,
+  ) {
+    if (!source.sessionId || !actions.has("clone")) return;
+    const sourceSessionId = source.sessionId;
     const navigation = navigationRevision.current;
     const title = await requestText({
       kind: "prompt",
       title: t("cloneName"),
       defaultValue: t("cloneOf", {
-        title: current?.title ?? sessionId.slice(0, 8),
+        title: source.title ?? sourceSessionId.slice(0, 8),
       }),
     });
-    if (title === null) return;
+    if (title === null || navigation !== navigationRevision.current) return;
     try {
-      const created = await api.clone(sessionId, title);
+      const created = await api.clone(sourceSessionId, title);
       await refreshSessions();
       if (navigation !== navigationRevision.current) return;
       select(created.sessionId);
@@ -4623,6 +4626,14 @@ export default function App() {
       if (navigation !== navigationRevision.current) return;
       setError(errorText(cause));
     }
+  }
+
+  async function cloneCurrent() {
+    if (!sessionId) return;
+    await cloneSession({
+      sessionId,
+      title: current?.title ?? null,
+    });
   }
 
   async function rewindTo(entryId: string) {
@@ -4947,6 +4958,70 @@ export default function App() {
       deleteInFlight.current = false;
       setDeletePending(false);
       setDeleteTarget(null);
+    }
+  }
+
+  async function bulkSessionMetadata(
+    targets: SessionSummary[],
+    patch: { pinned?: boolean; archived?: boolean },
+  ) {
+    const entries = targets.filter((session) => !retirementBusy(session));
+    if (!entries.length) return;
+    try {
+      await Promise.all(
+        entries.map((session) =>
+          updateSessionMetadata(session, {
+            ...patch,
+            ...(patch.archived ? { pinned: undefined } : {}),
+          }),
+        ),
+      );
+      setError(
+        language === "zh"
+          ? patch.archived
+            ? "已批量归档所选会话。"
+            : "已批量置顶所选会话。"
+          : patch.archived
+            ? "Archived the selected sessions."
+            : "Pinned the selected sessions.",
+      );
+    } catch {
+      // updateSessionMetadata reports individual failures through setError.
+    }
+  }
+
+  async function bulkDeleteSessions(targets: SessionSummary[]) {
+    const entries = targets.filter((session) => !retirementBusy(session));
+    if (!entries.length || deleteInFlight.current) return;
+    const confirmed = window.confirm(
+      language === "zh"
+        ? `确定永久删除选中的 ${entries.length} 个会话吗？此操作无法撤销。`
+        : `Permanently delete ${entries.length} selected sessions? This cannot be undone.`,
+    );
+    if (!confirmed) return;
+    deleteInFlight.current = true;
+    setDeletePending(true);
+    try {
+      for (const entry of entries) {
+        try {
+          await api.deleteSession(entry.sessionId);
+          draftBySession.current.delete(entry.sessionId);
+          rowsBySession.current.delete(entry.sessionId);
+        } catch (cause) {
+          setError(retirementError(cause, true));
+        }
+      }
+      saveDrafts(draftBySession.current);
+      setSessions((previous) =>
+        previous.filter(
+          (item) =>
+            !entries.some((entry) => entry.sessionId === item.sessionId),
+        ),
+      );
+      await refreshSessions();
+    } finally {
+      deleteInFlight.current = false;
+      setDeletePending(false);
     }
   }
 
@@ -5837,6 +5912,7 @@ export default function App() {
               creating={creatingSession}
               canManage={actions.has("session_organization")}
               canFork={actions.has("fork")}
+              canClone={actions.has("clone")}
               canCreate={actions.has("create_project")}
               onSelectProject={selectProject}
               onSelectSession={selectSidebarSession}
@@ -5844,6 +5920,11 @@ export default function App() {
               onNewProject={() => setProjectDialog(true)}
               onRename={setRenameTarget}
               onFork={(session) => void forkSession(session)}
+              onClone={(session) => void cloneSession(session)}
+              onBulkMetadata={(entries, patch) =>
+                bulkSessionMetadata(entries, patch)
+              }
+              onBulkDelete={(entries) => bulkDeleteSessions(entries)}
               onRenameProject={setProjectRenameTarget}
               onProjectMetadata={updateProjectMetadata}
               onEditTags={setTagsTarget}
