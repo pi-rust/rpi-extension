@@ -5259,7 +5259,11 @@ test.describe("mobile fork regression", () => {
   const forkError = "Mock fork failed without changing the selection";
   const toolbarFork = (page: Page) => page.locator(".toolbar-fork");
   const messageFork = (page: Page) =>
-    page.locator(".message.assistant .message-actions").last().locator("button").nth(1);
+    page
+      .locator(".message.assistant .message-actions")
+      .last()
+      .locator("button")
+      .nth(1);
   const historyFork = (page: Page) =>
     page.locator(".history-actions button").first();
   const titleDialog = (page: Page) =>
@@ -8786,6 +8790,7 @@ test("mobile composer footer keeps model picker usable beside session metrics", 
   ).toContainText("129k / 227k");
   await expect(metrics.getByLabel(/^Cache hit:/)).toBeVisible();
   await expect(metrics.getByLabel(/^Cache hit: 20%$/)).toBeVisible();
+  await expect(metrics.getByLabel(/^Session work:/)).toBeVisible();
   await expect(metrics.getByRole("button", { name: "details" })).toBeVisible();
   expect(
     await metrics.evaluate(
@@ -8800,7 +8805,7 @@ test("mobile composer footer keeps model picker usable beside session metrics", 
 
   for (const width of [320, 375, 390]) {
     await page.setViewportSize({ width, height: 844 });
-    await expect(metrics.locator(".composer-metric")).toHaveCount(2);
+    await expect(metrics.locator(".composer-metric")).toHaveCount(3);
     const layout = await metrics.evaluate((element) => {
       const tops = Array.from(
         element.querySelectorAll(".composer-metric"),
@@ -10346,6 +10351,55 @@ test.describe("run timing regressions", () => {
       }),
     );
   }
+
+  test("composer footer totals all native run durations in metric order", async ({
+    page,
+  }) => {
+    await mockHost(page);
+    await history(page, [
+      { role: "user", entryId: "work-prompt", content: "Do work" },
+      finalMessage("work-final", "Worked"),
+    ]);
+    await page.route(timingRoute, (route) =>
+      route.fulfill({
+        json: timingPage([
+          nativeTiming("work-final", "work-run-1", "completed", 138_000),
+          nativeTiming("work-final", "work-run-2", "failed", 2_000),
+        ]),
+      }),
+    );
+    await page.goto("/");
+    const metrics = page.locator(".composer-metrics.slim-metrics");
+    await expect(
+      metrics.getByLabel("Session work: 2m 20s", { exact: true }),
+    ).toContainText("2m 20s");
+    const labels = await metrics
+      .locator(".composer-metric")
+      .evaluateAll((nodes) =>
+        nodes.map((node) => node.getAttribute("aria-label")?.split(":")[0]),
+      );
+    expect(labels).toEqual(["Cache hit", "Context", "Session work"]);
+    await chooseLanguage(page, "zh");
+    await expect(
+      metrics.getByLabel("会话工作时长: 2m 20s", { exact: true }),
+    ).toBeVisible();
+  });
+
+  test("composer footer shows zero total work when native timings are unavailable", async ({
+    page,
+  }) => {
+    await mockHost(page);
+    await history(page, [finalMessage()]);
+    await page.route(timingRoute, (route) =>
+      route.fulfill({ status: 501, json: { error: "unsupported" } }),
+    );
+    await page.goto("/");
+    const metrics = page.locator(".composer-metrics.slim-metrics");
+    await expect(metrics.getByLabel(/^Cache hit:/)).toBeVisible();
+    await expect(
+      metrics.getByLabel("Session work: 0s", { exact: true }),
+    ).toContainText("0s");
+  });
 
   test("run elapsed history attaches once after the final projected row and survives reload", async ({
     page,

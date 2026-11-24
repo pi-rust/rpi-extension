@@ -101,6 +101,9 @@ const messages = {
     totalTokens: "Total tokens",
     cost: "Cost",
     cacheHit: "Cache hit",
+    sessionWork: "Session work",
+    sessionWorkTotal:
+      "Total agent work time in this session (sum of all recorded rounds)",
     inputTokens: "Input tokens",
     outputTokens: "Output tokens",
     cachedTokens: "Cached tokens",
@@ -501,6 +504,8 @@ const messages = {
     totalTokens: "总 Token",
     cost: "费用",
     cacheHit: "缓存命中率",
+    sessionWork: "会话工作时长",
+    sessionWorkTotal: "本会话 agent 各轮工作时长之和",
     inputTokens: "输入 Token",
     outputTokens: "输出 Token",
     cachedTokens: "缓存 Token",

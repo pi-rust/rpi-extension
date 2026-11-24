@@ -47,6 +47,7 @@ import {
   Sparkles,
   SquarePen,
   Sun,
+  Timer,
   Volume2,
   VolumeX,
   X,
@@ -484,6 +485,18 @@ function formatTokens(value: number) {
   if (value >= 1_000)
     return `${(value / 1_000).toFixed(value >= 10_000 ? 0 : 1)}k`;
   return String(Math.round(value));
+}
+
+/** Compact tabular duration for the footer, e.g. 2m 18s or 1h 01m. */
+function formatRunDuration(value: number) {
+  if (!Number.isFinite(value) || value <= 0) return "0s";
+  const seconds = Math.floor(value / 1000);
+  const hours = Math.floor(seconds / 3600);
+  const minutes = Math.floor(seconds / 60) % 60;
+  if (hours > 0) return `${hours}h ${String(minutes).padStart(2, "0")}m`;
+  if (minutes > 0)
+    return `${minutes}m ${String(seconds % 60).padStart(2, "0")}s`;
+  return `${seconds}s`;
 }
 
 function statNumber(
@@ -1250,6 +1263,15 @@ export default function App() {
   const displayedTimings = historical.active
     ? historicalRunTimings
     : runTimings;
+  const sessionWorkMs = useMemo(
+    () =>
+      displayedTimings.reduce(
+        (total, timing) =>
+          total + (Number.isFinite(timing.elapsedMs) ? timing.elapsedMs : 0),
+        0,
+      ),
+    [displayedTimings],
+  );
   const runFooters = useMemo(
     () => timingByRow(displayedRows, displayedTimings),
     [displayedRows, displayedTimings],
@@ -7003,7 +7025,7 @@ export default function App() {
                 </div>
                 <div
                   className="composer-metrics slim-metrics"
-                  aria-label={`${t("cacheHit")}, ${t("context")}`}
+                  aria-label={`${t("cacheHit")}, ${t("context")}, ${t("sessionWork")}`}
                 >
                   <span
                     className="composer-metric"
@@ -7028,6 +7050,14 @@ export default function App() {
                         ? `${formatTokens(runtime.context.tokens)} / ${formatTokens(runtime.context.window)}`
                         : "—"}
                     </strong>
+                  </span>
+                  <span
+                    className="composer-metric"
+                    title={t("sessionWorkTotal")}
+                    aria-label={`${t("sessionWork")}: ${formatRunDuration(sessionWorkMs)}`}
+                  >
+                    <Timer size={12} aria-hidden="true" />
+                    <strong>{formatRunDuration(sessionWorkMs)}</strong>
                   </span>
                   <button
                     type="button"
