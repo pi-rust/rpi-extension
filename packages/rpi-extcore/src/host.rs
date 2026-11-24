@@ -2,6 +2,7 @@ use serde_json::{json, Value};
 mod admission;
 mod child;
 mod resources;
+mod startup;
 use admission::{ExecutionAdmission, ExecutionProjection, ExecutionTicket};
 pub(crate) use resources::ResourceFence;
 use std::{
@@ -27,10 +28,16 @@ async fn read_ready(
     timeout: Duration,
 ) -> Result<Value, String> {
     let mut first_line = String::new();
-    tokio::time::timeout(timeout, reader.take(1024 * 1024).read_line(&mut first_line))
+    let count = tokio::time::timeout(timeout, reader.take(1024 * 1024).read_line(&mut first_line))
         .await
         .map_err(|_| "native rpi host startup timed out".to_string())?
         .map_err(|error| format!("failed to read rpi ready frame: {error}"))?;
+    if count == 0 {
+        return Err("native rpi host closed stdout before ready (EOF)".into());
+    }
+    if count == 1024 * 1024 && !first_line.ends_with('\n') {
+        return Err("rpi ready frame exceeds startup frame limit".into());
+    }
     let ready: Value = serde_json::from_str(first_line.trim())
         .map_err(|error| format!("invalid rpi ready frame: {error}"))?;
     if ready["type"] != "ready" || ready["protocol"] != "rpi" {
@@ -765,6 +772,7 @@ impl HostSession {
         options: SessionOptions,
         fork_cut: Option<&str>,
     ) -> Result<Arc<Self>, String> {
+        let launch_guard = startup::LaunchGuard::acquire(&options)?;
         let launch_options = options.clone();
         let resource_file = resources::StartupFile::prepare(&options).await?;
         let session_id = &options.session_id;
@@ -815,7 +823,17 @@ impl HostSession {
             .current_dir(project)
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::inherit());
+            .stderr(std::process::Stdio::piped());
+        #[cfg(windows)]
+        let stderr = {
+            // Tokio's conversion of a standard Windows pipe still uses
+            // blocking reads. Use an overlapped server pipe for cancellation.
+            let (writer, reader) = startup::windows_stderr_pipe()
+                .await
+                .map_err(|e| format!("failed to create native stderr pipe: {e}"))?;
+            command.stderr(writer);
+            reader
+        };
         let mut child = rpi_mcp_core::ProcessTree::spawn(&mut command.into_std())
             .map_err(|error| format!("failed to start {}: {error}", rpi_bin.display()))?;
         let stdin = tokio::process::ChildStdin::from_std(
@@ -834,14 +852,21 @@ impl HostSession {
                 .ok_or("rpi host stdout unavailable")?,
         )
         .map_err(|e| e.to_string())?;
-        let child_owner = child::NativeChild::start(child);
+        #[cfg(not(windows))]
+        let stderr = tokio::process::ChildStderr::from_std(
+            child
+                .child_mut()
+                .stderr
+                .take()
+                .ok_or("rpi host stderr unavailable")?,
+        )
+        .map_err(|e| e.to_string())?;
+        let child_owner = child::NativeChild::start(child, Some(launch_guard));
+        let diagnostics = startup::StderrCapture::start(stderr, child_owner.exit_signal());
         let mut reader = BufReader::new(stdout);
         let ready = match read_ready(&mut reader, Duration::from_secs(15)).await {
             Ok(ready) => ready,
-            Err(error) => {
-                let _ = child_owner.stop_checked().await;
-                return Err(error);
-            }
+            Err(error) => return Err(diagnostics.failure(error, &child_owner).await),
         };
 
         let (raw_events, _) = broadcast::channel(16_384);
