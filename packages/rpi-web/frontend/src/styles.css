@@ -3818,8 +3818,10 @@ details[open] > summary:before {
   }
   .composer-area.soft-keyboard-open .slash-menu {
     /* The workspace publishes the live gap above the composer while the
-       keyboard is open; the palette scrolls inside that gap. */
+       keyboard is open. Keep the palette inside the visual viewport even when
+       the browser paints its own top toolbar over the layout viewport. */
     max-height: var(--slash-keyboard-max-height, 340px);
+    overflow-y: auto;
   }
   .slash-item {
     flex-wrap: wrap;

@@ -256,3 +256,54 @@ test("slash menu shrinks above the composer while a soft keyboard is open", asyn
   expect(geometry.height).toBeLessThan(340);
   expect(geometry.composerTopGap).toBeGreaterThanOrEqual(0);
 });
+
+test("slash menu stays inside the visual viewport when the browser does not shift offsetTop", async ({
+  page,
+}) => {
+  await page.setViewportSize({ width: 393, height: 851 });
+  await mockHost(page);
+  await page.goto(`/?session=${sessionId}`);
+  const input = page.locator(".composer textarea");
+  await expect(input).toBeVisible();
+  await input.fill("/");
+  await expect(page.locator(".slash-menu")).toBeVisible();
+
+  // HarmonyOS浏览器 keeps `offsetTop` at 0 while the IME shrinks the visual
+  // viewport and paints its own toolbar over the layout viewport's top.
+  await page.evaluate(() => {
+    Object.defineProperty(window.visualViewport!, "height", {
+      configurable: true,
+      get: () => 430,
+    });
+    Object.defineProperty(window.visualViewport!, "offsetTop", {
+      configurable: true,
+      get: () => 0,
+    });
+    window.visualViewport!.dispatchEvent(new Event("resize"));
+  });
+  await expect(page.locator(".composer-area.soft-keyboard-open")).toBeVisible();
+  const geometry = await page.evaluate(() => {
+    const menuRect = document
+      .querySelector(".slash-menu")!
+      .getBoundingClientRect();
+    const composerRect = document
+      .querySelector(".composer")!
+      .getBoundingClientRect();
+    const viewport = window.visualViewport!;
+    // With offsetTop === 0 and a 430px visual viewport inside an 851px layout
+    // viewport, the browser chrome covers at least the top 421 layout pixels.
+    const paintedTop = Math.max(
+      viewport.offsetTop,
+      viewport.offsetTop + viewport.height - window.innerHeight,
+    );
+    return {
+      top: menuRect.top,
+      paintedTop,
+      height: menuRect.height,
+      composerTopGap: composerRect.top - menuRect.bottom,
+    };
+  });
+  expect(geometry.top).toBeGreaterThanOrEqual(geometry.paintedTop);
+  expect(geometry.height).toBeLessThan(260);
+  expect(geometry.composerTopGap).toBeGreaterThanOrEqual(0);
+});

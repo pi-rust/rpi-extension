@@ -944,8 +944,12 @@ export default function App() {
   );
   // Mobile browsers keep `innerHeight`/`dvh` fixed while a soft keyboard is
   // open; `VisualViewport.height` is the only reliable live size. Record the
-  // shrink so the slash palette can shrink with it instead of extending under
-  // (and being painted over by) the top toolbar.
+  // keyboard state and publish the palette's live visible height. The palette
+  // is absolutely positioned against the layout viewport, so its top must be
+  // clamped by the visual viewport's bottom edge as well as the normal top
+  // boundary. Some HarmonyOS browsers expose a smaller visual viewport without
+  // moving `offsetTop`; using only `offsetTop`/toolbar geometry lets the menu
+  // extend above the painted area where the user sees the browser toolbar.
   const [softKeyboardOpen, setSoftKeyboardOpen] = useState(false);
   useEffect(() => {
     const viewport = window.visualViewport;
@@ -956,21 +960,30 @@ export default function App() {
       const open = layoutHeight - viewport.height > 120;
       const root = document.querySelector<HTMLElement>(".workspace");
       if (open && root) {
-        // The palette ends just above the composer. Bound it by the space
-        // actually visible between that composer and the lower of the layout
-        // toolbar and the visual viewport's scrolled top edge.
         const composer = root.querySelector<HTMLElement>(".composer");
         const toolbar = root.querySelector<HTMLElement>(".toolbar");
+        // Worst case among: visual viewport's scrolled top, its bottom minus
+        // the full visible height, and the sticky app toolbar's bottom. The
+        // last is still useful when the browser reports a stale offsetTop.
         const visibleTop = Math.max(
           toolbar?.getBoundingClientRect().bottom ?? 0,
           viewport.offsetTop,
+          viewport.offsetTop + viewport.height - layoutHeight,
         );
+        // The palette is anchored to the composer's layout box. Keep an
+        // extra safety gap because mobile browsers may paint the URL bar over
+        // a few pixels of that box while the keyboard is open.
         const available = composer
-          ? Math.floor(composer.getBoundingClientRect().top - visibleTop - 8)
-          : 340;
+          ? Math.floor(composer.getBoundingClientRect().top - visibleTop - 24)
+          : 96;
+        // The palette is a transient command picker, not the primary task.
+        // Keep it well under half the live visual height so the browser's own
+        // toolbar/address bar cannot cover its upper rows when the keyboard
+        // reports a stale offsetTop.
+        const keyboardCap = Math.floor(viewport.height * 0.45);
         root.style.setProperty(
           "--slash-keyboard-max-height",
-          `${Math.max(96, Math.min(340, available))}px`,
+          `${Math.max(96, Math.min(260, available, keyboardCap))}px`,
         );
       }
       setSoftKeyboardOpen(open);
