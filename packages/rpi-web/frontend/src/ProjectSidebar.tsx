@@ -1315,21 +1315,6 @@ export function ProjectSidebar({
                       {translate(language, "clone")}
                     </button>
                   )}
-                  {(canClone || canManage) && (
-                    <>
-                      <button
-                        role="menuitem"
-                        onClick={() => {
-                          setMenu("");
-                          setSelectMode(true);
-                          setSelected(new Set([session.sessionId]));
-                        }}
-                      >
-                        <CheckSquare size={14} />
-                        {translate(language, "multiSelect")}
-                      </button>
-                    </>
-                  )}
                   {canManage && (
                     <>
                       <button

@@ -304,7 +304,7 @@ type TextRequest =
       message?: string;
       defaultValue?: string;
     }
-  | { kind: "confirm"; title: string; message: string };
+  | { kind: "confirm"; title: string; message: string; confirmLabel?: string };
 type SlashCommand = {
   name: string;
   usage: string;
@@ -4967,58 +4967,77 @@ export default function App() {
   ) {
     const entries = targets.filter((session) => !retirementBusy(session));
     if (!entries.length) return;
-    try {
-      await Promise.all(
-        entries.map((session) =>
-          updateSessionMetadata(session, {
-            ...patch,
-            ...(patch.archived ? { pinned: undefined } : {}),
-          }),
-        ),
-      );
-      setError(
-        language === "zh"
-          ? patch.archived
-            ? "已批量归档所选会话。"
-            : "已批量置顶所选会话。"
-          : patch.archived
-            ? "Archived the selected sessions."
-            : "Pinned the selected sessions.",
-      );
-    } catch {
-      // updateSessionMetadata reports individual failures through setError.
+    // One metadata write at a time: the native host is a single child process,
+    // and a burst of parallel writes neither helps nor reports better. Each
+    // failure still surfaces through updateSessionMetadata's own banner.
+    for (const session of entries) {
+      await updateSessionMetadata(session, {
+        ...patch,
+        ...(patch.archived ? { pinned: undefined } : {}),
+      });
     }
   }
 
   async function bulkDeleteSessions(targets: SessionSummary[]) {
     const entries = targets.filter((session) => !retirementBusy(session));
     if (!entries.length || deleteInFlight.current) return;
-    const confirmed = window.confirm(
-      language === "zh"
-        ? `确定永久删除选中的 ${entries.length} 个会话吗？此操作无法撤销。`
-        : `Permanently delete ${entries.length} selected sessions? This cannot be undone.`,
-    );
-    if (!confirmed) return;
+    const confirmed = await requestText({
+      kind: "confirm",
+      title:
+        language === "zh"
+          ? "永久删除所选会话"
+          : "Delete selected sessions permanently",
+      message:
+        language === "zh"
+          ? `确定要永久删除选中的 ${entries.length} 个会话吗？此操作会删除会话历史并释放 RPC 连接，不会删除项目文件，且无法撤销。运行中的会话请先停止并等待结束。`
+          : `Permanently delete ${entries.length} selected sessions? This deletes their history and releases the RPC connections, but does not delete project files. This cannot be undone. Stop running sessions and wait for them to settle first.`,
+      confirmLabel: language === "zh" ? "永久删除" : "Delete permanently",
+    });
+    if (confirmed === null) return;
+    const navigation = navigationRevision.current;
+    const activeId = activeSessionRef.current;
+    const activeEntry = entries.find((entry) => entry.sessionId === activeId);
     deleteInFlight.current = true;
     setDeletePending(true);
     try {
+      const removed = new Set<string>();
       for (const entry of entries) {
         try {
+          // A sent DELETE may already have landed even if the response fails.
+          // Never retry, but keep going so one failure cannot strand the rest.
           await api.deleteSession(entry.sessionId);
+          removed.add(entry.sessionId);
           draftBySession.current.delete(entry.sessionId);
           rowsBySession.current.delete(entry.sessionId);
         } catch (cause) {
+          if (navigation !== navigationRevision.current) return;
           setError(retirementError(cause, true));
         }
       }
       saveDrafts(draftBySession.current);
-      setSessions((previous) =>
-        previous.filter(
-          (item) =>
-            !entries.some((entry) => entry.sessionId === item.sessionId),
-        ),
+      if (removed.size) {
+        setSessions((previous) =>
+          previous.filter((item) => !removed.has(item.sessionId)),
+        );
+      }
+      const list = await refreshSessions();
+      if (
+        !activeEntry ||
+        !removed.has(activeEntry.sessionId) ||
+        navigation !== navigationRevision.current ||
+        activeSessionRef.current !== activeEntry.sessionId
+      )
+        return;
+      const next = list?.find(
+        (entry) =>
+          entry.sessionId !== activeEntry.sessionId &&
+          entry.projectId === activeEntry.projectId &&
+          !entry.archived &&
+          !entry.deleting,
       );
-      await refreshSessions();
+      select(next?.sessionId ?? "", next?.projectId ?? activeEntry.projectId, {
+        keepSidebarOpen: true,
+      });
     } finally {
       deleteInFlight.current = false;
       setDeletePending(false);
@@ -5683,6 +5702,7 @@ export default function App() {
           language={language}
           title={textRequest.title}
           message={textRequest.message}
+          confirmLabel={textRequest.confirmLabel}
           onClose={() => resolveTextRequest(null)}
           onConfirm={() => resolveTextRequest("confirmed")}
         />

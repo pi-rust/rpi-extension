@@ -1315,8 +1315,14 @@ test("multi-select session actions delete sessions in bulk", async ({
   await expect(page.locator(".session-selection-bar")).toContainText(
     "2 selected",
   );
-  page.once("dialog", (dialog) => void dialog.accept());
   await page
+    .getByRole("button", { name: "Delete permanently", exact: true })
+    .click();
+  const confirm = page.getByRole("dialog", {
+    name: "Delete selected sessions permanently",
+  });
+  await expect(confirm).toContainText("2 selected sessions");
+  await confirm
     .getByRole("button", { name: "Delete permanently", exact: true })
     .click();
   await expect(page.locator(".session-selection-bar")).toHaveCount(0);
