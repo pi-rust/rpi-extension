@@ -5259,7 +5259,11 @@ test.describe("mobile fork regression", () => {
   const forkError = "Mock fork failed without changing the selection";
   const toolbarFork = (page: Page) => page.locator(".toolbar-fork");
   const messageFork = (page: Page) =>
-    page.locator(".message.assistant .message-actions").last().locator("button").nth(1);
+    page
+      .locator(".message.assistant .message-actions")
+      .last()
+      .locator("button")
+      .nth(1);
   const historyFork = (page: Page) =>
     page.locator(".history-actions button").first();
   const titleDialog = (page: Page) =>
@@ -18948,4 +18952,56 @@ test("settings replace shortcut hints with session auto-archive controls", async
       JSON.parse(localStorage.getItem("rpi-session-auto-archive") ?? "null"),
     ),
   ).resolves.toEqual({ enabled: true, days: 1 });
+});
+
+test("changing auto-archive settings never re-runs startup or moves the chat", async ({
+  page,
+}) => {
+  await page.addInitScript(() => {
+    localStorage.setItem("rpi-web-language", "en");
+  });
+  // A stale session is present, so a re-run of the boot sweep would issue a
+  // second metadata write and could move the selected chat.
+  const now = Date.now();
+  const stale = {
+    ...session,
+    sessionId: "stale-chat",
+    title: "Stale chat",
+    lastTurnEndedAt: now - 20 * 86_400_000,
+  };
+  const sessionMutations: string[] = [];
+  await mockHost(page);
+  await page.route("**/api/v1/sessions", async (route: Route) => {
+    if (route.request().method() === "GET")
+      return route.fulfill({ json: { sessions: [session, stale] } });
+    sessionMutations.push(`${route.request().method()} /sessions`);
+    return route.fallback();
+  });
+  await page.route(/\/sessions\/[^/]+\/metadata$/, (route: Route) => {
+    sessionMutations.push("metadata");
+    return route.fallback();
+  });
+  await page.goto("/");
+  const heading = page.locator(".toolbar .breadcrumb h1");
+  await expect(heading).toHaveText("Mock session");
+  await expect.poll(() => sessionMutations.length).toBe(1);
+  const afterStartup = [...sessionMutations];
+
+  await page.keyboard.press("Control+,");
+  const settings = page.getByRole("dialog");
+  const days = settings.getByLabel("Days without interaction");
+  await days.fill("3");
+  await days.blur();
+  await page.keyboard.press("Escape");
+  await expect(page.getByRole("dialog")).toHaveCount(0);
+
+  // The preference is stored, the boot sweep did not run a second time, and
+  // the restored chat is still the same one.
+  await expect(
+    page.evaluate(() =>
+      JSON.parse(localStorage.getItem("rpi-session-auto-archive") ?? "null"),
+    ),
+  ).resolves.toEqual({ enabled: true, days: 3 });
+  await expect(heading).toHaveText("Mock session");
+  expect(sessionMutations).toEqual(afterStartup);
 });

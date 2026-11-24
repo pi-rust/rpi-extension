@@ -828,6 +828,10 @@ export default function App() {
   const [autoArchive, setAutoArchive] = useState<SessionAutoArchivePreference>(
     readSessionAutoArchivePreference,
   );
+  // The startup sweep reads the preference once, through a ref: a settings
+  // change must not re-run session bootstrap or move the restored chat.
+  const autoArchiveRef = useRef(autoArchive);
+  autoArchiveRef.current = autoArchive;
   /** Preview restored from `?file=…`; the dialog itself keeps the URL current. */
   const [linkedPreview, setLinkedPreview] = useState<ProjectFileLink | null>(
     null,
@@ -2859,30 +2863,33 @@ export default function App() {
         );
         const blockedRequest = sessionSelectionError(requestedSession);
         let activeList = list;
-        if (autoArchive.enabled) {
+        const sweep = autoArchiveRef.current;
+        if (sweep.enabled) {
           // Decide before selecting the restored chat: an explicit `?session=`
           // link and the current in-tab session must survive the sweep.
           const protectedIds = [requested, activeSessionRef.current].filter(
             (id): id is string => Boolean(id),
           );
           const stale = staleSessionIds(list, {
-            days: autoArchive.days,
+            days: sweep.days,
             now: Date.now(),
             protectedIds,
           });
           if (stale.length) {
-            const results = await Promise.allSettled(
-              stale.map((id) => api.sessionMetadata(id, { archived: true })),
-            );
-            const archivedIds = new Set(
-              stale.filter((_, index) => results[index].status === "fulfilled"),
-            );
+            // Sequential on purpose: the native host serves one session at a
+            // time, and a startup burst of parallel writes buys nothing.
+            const archivedIds = new Set<string>();
+            for (const id of stale) {
+              if (cancelled) return;
+              try {
+                await api.sessionMetadata(id, { archived: true });
+                archivedIds.add(id);
+              } catch {
+                // A single failure must not abort bootstrap; the next page
+                // load retries that session.
+              }
+            }
             if (archivedIds.size) {
-              activeList = list.map((session) =>
-                archivedIds.has(session.sessionId)
-                  ? { ...session, archived: true }
-                  : session,
-              );
               const refreshed = await refreshSessions();
               if (cancelled || !refreshed) return;
               activeList = refreshed;
@@ -2955,8 +2962,6 @@ export default function App() {
     authChecked,
     authRequired,
     authenticated,
-    autoArchive.days,
-    autoArchive.enabled,
     createSession,
     refreshSessions,
   ]);
