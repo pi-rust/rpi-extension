@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.16](https://github.com/pi-rust/rpi-extension/compare/rpi-im-message-v0.1.15...rpi-im-message-v0.1.16) - 2026-11-24
+
+### Added
+
+- *(im-message)* add WeCom intelligent bot long connections ([#63](https://github.com/pi-rust/rpi-extension/pull/63))
+
 ### Added
 
 - Support WeCom (企业微信) intelligent-bot long connections alongside Feishu/Lark,

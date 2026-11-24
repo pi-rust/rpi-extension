@@ -38,14 +38,14 @@
     "descriptionZh": "将 rpi 作为 MCP 服务供其他客户端调用，支持 stdio 和 Streamable HTTP。",
     "descriptionEn": "Expose rpi to MCP clients as a server over stdio or Streamable HTTP.",
     "description": "Expose rpi to MCP clients as a server over stdio or Streamable HTTP.",
-    "version": "0.1.0",
+    "version": "0.1.1",
     "type": "extension",
     "tool": "--mcp (MCP stdio server)",
     "inspiredBy": "Model Context Protocol",
     "sourceDownloadsPerMonth": null,
     "install": "rpi install rpi-mcp-server --github pi-rust/rpi-extension",
     "repository": "https://github.com/pi-rust/rpi-extension",
-    "prebuilt_manifest": "https://github.com/pi-rust/rpi-extension/releases/download/rpi-mcp-server-v0.1.0/rpi-extension.json"
+    "prebuilt_manifest": "https://github.com/pi-rust/rpi-extension/releases/download/rpi-mcp-server-v0.1.1/rpi-extension.json"
   },
   {
     "name": "rpi-subagents",
@@ -278,14 +278,14 @@
     "descriptionZh": "通过飞书、Lark 或企业微信智能机器人长连接接收消息，并发送文本、Markdown 和卡片。",
     "descriptionEn": "Receive Feishu/Lark or WeCom bot messages over a persistent connection and send text, Markdown and cards.",
     "description": "Receive Feishu/Lark or WeCom bot messages over a persistent connection and send text, Markdown and cards.",
-    "version": "0.1.15",
+    "version": "0.1.16",
     "type": "extension",
     "tool": "im_message_server",
     "inspiredBy": "Hermes Feishu/Lark and WeCom channels",
     "sourceDownloadsPerMonth": null,
     "install": "rpi install rpi-im-message --github pi-rust/rpi-extension",
     "repository": "https://github.com/pi-rust/rpi-extension",
-    "prebuilt_manifest": "https://github.com/pi-rust/rpi-extension/releases/download/rpi-im-message-v0.1.15/rpi-extension.json"
+    "prebuilt_manifest": "https://github.com/pi-rust/rpi-extension/releases/download/rpi-im-message-v0.1.16/rpi-extension.json"
   },
   {
     "name": "rpi-office",
@@ -342,14 +342,14 @@
     "descriptionZh": "通过 ACP 将 rpi 接入 Zed 等客户端，支持流式回复、工具交互和会话管理。",
     "descriptionEn": "Use rpi in Zed and other ACP clients, with streamed replies, tool interactions and session management.",
     "description": "Use rpi in Zed and other ACP clients, with streamed replies, tool interactions and session management.",
-    "version": "0.2.18",
+    "version": "0.2.19",
     "type": "extension",
     "tool": "--acp (Agent Client Protocol stdio server)",
     "inspiredBy": "Zed external agents / agent-client-protocol",
     "sourceDownloadsPerMonth": null,
     "install": "rpi install rpi-acp --github pi-rust/rpi-extension",
     "repository": "https://github.com/pi-rust/rpi-extension",
-    "prebuilt_manifest": "https://github.com/pi-rust/rpi-extension/releases/download/rpi-acp-v0.2.18/rpi-extension.json"
+    "prebuilt_manifest": "https://github.com/pi-rust/rpi-extension/releases/download/rpi-acp-v0.2.19/rpi-extension.json"
   },
   {
     "name": "rpi-permission-gate",

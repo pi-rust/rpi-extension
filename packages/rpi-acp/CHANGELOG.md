@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.19](https://github.com/pi-rust/rpi-extension/compare/rpi-acp-v0.2.18...rpi-acp-v0.2.19) - 2026-11-24
+
+### Other
+
+- updated the following local packages: rpi-extcore
+
 ## [0.2.18](https://github.com/pi-rust/rpi-package/compare/rpi-acp-v0.2.17...rpi-acp-v0.2.18) - 2026-11-17
 
 ### Other
