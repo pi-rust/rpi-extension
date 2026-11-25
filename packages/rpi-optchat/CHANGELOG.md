@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.1](https://github.com/pi-rust/rpi-extension/compare/rpi-optchat-v0.1.0...rpi-optchat-v0.1.1) - 2026-11-25
+
+### Other
+
+- *(optchat)* retry a busy compactor script instead of failing ([#79](https://github.com/pi-rust/rpi-extension/pull/79))
+
 ### Added
 
 - Model-written summary lines: `/optchat compact on|off` (or
