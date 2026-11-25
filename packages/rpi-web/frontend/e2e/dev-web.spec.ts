@@ -1527,22 +1527,51 @@ test("the workspace exposes an installable manifest and icons", async ({
     display: string;
     start_url: string;
     scope: string;
-    icons: Array<{ src: string; sizes: string; type: string }>;
+    icons: Array<{ src: string; sizes: string; type: string; purpose: string }>;
   };
   expect(body.display).toBe("standalone");
   expect(body.start_url).toBe("/");
   expect(body.scope).toBe("/");
-  expect(body.icons.map((icon) => icon.sizes)).toEqual(
-    expect.arrayContaining(["192x192", "512x512"]),
+  expect(body.icons).toEqual(
+    expect.arrayContaining([
+      expect.objectContaining({ sizes: "192x192", purpose: "any" }),
+      expect.objectContaining({ sizes: "512x512", purpose: "any" }),
+      expect.objectContaining({ sizes: "512x512", purpose: "maskable" }),
+    ]),
+  );
+  await page.goto("/");
+  await expect(page.locator('link[rel="manifest"]')).toHaveAttribute(
+    "href",
+    "/manifest.webmanifest",
   );
   for (const icon of body.icons) {
     const response = await request.get(icon.src);
     expect(response.status(), icon.src).toBe(200);
     expect(response.headers()["content-type"], icon.src).toContain("image/png");
+    const asset = await page.evaluate(async (src) => {
+      const image = new Image();
+      image.src = src;
+      await image.decode();
+      const canvas = document.createElement("canvas");
+      canvas.width = image.naturalWidth;
+      canvas.height = image.naturalHeight;
+      const context = canvas.getContext("2d")!;
+      context.drawImage(image, 0, 0);
+      return {
+        size: `${canvas.width}x${canvas.height}`,
+        cornerAlpha: context.getImageData(0, 0, 1, 1).data[3],
+      };
+    }, icon.src);
+    expect(asset.size, icon.src).toBe(icon.sizes);
+    expect(asset.cornerAlpha, icon.src).toBe(
+      icon.purpose === "maskable" ? 255 : 0,
+    );
+    if (icon.purpose === "maskable") {
+      await expect(
+        page.locator('link[rel="apple-touch-icon"]'),
+      ).toHaveAttribute("href", icon.src);
+    }
   }
-  // The page must reference the manifest, or the browser never reads it.
-  const html = await (await page.goto("/")).text();
-  expect(html).toContain('rel="manifest"');
 });
 
 test("install entry opens the browser prompt and hides once installed", async ({
