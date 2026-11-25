@@ -903,12 +903,28 @@ impl HostSession {
         let child_owner = child::NativeChild::start(child, launch_guard);
         let diagnostics = startup::StderrCapture::start(stderr, child_owner.exit_signal());
         let mut reader = BufReader::new(stdout);
-        let timeout = Duration::from_secs(if area.is_some() { 315 } else { 15 });
+        // A first area entry may have to create the Host and its profile, so it
+        // gets a longer deadline than an ordinary child. It is still bounded:
+        // startup must fail with a message instead of hanging a Web launch.
+        let timeout = Duration::from_secs(if area.is_some() { 120 } else { 15 });
         let mut ready = match read_ready(&mut reader, timeout).await {
             Ok(ready) => ready,
             Err(error) => return Err(diagnostics.failure(error, &child_owner).await),
         };
         if area.is_some() {
+            // An installed native that predates `rpi --host` ignores the
+            // unknown flag and answers as an ordinary RPC child. Without this
+            // check the join would sit on the long area deadline and then
+            // attach a session that no Host owns, so name the real problem and
+            // stop as soon as the ready frame proves the bridge is absent.
+            if ready["sharedHostArea"].as_str().is_none() {
+                return Err(diagnostics
+                    .failure(
+                        "the configured native rpi does not support `rpi --host`; upgrade it, or start Web without --host-area".into(),
+                        &child_owner,
+                    )
+                    .await);
+            }
             let Some(id) = ready["sessionId"]
                 .as_str()
                 .filter(|id| uuid::Uuid::parse_str(id).is_ok())
