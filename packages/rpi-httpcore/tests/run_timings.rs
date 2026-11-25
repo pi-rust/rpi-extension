@@ -190,8 +190,59 @@ async fn run_timings_preserve_security_validation_and_paging() {
             "complete":true,"cursor":first["cursor"],"scannedBytes":total_bytes,"totalBytes":total_bytes
         })
     );
+    // A session-total lookup needs no entry IDs and must find runs outside
+    // the narrow per-row selection, through the same HTTP contract. It starts
+    // a fresh scan; a cursor belonging to the row scan must be rejected.
+    assert_eq!(
+        post(&url)
+            .json(&json!({"cursor":page["cursor"],"all":true}))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        409
+    );
+    let response = post(&url)
+        .json(&json!({"entryIds":[],"all":true}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    let all = response.json::<Value>().await.unwrap();
+    assert_eq!(all["complete"], false);
+    assert_ne!(all["cursor"], page["cursor"]);
+    assert_eq!(all["timings"], json!([]));
+    let response = post(&url)
+        .json(&json!({"cursor":all["cursor"],"all":true}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    assert_eq!(
+        response.json::<Value>().await.unwrap()["timings"],
+        page["timings"]
+    );
+    // A later row filter with the all-run cursor conflicts, so retry without one.
+    assert_eq!(
+        post(&url)
+            .json(&json!({"entryIds":["actual"],"cursor":all["cursor"]}))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        409
+    );
+    let response = post(&url)
+        .json(&json!({"entryIds":["actual"]}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    let row_scan = response.json::<Value>().await.unwrap();
+    assert_eq!(row_scan["complete"], false);
+
     // The 400-entry boundary is accepted, not rejected by the adapter.
-    let response = post(&url).json(&json!({"entryIds":(0..400).map(|n| n.to_string()).collect::<Vec<_>>(),"cursor":page["cursor"]})).send().await.unwrap();
+    let response = post(&url).json(&json!({"entryIds":(0..400).map(|n| n.to_string()).collect::<Vec<_>>(),"cursor":row_scan["cursor"]})).send().await.unwrap();
     assert_eq!(response.status(), 200);
     assert_eq!(
         response.json::<Value>().await.unwrap()["timings"],

@@ -128,7 +128,11 @@ import { ZoomableImage } from "./ZoomableImage";
 import { ProjectImageContext, projectImageSource } from "./projectImages";
 import { useTranscriptViewport } from "./useTranscriptViewport";
 import { restoreRowsWithNotes } from "./localNotes";
-import { useRunTimings, timingByRow } from "./useRunTimings";
+import {
+  useRunTimings,
+  useSessionRunTimings,
+  timingByRow,
+} from "./useRunTimings";
 import { groupTodoUpdates, isTodoTool } from "./todoGroups";
 import { RunElapsed } from "./RunElapsed";
 import { ExecutionTrace } from "./ExecutionTracePanel";
@@ -1280,20 +1284,29 @@ export default function App() {
   const displayedTimings = historical.active
     ? historicalRunTimings
     : runTimings;
+  // The footer totals every finished native run in the session. Per-row
+  // timing queries are limited to the visible transcript window, which can
+  // exclude all but the newest round in history views.
+  const sessionTimings = useSessionRunTimings(
+    sessionId,
+    `${connectionRevision}:${navigationRevision.current}`,
+    !loadingSession && Boolean(capabilities),
+    settleTick,
+  );
   // A missing or unsupported timing lookup is unknown, not zero work: the
   // footer shows "—" exactly like cache hit and context, and only an actually
   // recorded run can produce "0s".
   const sessionWorkMs = useMemo(
     () =>
-      displayedTimings.length
-        ? displayedTimings.reduce(
+      sessionTimings.length
+        ? sessionTimings.reduce(
             (total, timing) =>
               total +
               (Number.isFinite(timing.elapsedMs) ? timing.elapsedMs : 0),
             0,
           )
         : null,
-    [displayedTimings],
+    [sessionTimings],
   );
   const runFooters = useMemo(
     () => timingByRow(displayedRows, displayedTimings),
