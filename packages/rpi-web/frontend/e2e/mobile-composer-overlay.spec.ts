@@ -107,7 +107,7 @@ async function mockEmptySession(page: Page) {
   });
 }
 
-test("mobile composer hides the empty-state project name behind attachments", async ({
+test("mobile composer stays opaque over the empty-state copy", async ({
   browser,
 }) => {
   const context = await browser.newContext({
@@ -121,10 +121,12 @@ test("mobile composer hides the empty-state project name behind attachments", as
 
     const composerArea = page.locator(".composer-area");
     await expect(composerArea).toBeVisible();
-    await expect(page.locator(".welcome-symbol")).toBeHidden();
-    await expect(page.locator(".welcome h2")).toBeHidden();
-    await expect(page.locator(".welcome > p")).toBeHidden();
-    await expect(page.locator(".welcome .suggestions")).toBeHidden();
+    // The empty state stays meaningful on a phone: the project name, heading,
+    // description and suggestions remain in the document. The bug was that the
+    // copy showed *through* a translucent composer, not that the copy existed.
+    await expect(page.locator(".welcome h2")).toHaveCount(1);
+    await expect(page.locator(".welcome > p")).toHaveCount(1);
+    await expect(page.locator(".welcome .suggestions")).toBeVisible();
 
     const composerBackground = await composerArea.evaluate(
       (element) => getComputedStyle(element).backgroundColor,
@@ -146,9 +148,41 @@ test("mobile composer hides the empty-state project name behind attachments", as
     });
 
     await expect(page.locator(".composer-attachment")).toHaveCount(2);
-    await expect(page.locator(".welcome-symbol")).toBeHidden();
     const composerBox = await page.locator(".composer").boundingBox();
     expect(composerBox?.height).toBeGreaterThan(100);
+
+    // The composer itself must be an opaque layer: the project name behind it
+    // must not be readable through either the composer or its surrounding area.
+    for (const selector of [".composer", ".composer-area"]) {
+      const alpha = await page
+        .locator(selector)
+        .first()
+        .evaluate((element) => {
+          const value = getComputedStyle(element).backgroundColor;
+          const match = value.match(/rgba?\(([^)]+)\)/);
+          if (!match) return null;
+          const parts = match[1].split(",").map((part) => part.trim());
+          return parts.length === 4 ? Number(parts[3]) : 1;
+        });
+      expect(alpha, selector).toBe(1);
+    }
+
+    // Nothing from the empty state may be painted inside the composer's box.
+    const overlap = await page.evaluate(() => {
+      const composer = document
+        .querySelector(".composer")
+        ?.getBoundingClientRect();
+      if (!composer) return null;
+      return [".welcome-symbol", ".welcome h2", ".welcome > p"]
+        .map((selector) => document.querySelector(selector))
+        .filter((element): element is Element => Boolean(element))
+        .filter((element) => {
+          const box = element.getBoundingClientRect();
+          return box.top < composer.bottom && composer.top < box.bottom;
+        })
+        .map((element) => element.className || element.tagName);
+    });
+    expect(overlap).toEqual([]);
   } finally {
     await context.close();
   }
