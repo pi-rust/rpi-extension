@@ -772,16 +772,54 @@ impl HostSession {
         options: SessionOptions,
         fork_cut: Option<&str>,
     ) -> Result<Arc<Self>, String> {
-        let launch_guard = startup::LaunchGuard::acquire(&options)?;
-        let launch_options = options.clone();
+        Self::spawn_transport(options, fork_cut, None).await
+    }
+
+    pub(crate) async fn attach_area(
+        executable: PathBuf,
+        project: PathBuf,
+        timings_dir: PathBuf,
+        area: &str,
+    ) -> Result<Arc<Self>, String> {
+        Self::spawn_transport(
+            SessionOptions {
+                executable,
+                project,
+                session_id: String::new(),
+                session_dir: None,
+                saved_session: None,
+                fork_source: None,
+                timings_dir,
+                model: None,
+                provider: None,
+                permission_gate: false,
+                bypass: false,
+                resources: None,
+            },
+            None,
+            Some(area),
+        )
+        .await
+    }
+
+    async fn spawn_transport(
+        mut options: SessionOptions,
+        fork_cut: Option<&str>,
+        area: Option<&str>,
+    ) -> Result<Arc<Self>, String> {
+        let launch_guard = if area.is_none() {
+            Some(startup::LaunchGuard::acquire(&options)?)
+        } else {
+            None
+        };
         let resource_file = resources::StartupFile::prepare(&options).await?;
-        let session_id = &options.session_id;
-        let mut timings = crate::timing::ToolTimings::load(options.timings_dir.join(format!(
-            "{}.json",
-            options.fork_source.as_deref().unwrap_or(session_id)
-        )))?;
-        timings.set_session(session_id);
         let mut command = crate::process::background_command(&options.executable);
+        if let Some(area) = area {
+            command.arg("--host");
+            if !area.is_empty() {
+                command.arg(area);
+            }
+        }
         command.arg("--mode").arg("rpc");
         // Declare support per child, never via a process-global environment
         // mutation. Old native ignores this and advertises legacy semantics;
@@ -790,7 +828,9 @@ impl HostSession {
         if let Some(file) = &resource_file {
             command.arg(file.flag).arg(&file.path);
         }
-        if let Some(path) = &options.saved_session {
+        if area.is_some() {
+            // The area owns Session selection and all execution settings.
+        } else if let Some(path) = &options.saved_session {
             command.arg("--session").arg(path);
         } else if let Some(source) = &options.fork_source {
             command.arg("--fork").arg(source);
@@ -801,7 +841,7 @@ impl HostSession {
                 command.arg("--fork-position").arg("at");
             }
         } else {
-            command.arg("--session-id").arg(session_id);
+            command.arg("--session-id").arg(&options.session_id);
         }
         if let Some(directory) = &options.session_dir {
             command.arg("--session-dir").arg(directory);
@@ -817,10 +857,9 @@ impl HostSession {
             options.bypass,
             !options.permission_gate,
         );
-        let project = options.project;
-        let rpi_bin = options.executable;
+        let rpi_bin = &options.executable;
         command
-            .current_dir(project)
+            .current_dir(&options.project)
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped());
@@ -861,13 +900,81 @@ impl HostSession {
                 .ok_or("rpi host stderr unavailable")?,
         )
         .map_err(|e| e.to_string())?;
-        let child_owner = child::NativeChild::start(child, Some(launch_guard));
+        let child_owner = child::NativeChild::start(child, launch_guard);
         let diagnostics = startup::StderrCapture::start(stderr, child_owner.exit_signal());
         let mut reader = BufReader::new(stdout);
-        let ready = match read_ready(&mut reader, Duration::from_secs(15)).await {
+        let timeout = Duration::from_secs(if area.is_some() { 315 } else { 15 });
+        let mut ready = match read_ready(&mut reader, timeout).await {
             Ok(ready) => ready,
             Err(error) => return Err(diagnostics.failure(error, &child_owner).await),
         };
+        if area.is_some() {
+            let Some(id) = ready["sessionId"]
+                .as_str()
+                .filter(|id| uuid::Uuid::parse_str(id).is_ok())
+            else {
+                return Err(diagnostics
+                    .failure(
+                        "native area bridge did not report a Session id".into(),
+                        &child_owner,
+                    )
+                    .await);
+            };
+            if ready["hostId"]
+                .as_str()
+                .and_then(|id| uuid::Uuid::parse_str(id).ok())
+                .is_none()
+            {
+                return Err(diagnostics
+                    .failure(
+                        "native area bridge did not report a Host id".into(),
+                        &child_owner,
+                    )
+                    .await);
+            }
+            if !ready["sharedHostArea"]
+                .as_str()
+                .is_some_and(|name| !name.is_empty())
+            {
+                return Err(diagnostics
+                    .failure(
+                        "native area bridge did not report an area name".into(),
+                        &child_owner,
+                    )
+                    .await);
+            }
+            options.session_id = id.into();
+            let transcript_path = ready
+                .as_object_mut()
+                .and_then(|value| value.remove("sessionPath"));
+            options.session_dir = transcript_path
+                .as_ref()
+                .and_then(Value::as_str)
+                .map(std::path::Path::new)
+                .filter(|path| {
+                    path.is_absolute()
+                        && path.file_name().and_then(|name| name.to_str())
+                            == Some(&format!("{}.jsonl", options.session_id))
+                })
+                .and_then(|path| path.parent())
+                .map(std::path::Path::to_owned);
+            if options.session_dir.is_none() {
+                return Err(diagnostics
+                    .failure(
+                        "native area bridge did not report its transcript path".into(),
+                        &child_owner,
+                    )
+                    .await);
+            }
+        }
+        let launch_options = options;
+        let session_id = &launch_options.session_id;
+        let mut timings =
+            crate::timing::ToolTimings::load(launch_options.timings_dir.join(format!(
+                "{}.json",
+                launch_options.fork_source.as_deref().unwrap_or(session_id)
+            )))?;
+        timings.set_session(session_id);
 
         let (raw_events, _) = broadcast::channel(16_384);
         let (events, _) = broadcast::channel(512);
@@ -1438,8 +1545,24 @@ impl HostSession {
         true
     }
 
+    pub(crate) fn is_shared_area(&self) -> bool {
+        self.ready["sharedHostArea"].is_string()
+    }
+
+    pub(crate) fn area_session_dir(&self) -> Option<PathBuf> {
+        self.launch_options
+            .as_ref()
+            .filter(|_| self.is_shared_area())?
+            .session_dir
+            .clone()
+    }
+
     /// Best-effort `stop` before the registry drops this session.
     pub async fn stop(&self) {
+        if self.is_shared_area() {
+            self.runtime.closed_signal.send_replace(true);
+            return;
+        }
         if let Some(service) = self.runtime.file_io() {
             service.close();
         }

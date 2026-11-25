@@ -100,6 +100,11 @@ impl HostSession {
         Ok(observation)
     }
     pub(crate) fn resource_fence(&self) -> ResourceResult<ResourceFence> {
+        if self.is_shared_area() {
+            return Err(ResourceError::conflict(
+                "Session configuration belongs to its native Host area",
+            ));
+        }
         let admission = self
             .admission_gate
             .clone()

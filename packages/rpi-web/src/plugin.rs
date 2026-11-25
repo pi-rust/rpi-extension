@@ -61,6 +61,12 @@ fn append_service_flags(args: &mut Vec<String>) {
         flag_value("port"),
         flag_value("session-timeout"),
     ));
+    if let Some(area) = flag("host-area").filter(|value| enabled(Some(value))) {
+        args.push("--host-area".into());
+        if let Some(name) = flag_text(area) {
+            args.push(name);
+        }
+    }
 }
 
 fn service_options(
@@ -138,14 +144,14 @@ extern "C" fn start(_: StablePluginEvent, _: *mut std::ffi::c_void) -> i32 {
     };
     let mut args = args;
     append_service_flags(&mut args);
-    let mut config = match config::from_args(args) {
-        Ok(Launch::Run(config)) => *config,
-        Ok(Launch::Initialized(path)) => {
+    let (mut config, area) = match config::from_args_with_host_area(args) {
+        Ok((Launch::Run(config), area)) => (*config, area),
+        Ok((Launch::Initialized(path), _)) => {
             println!("Created {}", path.display());
             finish(0);
             return 0;
         }
-        Ok(Launch::Help) => {
+        Ok((Launch::Help, _)) => {
             println!(
                 "rpi --webserver[=CONFIG|init|help]\nAlias: --web\n{}",
                 config::HELP
@@ -153,7 +159,7 @@ extern "C" fn start(_: StablePluginEvent, _: *mut std::ffi::c_void) -> i32 {
             finish(0);
             return 0;
         }
-        Ok(Launch::Version) => {
+        Ok((Launch::Version, _)) => {
             finish(0);
             return 0;
         }
@@ -182,7 +188,7 @@ extern "C" fn start(_: StablePluginEvent, _: *mut std::ffi::c_void) -> i32 {
             .enable_all()
             .build();
         let result = match runtime {
-            Ok(runtime) => runtime.block_on(crate::server::run_until(config, async move {
+            Ok(runtime) => runtime.block_on(crate::server::run_until(config, area, async move {
                 if !*receiver.borrow_and_update() {
                     let _ = receiver.changed().await;
                 }
@@ -245,6 +251,10 @@ fn register(api: &rpi_plugin_sdk::PluginApi) -> i32 {
             StbStringRef::from_str(
                 "Web server listen address (overrides web.json), used with --webserver",
             ),
+        );
+        let _ = register_flag(
+            StbStringRef::from_str("host-area"),
+            StbStringRef::from_str("Join the native Host area, optionally passing its name"),
         );
         let _ = register_flag(
             StbStringRef::from_str("session-timeout"),

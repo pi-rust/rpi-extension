@@ -71,7 +71,11 @@ pub async fn run_timings(state: &Service, id: String, query: RunTimingsQuery) ->
         Ok(project) => project,
         Err(error) => return (ReplyKind::Unavailable, json!({"error":error})).into_reply(),
     };
-    let configured = state.config.session_dir.clone();
+    let configured = state
+        .live_session(&id)
+        .await
+        .and_then(|session| session.area_session_dir())
+        .or_else(|| state.config.session_dir.clone());
     let cache = state.run_timing_cache.clone();
     let permit = match state.run_timing_workers.clone().acquire_owned().await {
         Ok(permit) => permit,
@@ -209,6 +213,62 @@ impl Service {
             .clone()
     }
 
+    /// Join a native area using the same entry point as the terminal. This
+    /// service retains only a client to the Session selected by the Host.
+    pub async fn attach_host_area(&self, area: &str) -> Result<(), String> {
+        let _lifecycle = self.session_lifecycle.lock().await;
+        self.attach_host_area_locked(area, None).await.map(|_| ())
+    }
+
+    async fn attach_host_area_locked(
+        &self,
+        area: &str,
+        expected: Option<&str>,
+    ) -> Result<String, String> {
+        let session = HostSession::attach_area(
+            self.config.rpi_bin.clone(),
+            self.config.project.clone(),
+            self.config.registry.with_extension("tool-timings"),
+            area,
+        )
+        .await?;
+        let id = session.ready()["sessionId"]
+            .as_str()
+            .ok_or("native area did not select a Session")?
+            .to_owned();
+        if expected.is_some_and(|expected| expected != id) {
+            session.shutdown().await;
+            return Err("native area selected another Session".into());
+        }
+        let snapshot = session.snapshot().await;
+        let saved = self.registry.write().await.attach(RegistryEntry {
+            session_id: id.clone(),
+            project_id: Some(self.default_project_id.clone()),
+            title: None,
+            parent_session_id: None,
+            fork_entry_id: None,
+            relation: None,
+            created_at: snapshot.created_at,
+            updated_at: snapshot.updated_at,
+            last_turn_ended_at: None,
+        });
+        if let Err(error) = saved {
+            session.shutdown().await;
+            return Err(error);
+        }
+        let previous = self
+            .sessions
+            .write()
+            .await
+            .insert(id.clone(), session.clone());
+        if let Some(previous) = previous {
+            previous.shutdown().await;
+        }
+        self.watch_turn_ends(&id, &session);
+        self.touch_session(&id).await;
+        Ok(id)
+    }
+
     pub async fn live_session(&self, id: &str) -> Option<Arc<HostSession>> {
         self.sessions.read().await.get(id).cloned()
     }
@@ -324,6 +384,10 @@ impl Service {
             .map(|(id, session)| (id.clone(), session.clone()))
             .collect();
         futures_util::future::join_all(sessions.iter().map(|(id, session)| async move {
+            if session.is_shared_area() {
+                session.shutdown().await;
+                return;
+            }
             if let Ok(fence) = session.resource_fence() {
                 // Native runtime setters are not persisted. Only a fresh idle
                 // owned-stop capture may be replayed on a later ordinary open.
@@ -1087,6 +1151,12 @@ async fn open_session_owned(state: &Service, id: String) -> (ReplyKind, Value) {
                     "ready": snapshot.ready,
                 }),
             );
+        }
+        if let Some(area) = session.ready()["sharedHostArea"].as_str() {
+            return match state.attach_host_area_locked(area, Some(&id)).await {
+                Ok(_) => (ReplyKind::Success, json!({"sessionId":id,"status":"ready"})),
+                Err(error) => (ReplyKind::HostUnavailable, json!({"error":error})),
+            };
         }
         // The native child exited (crash, kill, or `stop`); drop the corpse so
         // the branch can be reopened from its persisted session file.
