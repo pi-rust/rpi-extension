@@ -417,40 +417,58 @@ mod tests {
         }
     }
 
+    /// Write an executable stand-in for the host binary in its own directory.
+    #[cfg(unix)]
+    fn script(name: &str, body: &str) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("{name}-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let path = dir.join("rpi");
+        std::fs::write(&path, body).expect("script");
+        let mut permissions = std::fs::metadata(&path).expect("metadata").permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&path, permissions).expect("chmod");
+        path
+    }
+
+    /// Linux reports `ETXTBSY` when another test thread forks between this
+    /// script's write and its exec. The script itself is valid, so a short
+    /// bounded retry keeps the check deterministic without hiding real spawn
+    /// failures: only the busy-exec error is retried.
+    #[cfg(unix)]
+    fn run_script(path: &PathBuf, job: &Job) -> Result<String, String> {
+        let mut delay = std::time::Duration::from_millis(10);
+        for _ in 0..40 {
+            match run(path, job) {
+                Err(error) if error.contains("Text file busy") => {
+                    std::thread::sleep(delay);
+                    delay = (delay * 2).min(std::time::Duration::from_millis(200));
+                }
+                result => return result,
+            }
+        }
+        run(path, job)
+    }
+
     #[cfg(unix)]
     #[test]
     fn a_child_that_answers_produces_a_line() {
-        use std::os::unix::fs::PermissionsExt;
-        let dir = std::env::temp_dir().join(format!("optchat-compact-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).expect("temp dir");
-        let script = dir.join("rpi");
-        std::fs::write(
-            &script,
+        let script = script(
+            "optchat-compact",
             "#!/bin/sh\ncat > /dev/null\necho '0+2|the merged line'\n",
-        )
-        .expect("script");
-        let mut permissions = std::fs::metadata(&script).expect("metadata").permissions();
-        permissions.set_mode(0o755);
-        std::fs::set_permissions(&script, permissions).expect("chmod");
-        let answer = run(&script, &job("two halves")).expect("a line");
+        );
+        let answer = run_script(&script, &job("two halves")).expect("a line");
         assert_eq!(answer, "the merged line");
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(script.parent().expect("parent"));
     }
 
     #[cfg(unix)]
     #[test]
     fn a_child_that_fails_is_reported_not_panicked() {
-        use std::os::unix::fs::PermissionsExt;
-        let dir = std::env::temp_dir().join(format!("optchat-fail-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).expect("temp dir");
-        let script = dir.join("rpi");
-        std::fs::write(&script, "#!/bin/sh\necho 'no key' >&2\nexit 3\n").expect("script");
-        let mut permissions = std::fs::metadata(&script).expect("metadata").permissions();
-        permissions.set_mode(0o755);
-        std::fs::set_permissions(&script, permissions).expect("chmod");
-        let error = run(&script, &job("two halves")).expect_err("failure");
+        let script = script("optchat-fail", "#!/bin/sh\necho 'no key' >&2\nexit 3\n");
+        let error = run_script(&script, &job("two halves")).expect_err("failure");
         assert!(error.contains("exited with"), "{error}");
         assert!(error.contains("no key"), "{error}");
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(script.parent().expect("parent"));
     }
 }
