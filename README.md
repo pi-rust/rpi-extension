@@ -60,6 +60,7 @@ contributors must open an issue before submitting a pull request.
 | [rpi-mcp-adapter](packages/rpi-mcp-adapter/README.md) | Discover/call tools and manage resources with `mcp_list`, `mcp_call`, `mcp_resource`; raw diagnostics with `mcp_request` |
 | [rpi-mcp-server](packages/rpi-mcp-server/README.md) | Publish the agent as an MCP server with `--mcp`, or run the standalone `rpi-mcp-bridge` |
 | [rpi-subagents](packages/rpi-subagents/README.md) | Delegate work with `delegate_task` |
+| [rpi-host](packages/rpi-host/README.md) | Optional source-only `host` tool for an explicitly configured shared Host: queries, submit/receipts and guarded lifecycle control; no subprocess fallback |
 | [rpi-codemode](packages/rpi-codemode/README.md) | Compose native tools with bounded JavaScript, lossless business JSON and explicit exact native-result selection within inline limits; published/prebuilt extension, requires the companion ToolProgram v1 capabilities |
 | [rpi-orchestrator](packages/rpi-orchestrator/README.md) | Bounded child agents and task graphs with `subagent`, `plan` and `dispatch` |
 | [rpi-lens](packages/rpi-lens/README.md) | Inspect code with `code_lens` |

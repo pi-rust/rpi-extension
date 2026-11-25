@@ -526,10 +526,17 @@ test("closed by default; loaded user, LLM, correlated tool and native run timing
   await expect(pane(page)).toHaveCount(0);
   await expect(toggle(page)).toHaveAttribute("aria-pressed", "false");
   await expect(toggle(page)).toHaveAttribute("title", "Execution trace");
-  await expect.poll(() => host.count(A, "run-timings/query")).toBe(1);
-  expect(host.calls.find((c) => c.kind === "run-timings/query")?.body).toEqual({
+  // Two independent readers share the endpoint: the per-row lookup keyed by the
+  // visible entry IDs, and the composer footer's session-total `{all:true}`
+  // lookup. Opening the pane must not add a third request.
+  await expect.poll(() => host.count(A, "run-timings/query")).toBe(2);
+  const timingBodies = host.calls
+    .filter((call) => call.kind === "run-timings/query")
+    .map((call) => call.body);
+  expect(timingBodies).toContainEqual({
     entryIds: [`${A}-user`, `${A}-assistant`, `${A}-result`],
   });
+  expect(timingBodies).toContainEqual({ all: true });
   // Initial diagnostics are deliberately deferred; finish them before measuring
   // whether opening the local projection itself causes another request.
   await expect.poll(() => host.count(A, "get_auth_status")).toBe(1);

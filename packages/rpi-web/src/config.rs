@@ -9,14 +9,17 @@ use std::{
 pub const HELP: &str = "rpi-web [--config PATH] [--init]
        [--project PATH] [--rpi-bin PATH] [--bind IP] [--port N]
        [--add-project PATH]... [--projects-root PATH] [--assets PATH]
-       [--session-dir PATH] [--registry PATH] [--session-timeout SECONDS] [--version]
+       [--session-dir PATH] [--registry PATH] [--session-timeout SECONDS]
+       [--host-area [NAME]] [--version]
 
 Reads ~/.rpi/agent/web.json ($RPI_CODING_AGENT_DIR/web.json), then
 <startup-project>/.rpi/web.json. A legacy ~/.rpi/web.json is read first and
 overridden by the agent-dir file.
 --config loads only the specified file. CLI options override file settings.
 --init creates a project config without overwriting an existing file.
-Paths in JSON are relative to the config file; a bare rpiBin uses PATH.";
+Paths in JSON are relative to the config file; a bare rpiBin uses PATH.
+--host-area joins the native default area, or NAME if specified (macOS).
+Use hostArea: true or hostArea: \"NAME\" in web.json. Use false for ordinary sessions.";
 
 pub const AGENT_DIR_ENV: &str = "RPI_CODING_AGENT_DIR";
 
@@ -49,6 +52,13 @@ pub enum Launch {
     Initialized(PathBuf),
 }
 
+#[derive(Deserialize, Serialize)]
+#[serde(untagged)]
+enum HostArea {
+    Default(bool),
+    Named(String),
+}
+
 #[derive(Default, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct FileConfig {
@@ -74,10 +84,18 @@ struct FileConfig {
     allowed_hosts: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     session_timeout_seconds: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    host_area: Option<HostArea>,
 }
 
 impl FileConfig {
-    fn apply(self, config: &mut AppConfig, base: &Path, home: Option<&Path>) -> Result<(), String> {
+    fn apply(
+        self,
+        config: &mut AppConfig,
+        area_selection: &mut Option<String>,
+        base: &Path,
+        home: Option<&Path>,
+    ) -> Result<(), String> {
         for (value, target) in [
             (self.project, &mut config.project),
             (self.registry, &mut config.registry),
@@ -116,6 +134,13 @@ impl FileConfig {
         }
         if let Some(port) = self.port {
             config.port = port;
+        }
+        if let Some(area) = self.host_area {
+            *area_selection = match area {
+                HostArea::Default(true) => Some(String::new()),
+                HostArea::Default(false) => None,
+                HostArea::Named(name) => Some(name),
+            };
         }
         if let Some(seconds) = self.session_timeout_seconds {
             config.session_timeout_seconds = (seconds > 0).then_some(seconds);
@@ -174,6 +199,17 @@ fn resolve_home_path(base: &Path, path: &Path, home: Option<&Path>) -> Result<Pa
 }
 
 pub fn from_args(args: impl IntoIterator<Item = String>) -> Result<Launch, String> {
+    let (launch, area) = from_args_with_host_area(args)?;
+    if area.is_some() {
+        return Err("use from_args_with_host_area for a native Host area".into());
+    }
+    Ok(launch)
+}
+
+/// Resolve ordinary Web configuration and the optional native area selection.
+pub fn from_args_with_host_area(
+    args: impl IntoIterator<Item = String>,
+) -> Result<(Launch, Option<String>), String> {
     let cwd = std::env::current_dir().map_err(|e| e.to_string())?;
     let home = std::env::var_os("USERPROFILE")
         .or_else(|| std::env::var_os("HOME"))
@@ -191,7 +227,7 @@ fn configure(
     home: Option<&Path>,
     agent_dir: Option<&Path>,
 ) -> Result<Launch, String> {
-    configure_with_agent(args, cwd, home, agent_dir)
+    configure_with_agent(args, cwd, home, agent_dir).map(|(launch, _)| launch)
 }
 
 fn configure_with_agent(
@@ -199,17 +235,25 @@ fn configure_with_agent(
     cwd: &Path,
     home: Option<&Path>,
     agent_dir: Option<&Path>,
-) -> Result<Launch, String> {
-    let mut args = args.into_iter();
+) -> Result<(Launch, Option<String>), String> {
+    let mut args = args.into_iter().peekable();
+    let mut area = None;
     let mut cli = FileConfig::default();
     let mut additional_projects = Vec::new();
     let mut explicit = None;
     let mut init = false;
     while let Some(arg) = args.next() {
         match arg.as_str() {
-            "--help" | "-h" => return Ok(Launch::Help),
-            "--version" | "-V" => return Ok(Launch::Version),
+            "--help" | "-h" => return Ok((Launch::Help, None)),
+            "--version" | "-V" => return Ok((Launch::Version, None)),
             "--init" => init = true,
+            "--host-area" => {
+                cli.host_area = Some(if args.peek().is_some_and(|name| !name.starts_with('-')) {
+                    HostArea::Named(args.next().expect("peeked area"))
+                } else {
+                    HostArea::Default(true)
+                });
+            }
             _ => {
                 if ![
                     "--config",
@@ -269,7 +313,7 @@ fn configure_with_agent(
             project: startup,
             ..AppConfig::default()
         };
-        cli.apply(&mut config, cwd, home)?;
+        cli.apply(&mut config, &mut area, cwd, home)?;
         config.projects.extend(additional_projects);
         let seed = FileConfig {
             project: Some(if explicit.is_none() {
@@ -287,6 +331,13 @@ fn configure_with_agent(
             registry: (config.registry != rpi_extcore::registry::default_path())
                 .then_some(config.registry),
             allowed_hosts: None,
+            host_area: area.map(|area| {
+                if area.is_empty() {
+                    HostArea::Default(true)
+                } else {
+                    HostArea::Named(area)
+                }
+            }),
             session_timeout_seconds: (config.session_timeout_seconds != Some(30 * 60))
                 .then_some(config.session_timeout_seconds.unwrap_or_default()),
         };
@@ -310,30 +361,31 @@ fn configure_with_agent(
             .write_all(&bytes)
             .and_then(|_| output.write_all(b"\n"))
             .map_err(|e| format!("{}: {e}", file.display()))?;
-        return Ok(Launch::Initialized(file));
+        return Ok((Launch::Initialized(file), None));
     }
     let mut config = AppConfig {
         project: cwd.to_path_buf(),
         ..AppConfig::default()
     };
     if let Some(path) = explicit {
-        load(&path, &mut config, true, home)?;
+        load(&path, &mut config, &mut area, true, home)?;
     } else {
         for global in global_config_paths(agent_dir, home) {
             if global != local {
-                load(&global, &mut config, false, home)?;
+                load(&global, &mut config, &mut area, false, home)?;
             }
         }
-        load(&local, &mut config, false, home)?;
+        load(&local, &mut config, &mut area, false, home)?;
     }
-    cli.apply(&mut config, cwd, home)?;
+    cli.apply(&mut config, &mut area, cwd, home)?;
     config.projects.extend(additional_projects);
-    Ok(Launch::Run(Box::new(config)))
+    Ok((Launch::Run(Box::new(config)), area))
 }
 
 fn load(
     path: &Path,
     config: &mut AppConfig,
+    area: &mut Option<String>,
     required: bool,
     home: Option<&Path>,
 ) -> Result<(), String> {
@@ -346,6 +398,7 @@ fn load(
         .map_err(|e| format!("{}: {e}", path.display()))?;
     file.apply(
         config,
+        area,
         path.parent().ok_or("config requires a parent directory")?,
         home,
     )
@@ -396,6 +449,28 @@ mod tests {
                 .starts_with("rpi-web-config-"));
             let _ = std::fs::remove_dir_all(&self.0);
         }
+    }
+
+    #[test]
+    fn native_host_area_requires_opt_in_and_respects_precedence() {
+        let f = Fixture::new();
+        let launch = |args: &[&str]| {
+            configure_with_agent(
+                args.iter().map(|arg| arg.to_string()),
+                &f.0.join("work"),
+                Some(&f.0.join("home")),
+                Some(&f.0.join("home/.rpi/agent")),
+            )
+            .unwrap()
+            .1
+        };
+        assert_eq!(launch(&[]), None);
+        f.write("home/.rpi/agent/web.json", r#"{"hostArea":"work"}"#);
+        assert_eq!(launch(&[]).as_deref(), Some("work"));
+        f.write("work/.rpi/web.json", r#"{"hostArea":false}"#);
+        assert_eq!(launch(&[]), None);
+        assert_eq!(launch(&["--host-area"]).as_deref(), Some(""));
+        assert_eq!(launch(&["--host-area", "other"]).as_deref(), Some("other"));
     }
 
     #[test]

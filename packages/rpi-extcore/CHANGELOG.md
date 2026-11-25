@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.17](https://github.com/pi-rust/rpi-extension/compare/rpi-extcore-v0.2.16...rpi-extcore-v0.2.17) - 2026-11-25
+
+### Added
+
+- *(web)* fork from assistant message action ([#62](https://github.com/pi-rust/rpi-extension/pull/62))
+
+### Fixed
+
+- *(extcore)* retain native launch ownership through startup cleanup ([#50](https://github.com/pi-rust/rpi-extension/pull/50))
+
 ### Fixed
 
 - *(web)* reclaim hosts stuck in `awaiting_input` on an unanswered dialog: after the full idle budget with no requests, the reaper cancels projected dialogs through the normal `ui_dialog_response` path so the plugin settles its tool call and a later pass can close the host. Running operations are never interrupted.

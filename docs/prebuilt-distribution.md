@@ -182,9 +182,14 @@ triple and the archive slug.
 When manually dispatched on `main`, the release workflow prepares versions and
 changelogs, synchronizes the catalog, runs tests and Cargo publishing preflight,
 and opens and squash-merges a PR containing the tested release metadata. It never pushes
-directly to protected `main`. The repository must allow Actions to create PRs;
-the version PR is merged only when branch protection permits it. If approval or
-required checks are added later, merge that PR through the normal review flow
+directly to protected `main`. The repository must allow Actions to create PRs.
+Because the required `require-issue` context only starts after the PR exists, the
+workflow waits up to 20 minutes for that check to report success before merging
+(`RELEASE_REQUIRED_CHECK` and `RELEASE_CHECK_TIMEOUT_SECONDS` override the
+context and the bound). A failing or timed-out check ends the run without a
+merge and leaves the version PR open, so merge it or rerun on a later `main`.
+If approval or additional required checks are added later, merge that PR
+through the normal review flow
 and rerun the release workflow on `main`. The comparison checkout uses the newest
 stable `rpi-web-v*` tag reachable from the current commit and no newer than the
 manifest version. A merged but unpublished version therefore compares against

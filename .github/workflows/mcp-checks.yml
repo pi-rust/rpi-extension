@@ -7,6 +7,7 @@ on:
       - 'packages/rpi-mcp-adapter/**'
       - 'packages/rpi-mcp-server/**'
       - 'packages/rpi-extcore/**'
+      - 'packages/rpi-host/**'
       - 'packages/rpi-acp/**'
       - 'packages/rpi-http/**'
       - 'packages/rpi-httpcore/**'
@@ -49,6 +50,11 @@ jobs:
         run: |
           cargo fmt --check -p rpi-mcp-core -p rpi-mcp-adapter -p rpi-extcore -p rpi-acp
           rustfmt --edition 2021 --check packages/rpi-mcp-core/src/configured_http_tests.rs packages/rpi-mcp-adapter/src/http_tests.rs packages/rpi-extcore/src/external_tools.rs packages/rpi-extcore/src/external_tools_tests.rs packages/rpi-extcore/src/external_tools_host_tests.rs packages/rpi-acp/src/protocol_mcp_tests.rs packages/rpi-extcore/src/session_catalog_tests.rs packages/rpi-acp/src/protocol_session_list_tests.rs packages/rpi-acp/src/session_list_tests.rs packages/rpi-acp/src/session_list_fixture_tests.rs
+      - name: Test shared Host management plugin
+        run: |
+          cargo fmt --check -p rpi-host
+          cargo test --locked -p rpi-host --lib
+          python -c "import ast,pathlib; ast.parse(pathlib.Path('packages/rpi-host/tests/native_errors.py').read_text(encoding='utf-8'))"
       - name: Test bounded native-header catalog completion and ACP discovery fixtures
         # session_catalog includes deterministic post-result worker-exit gates;
         # fixture qualification is not a real-native smoke or deployment.

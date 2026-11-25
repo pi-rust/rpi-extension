@@ -128,7 +128,11 @@ import { ZoomableImage } from "./ZoomableImage";
 import { ProjectImageContext, projectImageSource } from "./projectImages";
 import { useTranscriptViewport } from "./useTranscriptViewport";
 import { restoreRowsWithNotes } from "./localNotes";
-import { useRunTimings, timingByRow } from "./useRunTimings";
+import {
+  useRunTimings,
+  useSessionRunTimings,
+  timingByRow,
+} from "./useRunTimings";
 import { groupTodoUpdates, isTodoTool } from "./todoGroups";
 import { RunElapsed } from "./RunElapsed";
 import { ExecutionTrace } from "./ExecutionTracePanel";
@@ -1286,20 +1290,29 @@ export default function App() {
   const displayedTimings = historical.active
     ? historicalRunTimings
     : runTimings;
+  // The footer totals every finished native run in the session. Per-row
+  // timing queries are limited to the visible transcript window, which can
+  // exclude all but the newest round in history views.
+  const sessionTimings = useSessionRunTimings(
+    sessionId,
+    `${connectionRevision}:${navigationRevision.current}`,
+    !loadingSession && Boolean(capabilities),
+    settleTick,
+  );
   // A missing or unsupported timing lookup is unknown, not zero work: the
   // footer shows "—" exactly like cache hit and context, and only an actually
   // recorded run can produce "0s".
   const sessionWorkMs = useMemo(
     () =>
-      displayedTimings.length
-        ? displayedTimings.reduce(
+      sessionTimings.length
+        ? sessionTimings.reduce(
             (total, timing) =>
               total +
               (Number.isFinite(timing.elapsedMs) ? timing.elapsedMs : 0),
             0,
           )
         : null,
-    [displayedTimings],
+    [sessionTimings],
   );
   const runFooters = useMemo(
     () => timingByRow(displayedRows, displayedTimings),
@@ -2702,22 +2715,6 @@ export default function App() {
         if (preference) {
           const { thinkingLevel, ...model } = preference;
           const hasModel = Boolean(preference.provider && preference.modelId);
-          // The saved level belongs to the saved model. Apply the model first,
-          // then its level, so a restored default is a consistent pair.
-          if (hasModel) {
-            try {
-              await commandData(created.sessionId, "set_model", { ...model });
-              rememberSessionRuntime(created.sessionId, {
-                provider: model.provider,
-                modelId: model.modelId,
-              });
-            } catch {
-              setModelPreferenceFailures((previous) => ({
-                ...previous,
-                [created.sessionId]: `${preference.provider}/${preference.modelId}`,
-              }));
-            }
-          }
           if (thinkingLevel) {
             try {
               await commandData(created.sessionId, "set_thinking_level", {
@@ -2730,6 +2727,20 @@ export default function App() {
               setThinkingPreferenceFailures((previous) => ({
                 ...previous,
                 [created.sessionId]: thinkingLevel,
+              }));
+            }
+          }
+          if (hasModel) {
+            try {
+              await commandData(created.sessionId, "set_model", { ...model });
+              rememberSessionRuntime(created.sessionId, {
+                provider: model.provider,
+                modelId: model.modelId,
+              });
+            } catch {
+              setModelPreferenceFailures((previous) => ({
+                ...previous,
+                [created.sessionId]: `${preference.provider}/${preference.modelId}`,
               }));
             }
           }
@@ -6104,7 +6115,6 @@ export default function App() {
               language={language}
               creating={creatingSession}
               canManage={actions.has("session_organization")}
-              canFork={actions.has("fork")}
               canClone={actions.has("clone")}
               canCreate={actions.has("create_project")}
               onSelectProject={selectProject}
@@ -6112,7 +6122,6 @@ export default function App() {
               onNewSession={(id) => void createSession(id)}
               onNewProject={() => setProjectDialog(true)}
               onRename={setRenameTarget}
-              onFork={(session) => void forkSession(session)}
               onClone={(session) => void cloneSession(session)}
               onBulkMetadata={(entries, patch) =>
                 bulkSessionMetadata(entries, patch)
@@ -7370,19 +7379,6 @@ export default function App() {
                 )
               }
               preference={readModelPreference(projectId)}
-              onSaveDefault={(selected, thinkingLevel) => {
-                writeModelPreference(projectId, {
-                  provider: selected.provider,
-                  modelId: selected.id,
-                  thinkingLevel,
-                });
-                setModelPreferenceRevision((value) => value + 1);
-                note(
-                  language === "zh"
-                    ? `默认模型和思考深度 → ${selected.name} (${selected.provider}) / ${thinkingLevel}`
-                    : `Default model and thinking level → ${selected.name} (${selected.provider}) / ${thinkingLevel}`,
-                );
-              }}
               onClearModelPreference={() => {
                 const previous = readModelPreference(projectRef.current);
                 writeModelPreference(
@@ -8632,7 +8628,6 @@ function RuntimePanel({
   onModelSelected,
   onThinkingSelected,
   preference,
-  onSaveDefault,
   onClearModelPreference,
   onClearThinkingPreference,
   details,
@@ -8650,7 +8645,6 @@ function RuntimePanel({
   onModelSelected: ModelSelected;
   onThinkingSelected: (level: string) => void;
   preference: ModelPreference | null;
-  onSaveDefault: (model: ModelDescriptor, thinkingLevel: string) => void;
   onClearModelPreference: () => void;
   onClearThinkingPreference: () => void;
   details?: ReactNode;
@@ -8661,11 +8655,6 @@ function RuntimePanel({
     translate(language, key, values);
   const [models, setModels] = useState<ModelDescriptor[]>([]);
   const [levels, setLevels] = useState<string[]>([]);
-  const [defaultModelId, setDefaultModelId] = useState("");
-  const [defaultThinkingLevel, setDefaultThinkingLevel] = useState("");
-  // The pickers seed from the saved pair, but a choice the user has started
-  // must survive catalog refreshes (runtime model changes, thinking changes).
-  const defaultTouched = useRef(false);
   const context = runtime?.context ?? null;
   const [catalog, setCatalog] = useState<ToolCatalog | null>(null);
   const [providersOpen, setProvidersOpen] = useState(false);
@@ -8680,9 +8669,6 @@ function RuntimePanel({
     setPending("");
     setModels([]);
     setLevels([]);
-    setDefaultModelId("");
-    setDefaultThinkingLevel("");
-    defaultTouched.current = false;
     setCatalog(null);
     return () => {
       mounted.current = false;
@@ -8725,30 +8711,6 @@ function RuntimePanel({
     };
   }, [onError, sessionId, supported, runtime?.modelId, runtime?.provider]);
 
-  // Seed the default pair from what this browser remembers, once per session
-  // and after an explicit save. A catalog refresh must not overwrite a choice
-  // the user has already made but not yet saved.
-  useEffect(() => {
-    if (defaultTouched.current) return;
-    const remembered = models.find(
-      (entry) =>
-        entry.id === preference?.modelId &&
-        entry.provider === preference?.provider,
-    );
-    setDefaultModelId(remembered ? modelKey(remembered) : "");
-    setDefaultThinkingLevel(
-      preference?.thinkingLevel && levels.includes(preference.thinkingLevel)
-        ? preference.thinkingLevel
-        : "",
-    );
-  }, [
-    models,
-    levels,
-    preference?.provider,
-    preference?.modelId,
-    preference?.thinkingLevel,
-  ]);
-
   async function run(
     label: string,
     action: () => Promise<RuntimeState | void>,
@@ -8778,11 +8740,6 @@ function RuntimePanel({
       entry.id === runtime?.modelId && entry.provider === runtime?.provider,
   );
   const level = normalizeLevel(runtime?.thinkingLevel);
-  const defaultModel = models.find(
-    (entry) => modelKey(entry) === defaultModelId,
-  );
-  const canSaveDefault =
-    Boolean(defaultModel && defaultThinkingLevel) && pending === "";
   const active = new Set(catalog?.activeTools ?? runtime?.activeTools ?? []);
   const heading = (
     <div className="panel-heading">
@@ -8837,76 +8794,8 @@ function RuntimePanel({
       </button>
       <p className="muted">
         {zh
-          ? "默认模型与思考档位会一起保存，仅用于此浏览器的未来新会话；已有会话不变。请确认两项都可选后再保存。"
-          : "Save a default model and thinking level together for future new sessions only in this browser; existing sessions are unchanged. Confirm both choices are available before saving."}
-        {defaultModel && defaultThinkingLevel && (
-          <>
-            {" "}
-            {defaultModel.provider}/{defaultModel.id}:{defaultThinkingLevel}
-          </>
-        )}
-      </p>
-      <label htmlFor="default-model">{zh ? "默认模型" : "Default model"}</label>
-      <MenuSelect
-        label={zh ? "默认模型" : "Default model"}
-        value={defaultModelId}
-        disabled={
-          !supported.has("set_model") || pending !== "" || models.length === 0
-        }
-        onChange={(value) => {
-          defaultTouched.current = true;
-          setDefaultModelId(value);
-        }}
-        options={[
-          { value: "", label: "—" },
-          ...models.map((entry) => ({
-            value: modelKey(entry),
-            label: `${entry.name} (${entry.provider})`,
-          })),
-        ]}
-      />
-      <label htmlFor="default-thinking">
-        {zh ? "默认思考深度" : "Default thinking level"}
-      </label>
-      <MenuSelect
-        label={zh ? "默认思考深度" : "Default thinking level"}
-        value={defaultThinkingLevel}
-        disabled={
-          !supported.has("set_thinking_level") ||
-          pending !== "" ||
-          levels.length === 0
-        }
-        onChange={(value) => {
-          defaultTouched.current = true;
-          setDefaultThinkingLevel(value);
-        }}
-        options={[
-          { value: "", label: "—" },
-          ...levels.map((entry) => ({
-            value: entry,
-            label: valueLabel(language, entry),
-          })),
-        ]}
-      />
-      <button
-        type="button"
-        disabled={!canSaveDefault}
-        onClick={() => {
-          if (!defaultModel || !defaultThinkingLevel) return;
-          onSaveDefault(defaultModel, defaultThinkingLevel);
-          // The saved pair is now the source of truth again, so a later
-          // catalog refresh may re-seed the pickers from it.
-          defaultTouched.current = false;
-        }}
-      >
-        {zh
-          ? "保存默认模型和思考深度"
-          : "Save default model and thinking level"}
-      </button>
-      <p className="muted">
-        {zh
-          ? "当前会话显式选择的模型会单独记住，仅用于未来新会话；已有会话不变。"
-          : "Explicit model choices are remembered individually for future new sessions only; existing sessions are unchanged."}
+          ? "成功选择的模型会在此浏览器中按项目记住，仅用于未来新会话；已有会话不变。"
+          : "Successful model choices are remembered in this browser per project for future new sessions only; existing sessions are unchanged."}
         {preference?.provider && preference.modelId && (
           <>
             {" "}
@@ -8987,8 +8876,8 @@ function RuntimePanel({
       />
       <p className="muted">
         {zh
-          ? "当前会话显式选择的思考深度会单独记住，仅用于未来新会话；已有会话不变。"
-          : "Explicit thinking level choices are remembered individually for future new sessions only; existing sessions are unchanged."}
+          ? "成功选择的思考深度会在此浏览器中按项目记住，仅用于未来新会话；已有会话不变。"
+          : "Successful thinking level choices are remembered in this browser per project for future new sessions only; existing sessions are unchanged."}
         {preference?.thinkingLevel ? (
           <> {valueLabel(language, preference.thinkingLevel)}</>
         ) : null}

@@ -10,8 +10,5 @@
     "userId": {"type":"string","description":"Optional list-only user filter; ignored by create. Sent directly in the query string without URL encoding; use a query-safe value."},
     "limit": {"type":"integer","minimum":1,"maximum":100,"description":"List-only page size, clamped to 1..100 by execution. If omitted, no limit is sent (server default); does not auto-paginate."},
     "page": {"type":"integer","minimum":1,"description":"List-only page number, floored at 1 by execution. If omitted, no page is sent (server default)."}
-  },
-  "allOf": [
-    {"if":{"properties":{"action":{"const":"create"}}},"then":{"required":["name","value","traceId"]}}
-  ]
+  }
 }

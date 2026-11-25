@@ -1,0 +1,551 @@
+{
+  "schema_version": 1,
+  "task": 61,
+  "recorded_at_utc": "2026-11-24T00:58:58.268803+00:00",
+  "status": "clippy_clean_and_scoped_regressions_pass_full_library_tests_not_green",
+  "core_artifact": {
+    "path": "/Users/bigfish/work/rpi-projects/pi-rust-wt-host/target/debug/rpi",
+    "profile": "dev/debug",
+    "sha256": "48835ce2ac25d300ceafc67bf448b8c1cf70760325580ba98b341ff9817b592a",
+    "built_this_followup": true
+  },
+  "management_artifact": {
+    "path": "/Users/bigfish/work/rpi-projects/rpi-extension-wt-host/target/release/librpi_host.dylib",
+    "profile": "release",
+    "sha256": "b21e7dfe0b7626014d9d39021fbf753570e2d3e24a3bc56b4b8c7cd075b2d477",
+    "reused_unchanged_from_result_interface_validation": true
+  },
+  "clippy": {
+    "command": "cargo clippy -p rpi-cli --lib --no-deps --locked --offline -j 2 -- -D warnings",
+    "exit_code": 0,
+    "remaining_diagnostics": 0,
+    "new_allow_or_expect_attributes": 0
+  },
+  "formatting": {
+    "rust_files": 34,
+    "scoped_rustfmt_check": true,
+    "skip_children": true,
+    "both_worktree_diff_checks": true
+  },
+  "core_library_tests": {
+    "command": "cargo test -p rpi-cli --lib --locked --offline -j 2 -- --test-threads=2",
+    "environment": {
+      "TMPDIR": "/private/tmp",
+      "CARGO_HOME": "read from /tmp/rpi-host-integration-checks/cargo-home.path",
+      "CARGO_TARGET_DIR": "/Users/bigfish/work/rpi-projects/pi-rust-wt-host/target"
+    },
+    "exit_code": 101,
+    "passed": 1529,
+    "failed": 4,
+    "ignored": 3,
+    "filtered_out": 0,
+    "failed_cases": [
+      "prebuilt_extensions::tests::all_six_distributions_install_and_record_exact_provenance",
+      "prebuilt_extensions::tests::downloaded_manifest_and_archive_install_into_an_isolated_profile",
+      "prebuilt_extensions::tests::legacy_archives_install_only_the_library_and_keep_their_records_unchanged",
+      "prebuilt_extensions::tests::prebuilt_packages_upgrade_without_force_and_same_version_is_unchanged"
+    ],
+    "ignored_cases": [
+      "interactive_tui::tests::monitor_function_key_works_with_a_draft_without_changing_text",
+      "prebuilt_release::tests::live_github_release_download_and_exact_version_validation",
+      "session::goal_outbox_smoke_tests::native_goal_outbox_smoke"
+    ],
+    "module_counts": {
+      "host::": {
+        "ok": 284
+      },
+      "config::": {
+        "ok": 37
+      },
+      "install::": {
+        "ok": 39
+      },
+      "interactive_tui::": {
+        "ok": 389,
+        "ignored": 1
+      },
+      "modes::": {
+        "ok": 79
+      },
+      "native_durable::": {
+        "ok": 62
+      },
+      "rpc::": {
+        "ok": 81
+      },
+      "prebuilt_extensions::": {
+        "FAILED": 4,
+        "ok": 21
+      }
+    },
+    "all_tests_green": false
+  },
+  "signature_fixture_investigation": {
+    "prebuilt_tests_source_unchanged": true,
+    "resign_staged_native_function_unchanged": true,
+    "full_before_source_test_run": false,
+    "scope": "Independent reproduction of the unchanged 128-byte header fixture and unchanged system signing command; not a full before-source baseline run.",
+    "reproductions": [
+      {
+        "target_arch": "aarch64",
+        "fixture_bytes": 128,
+        "fixture_sha256": "2624d1998fd4a71a4b84bd92d70fba7fdf6f38cca6064c2055e67635d8fc5c1e",
+        "exit_code": 1,
+        "diagnostic": "object file format unrecognized, invalid, or unsuitable"
+      },
+      {
+        "target_arch": "x86_64",
+        "fixture_bytes": 128,
+        "fixture_sha256": "7f58b6b57e9ef6e33f8c7231b4859fc7589cf618b97f24bbeeb76c75d39f538f",
+        "exit_code": 1,
+        "diagnostic": "object file format unrecognized, invalid, or unsuitable"
+      }
+    ]
+  },
+  "management_unit_tests": {
+    "passed": 19,
+    "failed": 0,
+    "ignored": 0
+  },
+  "sdk_shared_host_unit_tests": {
+    "passed": 24,
+    "failed": 0,
+    "ignored": 0,
+    "other_tests_filtered": 358
+  },
+  "sdk_real_daemon_test": {
+    "passed": 1,
+    "failed": 0,
+    "ignored": 0,
+    "explicit_binary": true,
+    "claim": "authenticated read-only SDK transport to a real foreground fixture Host, not DLL/Agent/Provider execution"
+  },
+  "native_results": {
+    "passed": true,
+    "checks": [
+      "real_running_native_run",
+      "exact_utf8_multipage_answer",
+      "wrong_run_and_invalid_offsets_rejected",
+      "duplicate_and_result_queries_do_not_replay",
+      "same_request_id_is_agent_scoped",
+      "old_answer_is_not_current_session_tip",
+      "real_provider_failure_outcome",
+      "real_running_cancel_then_aborted_outcome",
+      "crash_restart_unknown_without_replay"
+    ],
+    "management_tool_calls": 31,
+    "native_provider_calls": 6,
+    "fixture_only_expected_sigkill": true,
+    "fixture_only_stale_socket_cleanup_after_reaping": true,
+    "result_reads_use_tool_only_no_jsonl_inspection": true,
+    "all_fixture_resources_joined": true
+  },
+  "native_errors": {
+    "passed": true,
+    "cases": [
+      {
+        "name": "native_status_success",
+        "peer": "native",
+        "passed": true
+      },
+      {
+        "name": "native_agent_not_found",
+        "peer": "native",
+        "passed": true
+      },
+      {
+        "name": "local_missing_config",
+        "peer": "missing_config",
+        "passed": true
+      },
+      {
+        "name": "query_disconnected",
+        "peer": "closed",
+        "passed": true
+      },
+      {
+        "name": "mutation_reply_lost",
+        "peer": "closed",
+        "passed": true
+      },
+      {
+        "name": "native_receipt_uncertain_projection",
+        "peer": "uncertain",
+        "passed": true
+      },
+      {
+        "name": "query_envelope_overflow",
+        "peer": "large",
+        "passed": true
+      },
+      {
+        "name": "mutation_envelope_overflow",
+        "peer": "large",
+        "passed": true
+      },
+      {
+        "name": "v1_4_result_capability_not_sent",
+        "peer": "unsupported_results",
+        "passed": true
+      },
+      {
+        "name": "result_reply_lost_is_query_failure",
+        "peer": "result_closed",
+        "passed": true
+      }
+    ],
+    "all_fixture_processes_and_threads_reaped": true,
+    "claim": "native Host cases and authenticated fault peers are distinct; fault peers do not prove native durable commits"
+  },
+  "native_smokes": [
+    {
+      "passed": true,
+      "administrative": false,
+      "management_tool_calls": 7,
+      "native_provider_calls": 1,
+      "operations": [
+        "inspect",
+        "list",
+        "receipt",
+        "status",
+        "submit"
+      ],
+      "binary_sha256": "48835ce2ac25d300ceafc67bf448b8c1cf70760325580ba98b341ff9817b592a",
+      "plugin_sha256": "b21e7dfe0b7626014d9d39021fbf753570e2d3e24a3bc56b4b8c7cd075b2d477"
+    },
+    {
+      "passed": true,
+      "administrative": true,
+      "management_tool_calls": 21,
+      "native_provider_calls": 1,
+      "operations": [
+        "administrative_cancel",
+        "administrative_close",
+        "administrative_create",
+        "administrative_receipt",
+        "administrative_restore",
+        "administrative_stop",
+        "inspect",
+        "list",
+        "profiles",
+        "receipt",
+        "status",
+        "submit"
+      ],
+      "binary_sha256": "48835ce2ac25d300ceafc67bf448b8c1cf70760325580ba98b341ff9817b592a",
+      "plugin_sha256": "b21e7dfe0b7626014d9d39021fbf753570e2d3e24a3bc56b4b8c7cd075b2d477"
+    }
+  ],
+  "input_integrity": {
+    "core": {
+      "baseline_files": 1144,
+      "unchanged_existing_files": 1110,
+      "changed_existing_files": [
+        "crates/rpi-cli/src/app.rs",
+        "crates/rpi-cli/src/args.rs",
+        "crates/rpi-cli/src/cdn.rs",
+        "crates/rpi-cli/src/config.rs",
+        "crates/rpi-cli/src/export.rs",
+        "crates/rpi-cli/src/host/ordinary/mod.rs",
+        "crates/rpi-cli/src/host/ordinary/supervisor.rs",
+        "crates/rpi-cli/src/install.rs",
+        "crates/rpi-cli/src/interactive_tui.rs",
+        "crates/rpi-cli/src/interactive_tui/autocomplete.rs",
+        "crates/rpi-cli/src/interactive_tui/commands.rs",
+        "crates/rpi-cli/src/interactive_tui/history/experimental_durable_tests.rs",
+        "crates/rpi-cli/src/interactive_tui/history/native_durable_tests.rs",
+        "crates/rpi-cli/src/interactive_tui/panels.rs",
+        "crates/rpi-cli/src/interactive_tui/pet.rs",
+        "crates/rpi-cli/src/interactive_tui/run.rs",
+        "crates/rpi-cli/src/interactive_tui/selectors.rs",
+        "crates/rpi-cli/src/interactive_tui/sessions.rs",
+        "crates/rpi-cli/src/interactive_tui/settings.rs",
+        "crates/rpi-cli/src/interactive_tui/side_questions.rs",
+        "crates/rpi-cli/src/interactive_tui/tests.rs",
+        "crates/rpi-cli/src/interactive_tui/tests/session_regressions.rs",
+        "crates/rpi-cli/src/message_agent.rs",
+        "crates/rpi-cli/src/modes.rs",
+        "crates/rpi-cli/src/modes/native_durable_shutdown_tests.rs",
+        "crates/rpi-cli/src/native_durable/human.rs",
+        "crates/rpi-cli/src/packages.rs",
+        "crates/rpi-cli/src/remote/session.rs",
+        "crates/rpi-cli/src/rpc/prompt_content.rs",
+        "crates/rpi-cli/src/rpc/protocol.rs",
+        "crates/rpi-cli/src/session.rs",
+        "crates/rpi-cli/src/session_gc.rs",
+        "crates/rpi-cli/src/themes.rs",
+        "crates/rpi-cli/src/updates.rs"
+      ],
+      "missing_existing_files": []
+    },
+    "extension": {
+      "baseline_files": 821,
+      "unchanged_existing_files": 821,
+      "changed_existing_files": [],
+      "missing_existing_files": []
+    }
+  },
+  "four_contracts_byte_identical": [
+    {
+      "file": "protocol.rs",
+      "sha256": "920a93636c7e87c5a9c7053557e9f044f6030327c0be9466ec274e34ce4721e0"
+    },
+    {
+      "file": "client.rs",
+      "sha256": "55cb9897c61594dc554baddcc06dc80dcf88d11458b1a14fff1bc137c5d9e97a"
+    },
+    {
+      "file": "client_tests.rs",
+      "sha256": "8df4c991962ddf635b34e7dd67d9821ee3b59f411104b42e1898d2f6433759ae"
+    },
+    {
+      "file": "fixtures/control-v1.json",
+      "sha256": "33560f0b5d074b7822710493f7bcb16bec21c63ba5237629db4765bb25dab320"
+    }
+  ],
+  "source_changes": [
+    {
+      "file": "crates/rpi-cli/src/app.rs",
+      "before_sha256": "93bda15dc8edffa7b969446c2b80ac7fd19d8919e363f83ed5cfa910f3d6483b",
+      "after_sha256": "2dc5621367bf2cad7413f293176642ede57114b35e2b0e0a5bee3241412cf4df"
+    },
+    {
+      "file": "crates/rpi-cli/src/args.rs",
+      "before_sha256": "47c4fce9acd347c7cb3afb849b4449993fef8f8de24475334c8841f6a0aae583",
+      "after_sha256": "b4ecc2f0886a74735a98a9c21da6e5deb27f73a1b75208d8d392cc8c58f56c85"
+    },
+    {
+      "file": "crates/rpi-cli/src/cdn.rs",
+      "before_sha256": "15cc043db17f766671a613c65a05022498501a51eb58b51e5e3713e27e9a60bb",
+      "after_sha256": "6f88100fcc673fbded260ef2d6c8c27840085e80ba242eeab5cbb85d2e4b93d9"
+    },
+    {
+      "file": "crates/rpi-cli/src/config.rs",
+      "before_sha256": "046360a8803726bda3f112c5b1fbe726faeb1fbaa7b78e755761469db5099e7e",
+      "after_sha256": "62dd1f58f8171c50499f7e6a125eb954ada87968cbabed16338a13e3f9bd3e5a"
+    },
+    {
+      "file": "crates/rpi-cli/src/export.rs",
+      "before_sha256": "590fd59f7e78ba124522abd885256f35537a4aa6b1b485d4aea80c86101e2163",
+      "after_sha256": "56a4aa5a089d7646f9f83bc299db7beb0f7ed70e22dd93f54a86edf76c09a16d"
+    },
+    {
+      "file": "crates/rpi-cli/src/host/ordinary/mod.rs",
+      "before_sha256": "b3af947feba88fbd67cfdad203cf2426f9484488c076e9cee25644316753fbf9",
+      "after_sha256": "646f9acf551d95e137369e65171af9e9acfc3be9d606a43a5e24a3555d3b21ff"
+    },
+    {
+      "file": "crates/rpi-cli/src/host/ordinary/supervisor.rs",
+      "before_sha256": "432be98d6c4ed9ee714c358f101978c8c19cbd7a8a8e0a4e75aeb5c6c2e029d4",
+      "after_sha256": "627f3b07be62f79dc48c86c7da80ab5aacee0a9afaf254ae52c23e1e1b58ad17"
+    },
+    {
+      "file": "crates/rpi-cli/src/install.rs",
+      "before_sha256": "1b8918bbec9eb81e29a40c48578eb55b9eb92283c78cc53b2d4ae461145f2e59",
+      "after_sha256": "02a08f54cb9fad73d0b2f0965db93c9751f8b7cc324b1430d3e22ec43d34d9e0"
+    },
+    {
+      "file": "crates/rpi-cli/src/interactive_tui/autocomplete.rs",
+      "before_sha256": "c7e64cf50d310e393d2cf140c1f0718cbf70d01263118383cf46a7f8e793748a",
+      "after_sha256": "ad90b76f827d00fb760ce5474ecd5415e30fe9128e04f381f8eb5e7458c98984"
+    },
+    {
+      "file": "crates/rpi-cli/src/interactive_tui/commands.rs",
+      "before_sha256": "b081c967be7dff754d35ea16d4d8f73712586bef48e7bac81a3439cdaad8a333",
+      "after_sha256": "d1bfd283dee8154f0527770b7fa817c73bc3efba8691b1b8b3476c7fd905a7f0"
+    },
+    {
+      "file": "crates/rpi-cli/src/interactive_tui/history/experimental_durable_tests.rs",
+      "before_sha256": "ebd2ae978a1cd89467330e48b69185ccaa98a5a3800f8ab6a3455e95764891bd",
+      "after_sha256": "be8d6c5e2785bd764b2e67842763115e7c7f1788363ef6cd6c1010a569eb751d"
+    },
+    {
+      "file": "crates/rpi-cli/src/interactive_tui/history/native_durable_tests.rs",
+      "before_sha256": "3ed2b7ad162984501845dbb103a291e7098ebb061dd072e304ead4f70930cc45",
+      "after_sha256": "c3c537366c47a5592446ff1791c26be2f0305eff5dbde0b786634a2cd998d813"
+    },
+    {
+      "file": "crates/rpi-cli/src/interactive_tui/panels.rs",
+      "before_sha256": "07f6174a73feb87bffaef0809dab383664d44151a414b5ef5d2351bdab341ff7",
+      "after_sha256": "7b02b80e624960b0204c78455601a0f4bae4fa44e79d35d5186980c2a37fcba0"
+    },
+    {
+      "file": "crates/rpi-cli/src/interactive_tui/pet.rs",
+      "before_sha256": "cb126eb48860621bf479569069b4d07fb9b18ba86a4750003aeb2149f15ed8ec",
+      "after_sha256": "15fbdfe524982eb334c8dd7f8193750d69071ebb73fde11e7ced3ac9bd9c0af3"
+    },
+    {
+      "file": "crates/rpi-cli/src/interactive_tui/run.rs",
+      "before_sha256": "38e8ff5f2c4efa06e38d00ce6adcdecbf18511ea5b92d663aa597b1a70c8211b",
+      "after_sha256": "2300bbd1d8ae6b50de7a961315108d1958be244bf56e069e6bd067984b6795e5"
+    },
+    {
+      "file": "crates/rpi-cli/src/interactive_tui/selectors.rs",
+      "before_sha256": "c2a74bddbd6a26e1c1e067b061f8d38150ef9bf10aed7ccfb952e7f272d32ee3",
+      "after_sha256": "641d151e89b7fa9387fdcb0b105bbcfe5c440cceb66625b361ff8ce228ae45e9"
+    },
+    {
+      "file": "crates/rpi-cli/src/interactive_tui/sessions.rs",
+      "before_sha256": "61eda3dcedab0ea13d0e3bacc7986dcaaf1de7e9e58570e140a0634706ba6a9e",
+      "after_sha256": "35dca67c12620797caa40eeeab424941b3b36a1006e0dc24418dd0018e3d4b6a"
+    },
+    {
+      "file": "crates/rpi-cli/src/interactive_tui/settings.rs",
+      "before_sha256": "c2f325f66ca91d074256ed4b0fb0c726a3f5c105a8fee45ecaff65cad37985ba",
+      "after_sha256": "26e82db3b91aa657c648799985276882d3baa6a1af207118c30a7260d58045b0"
+    },
+    {
+      "file": "crates/rpi-cli/src/interactive_tui/side_questions.rs",
+      "before_sha256": "475418e79db91722aba0ec88b403d55a23dadb4458c4c17cbe470558d25991e1",
+      "after_sha256": "e5f90c4ff7f5014d5b4adf4104781041174d0358fad52553fa88767cf42d7435"
+    },
+    {
+      "file": "crates/rpi-cli/src/interactive_tui/tests/session_regressions.rs",
+      "before_sha256": "e6e0d847d6fe82ba91d9ff2b471f41a439f3eb86e97e4183a9d7897465d9960d",
+      "after_sha256": "800acc019f8baf617d354d28a8a5eaf4b97915d04cde09326762121e5894f901"
+    },
+    {
+      "file": "crates/rpi-cli/src/interactive_tui/tests.rs",
+      "before_sha256": "60d2fcf52a1f80d212280c2a7ad38007760f5faa290459f7efa9845639153935",
+      "after_sha256": "53f8179d5d1057a0bcfdf327ac53db2ffac4e64259ff4c2948430e08fdf8e455"
+    },
+    {
+      "file": "crates/rpi-cli/src/interactive_tui.rs",
+      "before_sha256": "79e479e5830bc22e756a37d9656bd56b38ad9961cc950095809baa6f672b33c7",
+      "after_sha256": "e88ba8ee77dfed10e16546c13b1266cfe32b1bbd408f5ce3e372f20c4e1dff9c"
+    },
+    {
+      "file": "crates/rpi-cli/src/message_agent.rs",
+      "before_sha256": "8f5824ae6a81d1ad7bbae60b70e1605333942a7935c91e880a8bea8970871f72",
+      "after_sha256": "5e795a5e053a48604b82a0168dbaee2cc428be11a8e7355032d353ecb052405f"
+    },
+    {
+      "file": "crates/rpi-cli/src/modes/native_durable_shutdown_tests.rs",
+      "before_sha256": "bbbe56c8020371164534c72ef2d9c72088823891db406d06f3ea8d40b9202c90",
+      "after_sha256": "fb289182ff17dac94a6ade47e31a1fcc62424b7fd831afc3484ea64add46cef1"
+    },
+    {
+      "file": "crates/rpi-cli/src/modes.rs",
+      "before_sha256": "b5ea0b5067fd1704b4a7015e9791c27c8401ab4cae134df6c882836c1e58e089",
+      "after_sha256": "57903f7606f2645e742569bb0b5927fd02b73e1687b75b475c8f0a0cc16f25e2"
+    },
+    {
+      "file": "crates/rpi-cli/src/native_durable/human.rs",
+      "before_sha256": "6d0684d15fa14b402fd54933fcf6571b4c1434dff88a9f0fa9f2cffbcab9c4d3",
+      "after_sha256": "9e877e8e0957b90c3e95355f97e8086aa2ca9d25aed7f738d88c8cd66b92e074"
+    },
+    {
+      "file": "crates/rpi-cli/src/packages.rs",
+      "before_sha256": "83297c73b07d05386b0b60b6ede6f4451144d3eb5b54d9e50eef28a7c19ec5bf",
+      "after_sha256": "61c6d1f868ab505bb1f9a36100b2178e0fc432a7bc92128a9b127a9ae09e66cc"
+    },
+    {
+      "file": "crates/rpi-cli/src/remote/session.rs",
+      "before_sha256": "f7d6f90ffa44af320b2ff07163baf6bb7770c11a14a01581fafd24347138b1ff",
+      "after_sha256": "43bfe0bf33264da5ebe9548469ee66f8d55ab115881c7d05920699857201ffd7"
+    },
+    {
+      "file": "crates/rpi-cli/src/rpc/prompt_content.rs",
+      "before_sha256": "57a4ec31633f24f9c80e916c0cb208a120d0b67901bbcb786fa0af53d7910875",
+      "after_sha256": "a3cd5d42420472428b1e08bb549e35c0a1958644512bed51115389920fe386cf"
+    },
+    {
+      "file": "crates/rpi-cli/src/rpc/protocol.rs",
+      "before_sha256": "38103a4f21ab4a7036cb5c2b656fd8a0324d036da7224826eda8d0a20264fe3e",
+      "after_sha256": "c5c814c089af0cf6755271e10724decec8905cfde45f7d2f47dab5246598ed9b"
+    },
+    {
+      "file": "crates/rpi-cli/src/session.rs",
+      "before_sha256": "dd0ed1870ca87948fc2566d8cd701489ab8a8b62a7bacf7ec7e65c9c65beb594",
+      "after_sha256": "8ff47a217ad0fde4920d305ac997fa853b962efab65541bf1221543ea1d96e77"
+    },
+    {
+      "file": "crates/rpi-cli/src/session_gc.rs",
+      "before_sha256": "37c2b01e5559c0b606fec782e7360ea7b83a88c3b76458863ec34b93345176af",
+      "after_sha256": "d544ffe06ec19f17f52f3f41abaec586b187ef894b9810571c38744c6b87fcf4"
+    },
+    {
+      "file": "crates/rpi-cli/src/themes.rs",
+      "before_sha256": "2a739a85227cebf97dd3c614d215a8e754a34eb57d1ee633074c203affbdc14e",
+      "after_sha256": "98651c29e405bbb726ab4caf6e3a07818f1b877b99754278a9ebfe59df5b7439"
+    },
+    {
+      "file": "crates/rpi-cli/src/updates.rs",
+      "before_sha256": "1de694cf71f8b8cd935da747512927f943199c94d254af8146f4ae061f7c1cde",
+      "after_sha256": "6505fef4861341e1c11c48dcc81fef95c5c6a056c1196d8299602f5c7394ba96"
+    }
+  ],
+  "before_input_manifest_sha256": "8f470a09b78bc7ee9254b24b3e7a62031cf132d81980a5a224ae2634bf419965",
+  "logs": {
+    "core-clippy-55-final.log": {
+      "local_path": "/tmp/rpi-host-integration-checks/core-clippy-55-final.log",
+      "sha256": "b82ab3c0e235134e02e2170da208750d3e6e537b5f1afa52fa5bda6ff4bd3d1c"
+    },
+    "core-clippy-55-build.log": {
+      "local_path": "/tmp/rpi-host-integration-checks/core-clippy-55-build.log",
+      "sha256": "3c6c4febf1f05e67275bba140adf26ae8e900674aa9be7d91377788d086e7934"
+    },
+    "core-clippy-55-unit-final.log": {
+      "local_path": "/tmp/rpi-host-integration-checks/core-clippy-55-unit-final.log",
+      "sha256": "eba3c971cb1919cd475a4b720254e3b328a2ff94f8aef9b99c6317f16af61523"
+    },
+    "core-clippy-55-native-results.log": {
+      "local_path": "/tmp/rpi-host-integration-checks/core-clippy-55-native-results.log",
+      "sha256": "973d943038317e52d1f16aec8a6a6ef99c3563f35e87c97ca72fb1d12ffaef0c"
+    },
+    "core-clippy-55-native-results.json": {
+      "local_path": "/tmp/rpi-host-integration-checks/core-clippy-55-native-results.json",
+      "sha256": "5d0dc36cfb04beebeec25234182aa5e2ecb2b3edd2f28f101bab2e6bf8ead2fc"
+    },
+    "core-clippy-55-native-errors.log": {
+      "local_path": "/tmp/rpi-host-integration-checks/core-clippy-55-native-errors.log",
+      "sha256": "521472942fe00f40fcea80a50b43bf21549911ef8ee9fcf48e2bec6f31b59baf"
+    },
+    "core-clippy-55-native-errors.json": {
+      "local_path": "/tmp/rpi-host-integration-checks/core-clippy-55-native-errors.json",
+      "sha256": "c3a26d98c9f94c2a1011a4bca7ebecba520ccc254c3eebd5bf5aab21f3cc7630"
+    },
+    "core-clippy-55-smoke.log": {
+      "local_path": "/tmp/rpi-host-integration-checks/core-clippy-55-smoke.log",
+      "sha256": "14fba7cc73d2f7331fd9fac3ea283d47a8bcd349e7f6bca10a6de999a6270b55"
+    },
+    "core-clippy-55-smoke-admin.log": {
+      "local_path": "/tmp/rpi-host-integration-checks/core-clippy-55-smoke-admin.log",
+      "sha256": "2aa5d96015d9c22c64cdc834b54f643f86bbbc6775f392738126767c1b28ceae"
+    },
+    "core-clippy-55-management-unit.log": {
+      "local_path": "/tmp/rpi-host-integration-checks/core-clippy-55-management-unit.log",
+      "sha256": "6a26576c38640f009918298d37c439d8dbc1bbb00be317520182b94d6bdd9f18"
+    },
+    "core-clippy-55-contract-unit.log": {
+      "local_path": "/tmp/rpi-host-integration-checks/core-clippy-55-contract-unit.log",
+      "sha256": "f4754c34282c094b022e895ddc52442630bf1cc4bb96f2d36f8ca44f0d17450a"
+    },
+    "core-clippy-55-sdk-daemon.log": {
+      "local_path": "/tmp/rpi-host-integration-checks/core-clippy-55-sdk-daemon.log",
+      "sha256": "d2acd9c3feab3ad95c1fdc338671f56dccbbc0b4f44c781b58e9bc0ca933f61d"
+    },
+    "core-clippy-55-signature-fixture.json": {
+      "local_path": "/tmp/rpi-host-integration-checks/core-clippy-55-signature-fixture.json",
+      "sha256": "e793a273c00e05c55d7efccc6dc0f805f34141d7db6a74ccb2f1df42af66a9a8"
+    }
+  },
+  "excluded_diagnostic_attempts": [
+    {
+      "log": "core-clippy-55-unit.log",
+      "reason": "initial foreground timeout was followed by an incomplete cargoc-wrapper process check; overlapping attempts shared a log; not used for final test-case evidence"
+    },
+    {
+      "log": "core-clippy-55-unit-clean.log",
+      "reason": "direct binary attempt omitted Cargo test cwd/TMPDIR environment and produced 122 environment/cascade failures; not used as acceptance evidence; the final Cargo invocation restored the documented environment and independently reported 1529/4/3"
+    }
+  ],
+  "limits": [
+    "No full before-source library test execution was performed; the four signing failures were independently reproduced with the unchanged fixture bytes and unchanged signing command.",
+    "No signing bypass, new skip, lint waiver, memory benchmark, install, release, commit or production service registration.",
+    "No all-target, full-workspace, MSRV-toolchain or cross-platform success claim.",
+    "No default Host, production plugin assembly, automatic group recovery or daemon feature expansion; task 56 and other earlier work remain open.",
+    "Unknown tool side effects are not exactly-once; cancellation fixture is not proof of arbitrary tool-descendant settlement."
+  ],
+  "historical_evidence_rewritten": false
+}
