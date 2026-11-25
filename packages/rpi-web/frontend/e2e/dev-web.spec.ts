@@ -1225,6 +1225,111 @@ test("fork is available from a session context menu", async ({ page }) => {
   await expect.poll(() => forkBody).toEqual({ title: "Design fork" });
 });
 
+test("session menu uses clone wording and icon for the clone action", async ({
+  page,
+}) => {
+  await mockHost(page);
+  let cloneBody: { title?: string } | undefined;
+  await page.route("**/api/v1/sessions/session-1/clone", async (route) => {
+    cloneBody = route.request().postDataJSON();
+    return route.fulfill({
+      status: 201,
+      json: {
+        sessionId: "clone-session",
+        sourceSessionId: sessionId,
+        status: "ready",
+      },
+    });
+  });
+  await page.goto("/");
+  await clickRowAction(page, "Session actions: Mock session");
+  await expect(
+    page.getByRole("menuitem", { name: "Fork", exact: true }),
+  ).toBeVisible();
+  const clone = page.getByRole("menuitem", { name: "Clone", exact: true });
+  await expect(clone).toBeVisible();
+  await expect(clone.locator("svg.lucide-copy")).toHaveCount(1);
+  await clone.click();
+  const dialog = page.getByRole("dialog", {
+    name: "Name the cloned session",
+    exact: true,
+  });
+  await dialog.getByRole("textbox").fill("Design clone");
+  await dialog.getByRole("button", { name: "Submit", exact: true }).click();
+  await expect.poll(() => cloneBody).toEqual({ title: "Design clone" });
+});
+
+test("multi-select session actions pin and archive in bulk", async ({
+  page,
+}) => {
+  await mockHost(page, { additionalSessions: 2 });
+  await page.goto("/");
+  await clickRowAction(page, "Session actions: Mock session");
+  await page
+    .getByRole("menuitem", { name: "Multi-select", exact: true })
+    .first()
+    .click();
+  const selectionBar = page.locator(".session-selection-bar");
+  await expect(selectionBar).toContainText("1 selected");
+  await expect(page.getByRole("checkbox")).toHaveCount(3);
+  const secondCheckbox = page.getByRole("checkbox", {
+    name: "Select session: Recent session 1",
+  });
+  await expect(secondCheckbox).toHaveAttribute("aria-checked", "false");
+  await secondCheckbox.click();
+  await expect(selectionBar).toContainText("2 selected");
+
+  await page.getByRole("button", { name: "Pin", exact: true }).click();
+  await expect(page.locator(".project-session .lucide-pin")).toHaveCount(2);
+  await expect(page.locator(".session-selection-bar")).toHaveCount(0);
+  await expect(page.getByRole("checkbox")).toHaveCount(0);
+
+  await clickRowAction(page, "Session actions: Mock session");
+  await page
+    .getByRole("menuitem", { name: "Multi-select", exact: true })
+    .first()
+    .click();
+  await page.getByRole("button", { name: "Select all", exact: true }).click();
+  await expect(selectionBar).toContainText("3 selected");
+  await page.getByRole("button", { name: "Archive", exact: true }).click();
+  await expect(page.locator(".session-selection-bar")).toHaveCount(0);
+  await expect(page.getByRole("checkbox")).toHaveCount(0);
+  await expect(
+    page.getByRole("button", { name: "Show projects", exact: true }),
+  ).toBeVisible();
+});
+
+test("multi-select session actions delete sessions in bulk", async ({
+  page,
+}) => {
+  await mockHost(page, { additionalSessions: 2 });
+  await page.goto("/");
+  await clickRowAction(page, "Session actions: Mock session");
+  await page
+    .getByRole("menuitem", { name: "Multi-select", exact: true })
+    .first()
+    .click();
+  await page
+    .getByRole("checkbox", { name: "Select session: Recent session 1" })
+    .click();
+  await expect(page.locator(".session-selection-bar")).toContainText(
+    "2 selected",
+  );
+  await page
+    .getByRole("button", { name: "Delete permanently", exact: true })
+    .click();
+  const confirm = page.getByRole("dialog", {
+    name: "Delete selected sessions permanently",
+  });
+  await expect(confirm).toContainText("2 selected sessions");
+  await confirm
+    .getByRole("button", { name: "Delete permanently", exact: true })
+    .click();
+  await expect(page.locator(".session-selection-bar")).toHaveCount(0);
+  await expect(page.getByRole("checkbox")).toHaveCount(0);
+  await expect(page.locator(".project-session")).toHaveCount(1);
+});
+
 test("recent chats stay inline as a scrollable sidebar list", async ({
   page,
 }) => {
@@ -5259,7 +5364,11 @@ test.describe("mobile fork regression", () => {
   const forkError = "Mock fork failed without changing the selection";
   const toolbarFork = (page: Page) => page.locator(".toolbar-fork");
   const messageFork = (page: Page) =>
-    page.locator(".message.assistant .message-actions").last().locator("button").nth(1);
+    page
+      .locator(".message.assistant .message-actions")
+      .last()
+      .locator("button")
+      .nth(1);
   const historyFork = (page: Page) =>
     page.locator(".history-actions button").first();
   const titleDialog = (page: Page) =>
@@ -8786,6 +8895,7 @@ test("mobile composer footer keeps model picker usable beside session metrics", 
   ).toContainText("129k / 227k");
   await expect(metrics.getByLabel(/^Cache hit:/)).toBeVisible();
   await expect(metrics.getByLabel(/^Cache hit: 20%$/)).toBeVisible();
+  await expect(metrics.getByLabel(/^Session work:/)).toBeVisible();
   await expect(metrics.getByRole("button", { name: "details" })).toBeVisible();
   expect(
     await metrics.evaluate(
@@ -8800,7 +8910,7 @@ test("mobile composer footer keeps model picker usable beside session metrics", 
 
   for (const width of [320, 375, 390]) {
     await page.setViewportSize({ width, height: 844 });
-    await expect(metrics.locator(".composer-metric")).toHaveCount(2);
+    await expect(metrics.locator(".composer-metric")).toHaveCount(3);
     const layout = await metrics.evaluate((element) => {
       const tops = Array.from(
         element.querySelectorAll(".composer-metric"),
@@ -10346,6 +10456,76 @@ test.describe("run timing regressions", () => {
       }),
     );
   }
+
+  test("composer footer totals all native run durations in metric order", async ({
+    page,
+  }) => {
+    await mockHost(page);
+    await history(page, [
+      { role: "user", entryId: "work-prompt", content: "Do work" },
+      finalMessage("work-final", "Worked"),
+    ]);
+    await page.route(timingRoute, (route) =>
+      route.fulfill({
+        json: timingPage([
+          nativeTiming("work-final", "work-run-1", "completed", 138_000),
+          nativeTiming("work-final", "work-run-2", "failed", 2_000),
+        ]),
+      }),
+    );
+    await page.goto("/");
+    const metrics = page.locator(".composer-metrics.slim-metrics");
+    await expect(
+      metrics.getByLabel("Session work: 2m 20s", { exact: true }),
+    ).toContainText("2m 20s");
+    const labels = await metrics
+      .locator(".composer-metric")
+      .evaluateAll((nodes) =>
+        nodes.map((node) => node.getAttribute("aria-label")?.split(":")[0]),
+      );
+    expect(labels).toEqual(["Cache hit", "Context", "Session work"]);
+    await chooseLanguage(page, "zh");
+    await expect(
+      metrics.getByLabel("会话工作时长: 2m 20s", { exact: true }),
+    ).toBeVisible();
+  });
+
+  test("composer footer shows unknown work when native timings are unavailable", async ({
+    page,
+  }) => {
+    await mockHost(page);
+    await history(page, [finalMessage()]);
+    await page.route(timingRoute, (route) =>
+      route.fulfill({ status: 501, json: { error: "unsupported" } }),
+    );
+    await page.goto("/");
+    const metrics = page.locator(".composer-metrics.slim-metrics");
+    await expect(metrics.getByLabel(/^Cache hit:/)).toBeVisible();
+    // Unknown is not zero: an unavailable lookup must not claim the agent did
+    // no work, so the metric reads exactly like the other unknown metrics.
+    await expect(
+      metrics.getByLabel("Session work: —", { exact: true }),
+    ).toContainText("—");
+  });
+
+  test("composer footer keeps a recorded zero-work session at zero", async ({
+    page,
+  }) => {
+    await mockHost(page);
+    await history(page, [finalMessage("zero-final", "Nothing to do")]);
+    await page.route(timingRoute, (route) =>
+      route.fulfill({
+        json: timingPage([
+          nativeTiming("zero-final", "zero-run", "completed", 0),
+        ]),
+      }),
+    );
+    await page.goto("/");
+    const metrics = page.locator(".composer-metrics.slim-metrics");
+    await expect(
+      metrics.getByLabel("Session work: 0s", { exact: true }),
+    ).toContainText("0s");
+  });
 
   test("run elapsed history attaches once after the final projected row and survives reload", async ({
     page,
@@ -18867,4 +19047,137 @@ test("mobile composer keeps Enter and Shift+Enter as newlines", async ({
   await expect.poll(() => prompts).toBe(1);
   await expect(input).toHaveValue("");
   await context.close();
+});
+
+test("startup auto-archives stale sessions by last completed turn", async ({
+  page,
+}) => {
+  const now = Date.now();
+  const sessions = [
+    {
+      ...session,
+      sessionId: "stale-chat",
+      title: "Stale chat",
+      lastTurnEndedAt: now - 20 * 86_400_000,
+    },
+    {
+      ...session,
+      sessionId: "recent-chat",
+      title: "Recent chat",
+      lastTurnEndedAt: now - 2 * 86_400_000,
+    },
+  ];
+  const archived: string[] = [];
+  await page.addInitScript(() => {
+    localStorage.setItem("rpi-web-language", "en");
+    localStorage.setItem(
+      "rpi-session-auto-archive",
+      JSON.stringify({ enabled: true, days: 15 }),
+    );
+  });
+  await mockHost(page, { additionalSessions: 0 });
+  await page.route("**/api/v1/sessions", async (route: Route) => {
+    if (route.request().method() === "GET")
+      return route.fulfill({ json: { sessions } });
+    return route.fallback();
+  });
+  await page.route(/\/sessions\/[^/]+\/metadata$/, async (route: Route) => {
+    const id = new URL(route.request().url()).pathname.split("/")[4];
+    archived.push(id);
+    return route.fallback();
+  });
+  await page.goto("/?session=recent-chat");
+  await expect.poll(() => archived).toEqual(["stale-chat"]);
+  await expect(page.locator(".toolbar .breadcrumb h1")).toHaveText(
+    "Recent chat",
+  );
+});
+
+test("settings replace shortcut hints with session auto-archive controls", async ({
+  page,
+}) => {
+  await page.addInitScript(() => {
+    localStorage.setItem("rpi-web-language", "zh");
+  });
+  await mockHost(page);
+  await page.goto("/");
+  await expect(
+    page.getByRole("button", { name: "新建会话", exact: false }).first(),
+  ).toBeVisible();
+  await page.keyboard.press("Control+,");
+  const settings = page.getByRole("dialog");
+  await expect(settings).toBeVisible();
+  await expect(
+    settings.getByText("自动会话归档", { exact: true }),
+  ).toBeVisible();
+  const enabled = settings.getByLabel("开启", { exact: true });
+  await expect(enabled).toBeChecked();
+  const days = settings.getByLabel("未发生交互天数", { exact: true });
+  await expect(days).toHaveValue("15");
+  await expect(days).toHaveAttribute("min", "1");
+  await expect(days).toHaveAttribute("max", "90");
+  await expect(settings.getByText("Ctrl / ⌘ N")).toHaveCount(0);
+  await days.fill("120");
+  await days.blur();
+  await expect(days).toHaveValue("90");
+  await days.fill("0");
+  await days.blur();
+  await expect(days).toHaveValue("1");
+  await expect(
+    page.evaluate(() =>
+      JSON.parse(localStorage.getItem("rpi-session-auto-archive") ?? "null"),
+    ),
+  ).resolves.toEqual({ enabled: true, days: 1 });
+});
+
+test("changing auto-archive settings never re-runs startup or moves the chat", async ({
+  page,
+}) => {
+  await page.addInitScript(() => {
+    localStorage.setItem("rpi-web-language", "en");
+  });
+  // A stale session is present, so a re-run of the boot sweep would issue a
+  // second metadata write and could move the selected chat.
+  const now = Date.now();
+  const stale = {
+    ...session,
+    sessionId: "stale-chat",
+    title: "Stale chat",
+    lastTurnEndedAt: now - 20 * 86_400_000,
+  };
+  const sessionMutations: string[] = [];
+  await mockHost(page);
+  await page.route("**/api/v1/sessions", async (route: Route) => {
+    if (route.request().method() === "GET")
+      return route.fulfill({ json: { sessions: [session, stale] } });
+    sessionMutations.push(`${route.request().method()} /sessions`);
+    return route.fallback();
+  });
+  await page.route(/\/sessions\/[^/]+\/metadata$/, (route: Route) => {
+    sessionMutations.push("metadata");
+    return route.fallback();
+  });
+  await page.goto("/");
+  const heading = page.locator(".toolbar .breadcrumb h1");
+  await expect(heading).toHaveText("Mock session");
+  await expect.poll(() => sessionMutations.length).toBe(1);
+  const afterStartup = [...sessionMutations];
+
+  await page.keyboard.press("Control+,");
+  const settings = page.getByRole("dialog");
+  const days = settings.getByLabel("Days without interaction");
+  await days.fill("3");
+  await days.blur();
+  await page.keyboard.press("Escape");
+  await expect(page.getByRole("dialog")).toHaveCount(0);
+
+  // The preference is stored, the boot sweep did not run a second time, and
+  // the restored chat is still the same one.
+  await expect(
+    page.evaluate(() =>
+      JSON.parse(localStorage.getItem("rpi-session-auto-archive") ?? "null"),
+    ),
+  ).resolves.toEqual({ enabled: true, days: 3 });
+  await expect(heading).toHaveText("Mock session");
+  expect(sessionMutations).toEqual(afterStartup);
 });

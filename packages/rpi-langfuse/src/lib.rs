@@ -3173,6 +3173,10 @@ mod tests {
         for (name, description, parameters) in schemas {
             let schema: Value = serde_json::from_str(parameters).unwrap();
             assert_eq!(schema["type"], "object", "{name}");
+            // Gateways can reject conditional rules even for non-strict tools.
+            for keyword in ["allOf", "if", "then", "else"] {
+                assert!(schema.get(keyword).is_none(), "{name}.{keyword}");
+            }
             // Do not close the envelope: the host may inject __rpi.
             assert_ne!(schema["additionalProperties"], false, "{name}");
             assert!(schema
@@ -3190,47 +3194,26 @@ mod tests {
     }
 
     #[test]
-    fn manual_registration_schemas_match_action_requirements_and_limits() {
+    fn manual_registration_schemas_match_action_defaults_and_limits() {
         let schemas = manual_tool_schemas();
         let score: Value = serde_json::from_str(schemas[0].2).unwrap();
         assert_eq!(score["properties"]["action"]["default"], "create");
-        assert_eq!(
-            score["allOf"][0]["then"]["required"],
-            json!(["name", "value", "traceId"])
-        );
-        // The condition deliberately has no required:[action], so omission also
-        // selects create/get rather than bypassing the runtime's default action.
-        assert!(score["allOf"][0]["if"].get("required").is_none());
-        assert_eq!(
-            score["allOf"][0]["if"]["properties"]["action"]["const"],
-            "create"
-        );
+        assert!(score.get("required").is_none());
         let prompt: Value = serde_json::from_str(schemas[1].2).unwrap();
         assert_eq!(prompt["required"], json!(["name"]));
-        assert_eq!(prompt["allOf"][0]["then"]["required"], json!(["prompt"]));
-        assert_eq!(
-            prompt["allOf"][0]["if"]["properties"]["action"]["const"],
-            "create"
-        );
         assert_eq!(prompt["properties"]["action"]["default"], "create");
         assert_eq!(
             prompt["properties"]["action"]["enum"],
             json!(["create", "get", "list"])
         );
-        assert!(prompt["allOf"][0]["if"].get("required").is_none());
         let trace: Value = serde_json::from_str(schemas[2].2).unwrap();
         assert_eq!(trace["properties"]["action"]["default"], "get");
-        assert_eq!(trace["allOf"][0]["then"]["required"], json!(["id"]));
-        assert_eq!(
-            trace["allOf"][0]["if"]["properties"]["action"]["const"],
-            "get"
-        );
+        assert!(trace.get("required").is_none());
         assert_eq!(trace["properties"]["limit"]["maximum"], 1000);
         assert_eq!(
             trace["properties"]["action"]["enum"],
             json!(["get", "list"])
         );
-        assert!(trace["allOf"][0]["if"].get("required").is_none());
         assert_eq!(
             score["properties"]["action"]["enum"],
             json!(["create", "list"])

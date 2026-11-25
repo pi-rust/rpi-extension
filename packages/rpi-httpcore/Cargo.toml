@@ -9,7 +9,7 @@ repository.workspace = true
 description = "HTTP and SSE protocol adapter library for the shared rpi extension core"
 
 [dependencies]
-rpi-extcore = { path = "../rpi-extcore", version = "0.2.16" }
+rpi-extcore = { path = "../rpi-extcore", version = "0.2.17" }
 rpi-node-core = { path = "../rpi-node-core", version = "0.1.0" }
 rpi-tts = { path = "../rpi-tts", version = "0.1.17" }
 serde.workspace = true

@@ -47,6 +47,7 @@ import {
   Sparkles,
   SquarePen,
   Sun,
+  Timer,
   Volume2,
   VolumeX,
   X,
@@ -73,6 +74,15 @@ import {
   writeSessionRuntimePreference,
   type SessionRuntimeChoice,
 } from "./sessionRuntimePreference";
+import {
+  MAX_SESSION_AUTO_ARCHIVE_DAYS,
+  MIN_SESSION_AUTO_ARCHIVE_DAYS,
+  normalizeSessionAutoArchiveDays,
+  readSessionAutoArchivePreference,
+  staleSessionIds,
+  writeSessionAutoArchivePreference,
+  type SessionAutoArchivePreference,
+} from "./sessionAutoArchive";
 import { ResourcePanel } from "./ResourcePanel";
 import { useTheme } from "./useTheme";
 import { useHistoricalMessages } from "./useHistoricalMessages";
@@ -304,7 +314,7 @@ type TextRequest =
       message?: string;
       defaultValue?: string;
     }
-  | { kind: "confirm"; title: string; message: string };
+  | { kind: "confirm"; title: string; message: string; confirmLabel?: string };
 type SlashCommand = {
   name: string;
   usage: string;
@@ -484,6 +494,18 @@ function formatTokens(value: number) {
   if (value >= 1_000)
     return `${(value / 1_000).toFixed(value >= 10_000 ? 0 : 1)}k`;
   return String(Math.round(value));
+}
+
+/** Compact tabular duration for the footer, e.g. 2m 18s or 1h 01m. */
+function formatRunDuration(value: number) {
+  if (!Number.isFinite(value) || value <= 0) return "0s";
+  const seconds = Math.floor(value / 1000);
+  const hours = Math.floor(seconds / 3600);
+  const minutes = Math.floor(seconds / 60) % 60;
+  if (hours > 0) return `${hours}h ${String(minutes).padStart(2, "0")}m`;
+  if (minutes > 0)
+    return `${minutes}m ${String(seconds % 60).padStart(2, "0")}s`;
+  return `${seconds}s`;
 }
 
 function statNumber(
@@ -816,6 +838,13 @@ export default function App() {
   const [deletePending, setDeletePending] = useState(false);
   const deleteInFlight = useRef(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
+  const [autoArchive, setAutoArchive] = useState<SessionAutoArchivePreference>(
+    readSessionAutoArchivePreference,
+  );
+  // The startup sweep reads the preference once, through a ref: a settings
+  // change must not re-run session bootstrap or move the restored chat.
+  const autoArchiveRef = useRef(autoArchive);
+  autoArchiveRef.current = autoArchive;
   /** Preview restored from `?file=…`; the dialog itself keeps the URL current. */
   const [linkedPreview, setLinkedPreview] = useState<ProjectFileLink | null>(
     null,
@@ -1250,6 +1279,21 @@ export default function App() {
   const displayedTimings = historical.active
     ? historicalRunTimings
     : runTimings;
+  // A missing or unsupported timing lookup is unknown, not zero work: the
+  // footer shows "—" exactly like cache hit and context, and only an actually
+  // recorded run can produce "0s".
+  const sessionWorkMs = useMemo(
+    () =>
+      displayedTimings.length
+        ? displayedTimings.reduce(
+            (total, timing) =>
+              total +
+              (Number.isFinite(timing.elapsedMs) ? timing.elapsedMs : 0),
+            0,
+          )
+        : null,
+    [displayedTimings],
+  );
   const runFooters = useMemo(
     () => timingByRow(displayedRows, displayedTimings),
     [displayedRows, displayedTimings],
@@ -2640,6 +2684,22 @@ export default function App() {
         if (preference) {
           const { thinkingLevel, ...model } = preference;
           const hasModel = Boolean(preference.provider && preference.modelId);
+          // The saved level belongs to the saved model. Apply the model first,
+          // then its level, so a restored default is a consistent pair.
+          if (hasModel) {
+            try {
+              await commandData(created.sessionId, "set_model", { ...model });
+              rememberSessionRuntime(created.sessionId, {
+                provider: model.provider,
+                modelId: model.modelId,
+              });
+            } catch {
+              setModelPreferenceFailures((previous) => ({
+                ...previous,
+                [created.sessionId]: `${preference.provider}/${preference.modelId}`,
+              }));
+            }
+          }
           if (thinkingLevel) {
             try {
               await commandData(created.sessionId, "set_thinking_level", {
@@ -2652,20 +2712,6 @@ export default function App() {
               setThinkingPreferenceFailures((previous) => ({
                 ...previous,
                 [created.sessionId]: thinkingLevel,
-              }));
-            }
-          }
-          if (hasModel) {
-            try {
-              await commandData(created.sessionId, "set_model", { ...model });
-              rememberSessionRuntime(created.sessionId, {
-                provider: model.provider,
-                modelId: model.modelId,
-              });
-            } catch {
-              setModelPreferenceFailures((previous) => ({
-                ...previous,
-                [created.sessionId]: `${preference.provider}/${preference.modelId}`,
               }));
             }
           }
@@ -2706,6 +2752,9 @@ export default function App() {
       /* optional display preference */
     }
   }, [toolNameMode]);
+  useEffect(() => {
+    writeSessionAutoArchivePreference(autoArchive);
+  }, [autoArchive]);
   useEffect(() => {
     const keydown = (event: KeyboardEvent) => {
       if (
@@ -2843,7 +2892,41 @@ export default function App() {
           (session) => session.sessionId === requested,
         );
         const blockedRequest = sessionSelectionError(requestedSession);
-        const reusable = list.filter(
+        let activeList = list;
+        const sweep = autoArchiveRef.current;
+        if (sweep.enabled) {
+          // Decide before selecting the restored chat: an explicit `?session=`
+          // link and the current in-tab session must survive the sweep.
+          const protectedIds = [requested, activeSessionRef.current].filter(
+            (id): id is string => Boolean(id),
+          );
+          const stale = staleSessionIds(list, {
+            days: sweep.days,
+            now: Date.now(),
+            protectedIds,
+          });
+          if (stale.length) {
+            // Sequential on purpose: the native host serves one session at a
+            // time, and a startup burst of parallel writes buys nothing.
+            const archivedIds = new Set<string>();
+            for (const id of stale) {
+              if (cancelled) return;
+              try {
+                await api.sessionMetadata(id, { archived: true });
+                archivedIds.add(id);
+              } catch {
+                // A single failure must not abort bootstrap; the next page
+                // load retries that session.
+              }
+            }
+            if (archivedIds.size) {
+              const refreshed = await refreshSessions();
+              if (cancelled || !refreshed) return;
+              activeList = refreshed;
+            }
+          }
+        }
+        const reusable = activeList.filter(
           (session) =>
             session.status !== "closed" &&
             !session.archived &&
@@ -2854,9 +2937,12 @@ export default function App() {
                   project.id === session.projectId && !project.archived,
               )),
         );
+        const activeRequestedSession = activeList.find(
+          (session) => session.sessionId === requested,
+        );
         const empty = reusable.find((session) => !hasUserTurn(session));
         const match =
-          (blockedRequest ? undefined : requestedSession) ??
+          (blockedRequest ? undefined : activeRequestedSession) ??
           reusable.find(
             (session) => session.sessionId === activeSessionRef.current,
           ) ??
@@ -2867,7 +2953,9 @@ export default function App() {
           blockedRequest ??
           (!match && !empty
             ? sessionSelectionError(
-                list.find((session) => session.archived || session.deleting),
+                activeList.find(
+                  (session) => session.archived || session.deleting,
+                ),
               )
             : null);
         const selectionChanges =
@@ -4603,19 +4691,22 @@ export default function App() {
     await forkSession({ sessionId, title: current?.title ?? null }, entryId);
   }
 
-  async function cloneCurrent() {
-    if (!sessionId || !actions.has("clone")) return;
+  async function cloneSession(
+    source: Pick<SessionSummary, "sessionId" | "title">,
+  ) {
+    if (!source.sessionId || !actions.has("clone")) return;
+    const sourceSessionId = source.sessionId;
     const navigation = navigationRevision.current;
     const title = await requestText({
       kind: "prompt",
       title: t("cloneName"),
       defaultValue: t("cloneOf", {
-        title: current?.title ?? sessionId.slice(0, 8),
+        title: source.title ?? sourceSessionId.slice(0, 8),
       }),
     });
-    if (title === null) return;
+    if (title === null || navigation !== navigationRevision.current) return;
     try {
-      const created = await api.clone(sessionId, title);
+      const created = await api.clone(sourceSessionId, title);
       await refreshSessions();
       if (navigation !== navigationRevision.current) return;
       select(created.sessionId);
@@ -4623,6 +4714,14 @@ export default function App() {
       if (navigation !== navigationRevision.current) return;
       setError(errorText(cause));
     }
+  }
+
+  async function cloneCurrent() {
+    if (!sessionId) return;
+    await cloneSession({
+      sessionId,
+      title: current?.title ?? null,
+    });
   }
 
   async function rewindTo(entryId: string) {
@@ -4947,6 +5046,89 @@ export default function App() {
       deleteInFlight.current = false;
       setDeletePending(false);
       setDeleteTarget(null);
+    }
+  }
+
+  async function bulkSessionMetadata(
+    targets: SessionSummary[],
+    patch: { pinned?: boolean; archived?: boolean },
+  ) {
+    const entries = targets.filter((session) => !retirementBusy(session));
+    if (!entries.length) return;
+    // One metadata write at a time: the native host is a single child process,
+    // and a burst of parallel writes neither helps nor reports better. Each
+    // failure still surfaces through updateSessionMetadata's own banner.
+    for (const session of entries) {
+      await updateSessionMetadata(session, {
+        ...patch,
+        ...(patch.archived ? { pinned: undefined } : {}),
+      });
+    }
+  }
+
+  async function bulkDeleteSessions(targets: SessionSummary[]) {
+    const entries = targets.filter((session) => !retirementBusy(session));
+    if (!entries.length || deleteInFlight.current) return;
+    const confirmed = await requestText({
+      kind: "confirm",
+      title:
+        language === "zh"
+          ? "永久删除所选会话"
+          : "Delete selected sessions permanently",
+      message:
+        language === "zh"
+          ? `确定要永久删除选中的 ${entries.length} 个会话吗？此操作会删除会话历史并释放 RPC 连接，不会删除项目文件，且无法撤销。运行中的会话请先停止并等待结束。`
+          : `Permanently delete ${entries.length} selected sessions? This deletes their history and releases the RPC connections, but does not delete project files. This cannot be undone. Stop running sessions and wait for them to settle first.`,
+      confirmLabel: language === "zh" ? "永久删除" : "Delete permanently",
+    });
+    if (confirmed === null) return;
+    const navigation = navigationRevision.current;
+    const activeId = activeSessionRef.current;
+    const activeEntry = entries.find((entry) => entry.sessionId === activeId);
+    deleteInFlight.current = true;
+    setDeletePending(true);
+    try {
+      const removed = new Set<string>();
+      for (const entry of entries) {
+        try {
+          // A sent DELETE may already have landed even if the response fails.
+          // Never retry, but keep going so one failure cannot strand the rest.
+          await api.deleteSession(entry.sessionId);
+          removed.add(entry.sessionId);
+          draftBySession.current.delete(entry.sessionId);
+          rowsBySession.current.delete(entry.sessionId);
+        } catch (cause) {
+          if (navigation !== navigationRevision.current) return;
+          setError(retirementError(cause, true));
+        }
+      }
+      saveDrafts(draftBySession.current);
+      if (removed.size) {
+        setSessions((previous) =>
+          previous.filter((item) => !removed.has(item.sessionId)),
+        );
+      }
+      const list = await refreshSessions();
+      if (
+        !activeEntry ||
+        !removed.has(activeEntry.sessionId) ||
+        navigation !== navigationRevision.current ||
+        activeSessionRef.current !== activeEntry.sessionId
+      )
+        return;
+      const next = list?.find(
+        (entry) =>
+          entry.sessionId !== activeEntry.sessionId &&
+          entry.projectId === activeEntry.projectId &&
+          !entry.archived &&
+          !entry.deleting,
+      );
+      select(next?.sessionId ?? "", next?.projectId ?? activeEntry.projectId, {
+        keepSidebarOpen: true,
+      });
+    } finally {
+      deleteInFlight.current = false;
+      setDeletePending(false);
     }
   }
 
@@ -5608,6 +5790,7 @@ export default function App() {
           language={language}
           title={textRequest.title}
           message={textRequest.message}
+          confirmLabel={textRequest.confirmLabel}
           onClose={() => resolveTextRequest(null)}
           onConfirm={() => resolveTextRequest("confirmed")}
         />
@@ -5759,15 +5942,63 @@ export default function App() {
                 {t("mappedToolNames")}
               </button>
             </div>
-            <div className="shortcut-list">
-              <span>{t("newSession")}</span>
-              <kbd>Ctrl / ⌘ N</kbd>
-              <span>{language === "zh" ? "搜索会话" : "Search chats"}</span>
-              <kbd>Ctrl / ⌘ K</kbd>
-              <span>{t("messageSearch")}</span>
-              <kbd>Ctrl / ⌘ F</kbd>
-              <span>{t("closeSidebar")}</span>
-              <kbd>Ctrl / ⌘ B</kbd>
+            <div className="auto-archive-settings">
+              <label htmlFor="settings-auto-archive-days">
+                {language === "zh" ? "自动会话归档" : "Auto-archive sessions"}
+              </label>
+              <label
+                className="settings-toggle"
+                htmlFor="settings-auto-archive-enabled"
+              >
+                <input
+                  id="settings-auto-archive-enabled"
+                  type="checkbox"
+                  checked={autoArchive.enabled}
+                  onChange={(event) =>
+                    setAutoArchive((previous) => ({
+                      ...previous,
+                      enabled: event.target.checked,
+                    }))
+                  }
+                />
+                {language === "zh" ? "开启" : "Enabled"}
+              </label>
+              <label
+                className="settings-number-label"
+                htmlFor="settings-auto-archive-days"
+              >
+                {language === "zh"
+                  ? "未发生交互天数"
+                  : "Days without interaction"}
+              </label>
+              <input
+                id="settings-auto-archive-days"
+                className="settings-number"
+                type="number"
+                min={MIN_SESSION_AUTO_ARCHIVE_DAYS}
+                max={MAX_SESSION_AUTO_ARCHIVE_DAYS}
+                step={1}
+                value={autoArchive.days}
+                disabled={!autoArchive.enabled}
+                onChange={(event) =>
+                  setAutoArchive((previous) => ({
+                    ...previous,
+                    days: Number(event.target.value),
+                  }))
+                }
+                onBlur={(event) => {
+                  const days = normalizeSessionAutoArchiveDays(
+                    event.target.value,
+                  );
+                  event.target.value = String(days);
+                  setAutoArchive((previous) => ({ ...previous, days }));
+                }}
+              />
+              <p className="form-hint">
+                {language === "zh"
+                  ? `从会话最后一轮回复完成时间起，${MIN_SESSION_AUTO_ARCHIVE_DAYS}-${MAX_SESSION_AUTO_ARCHIVE_DAYS} 日内未发生任何交互，则在下一次打开页面时归档。`
+                  : `Sessions with no interaction for ${MIN_SESSION_AUTO_ARCHIVE_DAYS}-${MAX_SESSION_AUTO_ARCHIVE_DAYS} days after their last completed turn are archived the next time this page opens.`}
+              </p>
             </div>
             <button
               type="button"
@@ -5837,6 +6068,7 @@ export default function App() {
               creating={creatingSession}
               canManage={actions.has("session_organization")}
               canFork={actions.has("fork")}
+              canClone={actions.has("clone")}
               canCreate={actions.has("create_project")}
               onSelectProject={selectProject}
               onSelectSession={selectSidebarSession}
@@ -5844,6 +6076,11 @@ export default function App() {
               onNewProject={() => setProjectDialog(true)}
               onRename={setRenameTarget}
               onFork={(session) => void forkSession(session)}
+              onClone={(session) => void cloneSession(session)}
+              onBulkMetadata={(entries, patch) =>
+                bulkSessionMetadata(entries, patch)
+              }
+              onBulkDelete={(entries) => bulkDeleteSessions(entries)}
               onRenameProject={setProjectRenameTarget}
               onProjectMetadata={updateProjectMetadata}
               onEditTags={setTagsTarget}
@@ -7003,7 +7240,7 @@ export default function App() {
                 </div>
                 <div
                   className="composer-metrics slim-metrics"
-                  aria-label={`${t("cacheHit")}, ${t("context")}`}
+                  aria-label={`${t("cacheHit")}, ${t("context")}, ${t("sessionWork")}`}
                 >
                   <span
                     className="composer-metric"
@@ -7027,6 +7264,18 @@ export default function App() {
                       {runtime?.context
                         ? `${formatTokens(runtime.context.tokens)} / ${formatTokens(runtime.context.window)}`
                         : "—"}
+                    </strong>
+                  </span>
+                  <span
+                    className="composer-metric"
+                    title={t("sessionWorkTotal")}
+                    aria-label={`${t("sessionWork")}: ${sessionWorkMs == null ? "—" : formatRunDuration(sessionWorkMs)}`}
+                  >
+                    <Timer size={12} aria-hidden="true" />
+                    <strong>
+                      {sessionWorkMs == null
+                        ? "—"
+                        : formatRunDuration(sessionWorkMs)}
                     </strong>
                   </span>
                   <button
@@ -7084,6 +7333,19 @@ export default function App() {
                 )
               }
               preference={readModelPreference(projectId)}
+              onSaveDefault={(selected, thinkingLevel) => {
+                writeModelPreference(projectId, {
+                  provider: selected.provider,
+                  modelId: selected.id,
+                  thinkingLevel,
+                });
+                setModelPreferenceRevision((value) => value + 1);
+                note(
+                  language === "zh"
+                    ? `默认模型和思考深度 → ${selected.name} (${selected.provider}) / ${thinkingLevel}`
+                    : `Default model and thinking level → ${selected.name} (${selected.provider}) / ${thinkingLevel}`,
+                );
+              }}
               onClearModelPreference={() => {
                 const previous = readModelPreference(projectRef.current);
                 writeModelPreference(
@@ -8333,6 +8595,7 @@ function RuntimePanel({
   onModelSelected,
   onThinkingSelected,
   preference,
+  onSaveDefault,
   onClearModelPreference,
   onClearThinkingPreference,
   details,
@@ -8350,6 +8613,7 @@ function RuntimePanel({
   onModelSelected: ModelSelected;
   onThinkingSelected: (level: string) => void;
   preference: ModelPreference | null;
+  onSaveDefault: (model: ModelDescriptor, thinkingLevel: string) => void;
   onClearModelPreference: () => void;
   onClearThinkingPreference: () => void;
   details?: ReactNode;
@@ -8360,6 +8624,11 @@ function RuntimePanel({
     translate(language, key, values);
   const [models, setModels] = useState<ModelDescriptor[]>([]);
   const [levels, setLevels] = useState<string[]>([]);
+  const [defaultModelId, setDefaultModelId] = useState("");
+  const [defaultThinkingLevel, setDefaultThinkingLevel] = useState("");
+  // The pickers seed from the saved pair, but a choice the user has started
+  // must survive catalog refreshes (runtime model changes, thinking changes).
+  const defaultTouched = useRef(false);
   const context = runtime?.context ?? null;
   const [catalog, setCatalog] = useState<ToolCatalog | null>(null);
   const [providersOpen, setProvidersOpen] = useState(false);
@@ -8374,6 +8643,9 @@ function RuntimePanel({
     setPending("");
     setModels([]);
     setLevels([]);
+    setDefaultModelId("");
+    setDefaultThinkingLevel("");
+    defaultTouched.current = false;
     setCatalog(null);
     return () => {
       mounted.current = false;
@@ -8416,6 +8688,30 @@ function RuntimePanel({
     };
   }, [onError, sessionId, supported, runtime?.modelId, runtime?.provider]);
 
+  // Seed the default pair from what this browser remembers, once per session
+  // and after an explicit save. A catalog refresh must not overwrite a choice
+  // the user has already made but not yet saved.
+  useEffect(() => {
+    if (defaultTouched.current) return;
+    const remembered = models.find(
+      (entry) =>
+        entry.id === preference?.modelId &&
+        entry.provider === preference?.provider,
+    );
+    setDefaultModelId(remembered ? modelKey(remembered) : "");
+    setDefaultThinkingLevel(
+      preference?.thinkingLevel && levels.includes(preference.thinkingLevel)
+        ? preference.thinkingLevel
+        : "",
+    );
+  }, [
+    models,
+    levels,
+    preference?.provider,
+    preference?.modelId,
+    preference?.thinkingLevel,
+  ]);
+
   async function run(
     label: string,
     action: () => Promise<RuntimeState | void>,
@@ -8445,6 +8741,11 @@ function RuntimePanel({
       entry.id === runtime?.modelId && entry.provider === runtime?.provider,
   );
   const level = normalizeLevel(runtime?.thinkingLevel);
+  const defaultModel = models.find(
+    (entry) => modelKey(entry) === defaultModelId,
+  );
+  const canSaveDefault =
+    Boolean(defaultModel && defaultThinkingLevel) && pending === "";
   const active = new Set(catalog?.activeTools ?? runtime?.activeTools ?? []);
   const heading = (
     <div className="panel-heading">
@@ -8499,8 +8800,76 @@ function RuntimePanel({
       </button>
       <p className="muted">
         {zh
-          ? "成功选择的模型会在此浏览器中按项目记住，仅用于未来新会话；已有会话不变。"
-          : "Successful model choices are remembered in this browser per project for future new sessions only; existing sessions are unchanged."}
+          ? "默认模型与思考档位会一起保存，仅用于此浏览器的未来新会话；已有会话不变。请确认两项都可选后再保存。"
+          : "Save a default model and thinking level together for future new sessions only in this browser; existing sessions are unchanged. Confirm both choices are available before saving."}
+        {defaultModel && defaultThinkingLevel && (
+          <>
+            {" "}
+            {defaultModel.provider}/{defaultModel.id}:{defaultThinkingLevel}
+          </>
+        )}
+      </p>
+      <label htmlFor="default-model">{zh ? "默认模型" : "Default model"}</label>
+      <MenuSelect
+        label={zh ? "默认模型" : "Default model"}
+        value={defaultModelId}
+        disabled={
+          !supported.has("set_model") || pending !== "" || models.length === 0
+        }
+        onChange={(value) => {
+          defaultTouched.current = true;
+          setDefaultModelId(value);
+        }}
+        options={[
+          { value: "", label: "—" },
+          ...models.map((entry) => ({
+            value: modelKey(entry),
+            label: `${entry.name} (${entry.provider})`,
+          })),
+        ]}
+      />
+      <label htmlFor="default-thinking">
+        {zh ? "默认思考深度" : "Default thinking level"}
+      </label>
+      <MenuSelect
+        label={zh ? "默认思考深度" : "Default thinking level"}
+        value={defaultThinkingLevel}
+        disabled={
+          !supported.has("set_thinking_level") ||
+          pending !== "" ||
+          levels.length === 0
+        }
+        onChange={(value) => {
+          defaultTouched.current = true;
+          setDefaultThinkingLevel(value);
+        }}
+        options={[
+          { value: "", label: "—" },
+          ...levels.map((entry) => ({
+            value: entry,
+            label: valueLabel(language, entry),
+          })),
+        ]}
+      />
+      <button
+        type="button"
+        disabled={!canSaveDefault}
+        onClick={() => {
+          if (!defaultModel || !defaultThinkingLevel) return;
+          onSaveDefault(defaultModel, defaultThinkingLevel);
+          // The saved pair is now the source of truth again, so a later
+          // catalog refresh may re-seed the pickers from it.
+          defaultTouched.current = false;
+        }}
+      >
+        {zh
+          ? "保存默认模型和思考深度"
+          : "Save default model and thinking level"}
+      </button>
+      <p className="muted">
+        {zh
+          ? "当前会话显式选择的模型会单独记住，仅用于未来新会话；已有会话不变。"
+          : "Explicit model choices are remembered individually for future new sessions only; existing sessions are unchanged."}
         {preference?.provider && preference.modelId && (
           <>
             {" "}
@@ -8581,8 +8950,8 @@ function RuntimePanel({
       />
       <p className="muted">
         {zh
-          ? "成功选择的思考深度会在此浏览器中按项目记住，仅用于未来新会话；已有会话不变。"
-          : "Successful thinking level choices are remembered in this browser per project for future new sessions only; existing sessions are unchanged."}
+          ? "当前会话显式选择的思考深度会单独记住，仅用于未来新会话；已有会话不变。"
+          : "Explicit thinking level choices are remembered individually for future new sessions only; existing sessions are unchanged."}
         {preference?.thinkingLevel ? (
           <> {valueLabel(language, preference.thinkingLevel)}</>
         ) : null}
