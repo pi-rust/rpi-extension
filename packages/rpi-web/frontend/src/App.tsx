@@ -6065,7 +6065,6 @@ export default function App() {
               language={language}
               creating={creatingSession}
               canManage={actions.has("session_organization")}
-              canFork={actions.has("fork")}
               canClone={actions.has("clone")}
               canCreate={actions.has("create_project")}
               onSelectProject={selectProject}
@@ -6073,7 +6072,6 @@ export default function App() {
               onNewSession={(id) => void createSession(id)}
               onNewProject={() => setProjectDialog(true)}
               onRename={setRenameTarget}
-              onFork={(session) => void forkSession(session)}
               onClone={(session) => void cloneSession(session)}
               onBulkMetadata={(entries, patch) =>
                 bulkSessionMetadata(entries, patch)
