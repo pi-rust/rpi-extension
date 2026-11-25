@@ -778,6 +778,12 @@ export default function App() {
   }
   const [capabilities, setCapabilities] = useState<Capabilities | null>(null);
   const [nativeMessageQueries, setNativeMessageQueries] = useState(false);
+  // `/capabilities` describes the Web service's static command surface, not the
+  // native host that happens to be running under it. A session snapshot carries
+  // the child's own `supportedCommands`, which is the only authoritative answer
+  // for a command the adapter merely forwards (`stop_run`). `null` means the
+  // live host has not reported yet, so callers fall back to the static list.
+  const [hostCommands, setHostCommands] = useState<Set<string> | null>(null);
   const [authRequired, setAuthRequired] = useState(false);
   const [authenticated, setAuthenticated] = useState(false);
   const [authChecked, setAuthChecked] = useState(false);
@@ -1986,6 +1992,17 @@ export default function App() {
     () => new Set(capabilities?.supportedCommands ?? []),
     [capabilities],
   );
+  // Whether the *live native child* accepts a command. Fall back to the static
+  // service list only while no snapshot has arrived yet; otherwise a host that
+  // predates `stop_run` would be told it supports the command and Stop would
+  // fail with "unknown command type".
+  const hostSupports = useCallback(
+    (command: string) => (hostCommands ?? supported).has(command),
+    [hostCommands, supported],
+  );
+  // Stop preserves the queue only on a host that advertises `stop_run`.
+  const stopPreservesQueue = hostSupports("stop_run");
+  const canStopRun = stopPreservesQueue || hostSupports("abort");
   const actions = useMemo(
     () => new Set(capabilities?.supportedActions ?? []),
     [capabilities],
@@ -2035,10 +2052,7 @@ export default function App() {
     [],
   );
   const composerAbort =
-    busy &&
-    (supported.has("stop_run") || supported.has("abort")) &&
-    !loadingSession &&
-    !connectionFailed;
+    busy && canStopRun && !loadingSession && !connectionFailed;
   // While a run is active the main button is Stop for an empty composer and
   // Send for a draft: touch keyboards use Enter for a newline, so the icon is
   // the only way to queue a follow-up from the same field.
@@ -2139,7 +2153,7 @@ export default function App() {
         name: "/abort",
         usage: "/abort",
         hint: t("slashAbort"),
-        enabled: supported.has("stop_run") || supported.has("abort"),
+        enabled: canStopRun,
       },
       {
         name: "/new",
@@ -3057,6 +3071,7 @@ export default function App() {
     setStatus("connecting");
     setLoadingSession(Boolean(sessionId));
     setNativeMessageQueries(false);
+    setHostCommands(null);
     setInterrupted(false);
     setFailedRun(false);
     setRecoveryNoticeDismissed(false);
@@ -3110,6 +3125,9 @@ export default function App() {
         ["get_message_summaries", "get_message_window"].every((command) =>
           snapshot.supportedCommands?.includes(command),
         ),
+      );
+      setHostCommands(
+        snapshot.supportedCommands ? new Set(snapshot.supportedCommands) : null,
       );
       setMessageStats({
         sessionId,
@@ -3836,7 +3854,7 @@ export default function App() {
         return;
       }
       if (name === "/abort") {
-        if (!supported.has("stop_run") && !supported.has("abort")) {
+        if (!canStopRun) {
           note("/abort is not advertised by this host.");
           return;
         }
@@ -4815,8 +4833,8 @@ export default function App() {
     // `abort` is the fallback for older hosts: it drains steering/follow-up
     // queues and hands them back, which is useful for recovery but is the old
     // Stop behaviour being fixed here.
-    const preserveQueue = supported.has("stop_run");
-    if (!preserveQueue && !supported.has("abort")) return;
+    const preserveQueue = stopPreservesQueue;
+    if (!preserveQueue && !hostSupports("abort")) return;
     try {
       if (preserveQueue) {
         await commandData<StopRunResult>(targetSession, "stop_run");
