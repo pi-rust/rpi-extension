@@ -644,6 +644,29 @@ for (const settlement of [
   });
 }
 
+test("Stop falls back to abort when the live host predates stop_run", async ({
+  page,
+  host,
+}) => {
+  // `/capabilities` advertises the Web service's static command list, which
+  // includes `stop_run`. Only the native child's own snapshot says whether this
+  // installed host actually implements it. An older host must still stop: using
+  // `stop_run` there fails with "unknown command type" and leaves the run alive.
+  host.snapshots[A] = snapshot(A, {
+    status: "running",
+    supportedCommands: [...reads, "prompt", "abort"],
+  });
+  await open(page, host);
+  await ready(page, host);
+  await expect(stopButton(page)).toBeEnabled();
+  host.expectCommand(A, "abort", {
+    json: envelope("abort", { aborted: true, steer: [], followUp: [] }),
+  });
+  await stopButton(page).click();
+  await received(host, A, "abort");
+  expect(commandBodies(host, "stop_run")).toEqual([]);
+});
+
 test("manual Stop waits for native settlement, then empty Enter continues while a draft still sends normally", async ({
   page,
   host,
@@ -709,9 +732,7 @@ test("rejected Stop does not invent a settled continuation action", async ({
   await ready(page, host);
   host.expectCommand(A, "stop_run", rejected("stop_run", "Mock stop denied"));
   await stopButton(page).click();
-  await expect(page.locator(".error-banner")).toContainText(
-    "Mock stop denied",
-  );
+  await expect(page.locator(".error-banner")).toContainText("Mock stop denied");
   await expect(stopButton(page)).toBeEnabled();
   await noContinue(page);
   expect(commandBodies(host, "prompt")).toEqual([]);
