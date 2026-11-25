@@ -223,8 +223,8 @@ rpi install rpi-langfuse
 
 ### schema 测试
 
-`src/tool_schemas/*.json` 是实际注册通过 `manual_tool_schemas()` 使用的 schema，Rust 单元测试直接解析这些定义，
-检查字段说明、默认动作、条件必填与结果限制，并对缺失参数调用真实动作函数验证请求前失败。
+`manual_tool_schemas()` 直接注册 `src/tool_schemas/*.json` 中的定义。为兼容模型网关，按动作区分的必填参数写在字段说明中，由工具在发出 HTTP 请求前校验。
+Rust 单元测试检查字段说明、默认动作和参数范围，并验证缺少必填参数时工具会在请求前报错。
 运行 `cargo test --locked -p rpi-langfuse manual_` 可单独执行这组无需凭据或网络的测试。
 
 ## 开发
