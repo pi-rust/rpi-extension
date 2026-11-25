@@ -200,6 +200,11 @@ export interface AbortResult {
   followUp?: ReclaimedQueuedMessage[];
 }
 
+/** Native `stop_run` reply: the run is cancelled and its queue is untouched. */
+export interface StopRunResult {
+  stopped?: boolean;
+}
+
 export interface QueueItem {
   entryId: string;
   queue: string;
@@ -975,13 +980,13 @@ export const api = {
   },
   runTimings: (
     id: string,
-    entryIds: string[],
+    query: { entryIds?: string[]; all?: boolean },
     cursor?: string,
     signal?: AbortSignal,
   ) =>
     request<RunTimingsPage>(`/sessions/${id}/run-timings/query`, {
       method: "POST",
-      body: JSON.stringify({ entryIds, ...(cursor ? { cursor } : {}) }),
+      body: JSON.stringify({ ...query, ...(cursor ? { cursor } : {}) }),
       signal,
     }),
   messageSummaries: (

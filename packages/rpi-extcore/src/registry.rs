@@ -57,6 +57,7 @@ struct RegistryFile {
 pub struct Registry {
     path: PathBuf,
     entries: Vec<RegistryEntry>,
+    attached: HashSet<String>,
     preferences: HashMap<String, SessionPreferences>,
     resources: HashMap<String, crate::resources::ResourceConfiguration>,
     deletions: HashMap<String, crate::deletion::DeletionPlan>,
@@ -103,6 +104,7 @@ impl Registry {
         Ok(Self {
             path,
             entries: data.sessions,
+            attached: HashSet::new(),
             preferences: data.preferences,
             resources: data.resources,
             deletions: data.deletions,
@@ -223,7 +225,22 @@ impl Registry {
         Ok(result)
     }
 
+    // Host areas are rediscovered on startup. An ordinary Web server sharing
+    // this registry must never reopen an area Session as a standalone child.
+    pub(crate) fn attach(&mut self, entry: RegistryEntry) -> Result<(), String> {
+        if self.attached.contains(&entry.session_id) {
+            return Ok(());
+        }
+        if self.get(&entry.session_id).is_some() {
+            return Err("shared Host Session id conflicts with the Web registry".into());
+        }
+        self.attached.insert(entry.session_id.clone());
+        self.entries.push(entry);
+        Ok(())
+    }
+
     pub fn upsert(&mut self, entry: RegistryEntry) -> Result<(), String> {
+        let attached = self.attached.contains(&entry.session_id);
         let previous = self.entries.clone();
         match self
             .entries
@@ -250,6 +267,9 @@ impl Registry {
                 Self::merge_last_turn_ended_at(existing, entry.last_turn_ended_at);
             }
             None => self.entries.push(entry),
+        }
+        if attached {
+            return Ok(());
         }
         if let Err(error) = self.save_result() {
             self.entries = previous;
@@ -298,6 +318,9 @@ impl Registry {
             .map_or(true, |value| ended_at > value);
         if changed {
             entry.last_turn_ended_at = Some(ended_at);
+            if self.attached.contains(session_id) {
+                return Ok(true);
+            }
             if let Err(error) = self.save_result() {
                 self.entries = previous;
                 return Err(error);
@@ -340,8 +363,18 @@ impl Registry {
             std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
         }
         let file = RegistryFile {
-            sessions: self.entries.clone(),
-            preferences: self.preferences.clone(),
+            sessions: self
+                .entries
+                .iter()
+                .filter(|entry| !self.attached.contains(&entry.session_id))
+                .cloned()
+                .collect(),
+            preferences: self
+                .preferences
+                .iter()
+                .filter(|(id, _)| !self.attached.contains(*id))
+                .map(|(id, value)| (id.clone(), value.clone()))
+                .collect(),
             resources: self.resources.clone(),
             deletions: self.deletions.clone(),
         };

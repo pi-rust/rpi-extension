@@ -10,4 +10,4 @@ mod plugin;
 mod server;
 mod startup;
 
-pub use server::{run, AppConfig};
+pub use server::{run, run_with_host_area, AppConfig};
