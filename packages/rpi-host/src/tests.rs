@@ -1,4 +1,5 @@
 use super::*;
+#[cfg(unix)]
 use rpi_extcore::shared_host::protocol::*;
 use std::sync::Mutex;
 static WORKER_TEST: Mutex<()> = Mutex::new(());
@@ -39,9 +40,12 @@ fn registered_schema_has_all_supported_commands_and_no_endpoint_override() {
     assert!(parameters["properties"].get("config").is_none());
     let description = schema.description.to_string_lossy();
     for guidance in [
+        "wire v1.5",
         "outcome_unknown",
         "remote work may continue",
-        "request IDs",
+        "generic error without a structured result",
+        "original agent_id and request_id",
+        "administrative_receipt with the complete original request",
         "not an OS sandbox",
         "joined",
     ] {

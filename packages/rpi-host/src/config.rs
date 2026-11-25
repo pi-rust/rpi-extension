@@ -1,17 +1,19 @@
 //! Configuration is supplied by the operator, never by tool arguments.
-use rpi_extcore::shared_host::{
-    protocol::{AuthToken, HostId},
-    ConnectionConfig,
-};
+use rpi_extcore::shared_host::ConnectionConfig;
+use std::path::Path;
+
+#[cfg(unix)]
+use rpi_extcore::shared_host::protocol::{AuthToken, HostId};
+#[cfg(unix)]
 use serde::Deserialize;
-use std::{
-    path::{Path, PathBuf},
-    time::Duration,
-};
+#[cfg(unix)]
+use std::{path::PathBuf, time::Duration};
 
 pub const CONFIG_ENV: &str = "RPI_SHARED_HOST_CONFIG";
+#[cfg(unix)]
 const MAX_CONFIG_BYTES: u64 = 64 * 1024;
 
+#[cfg(unix)]
 #[derive(Deserialize)]
 struct FileConfig {
     socket_path: PathBuf,
@@ -20,6 +22,8 @@ struct FileConfig {
     #[serde(default = "default_timeout")]
     timeout_seconds: u64,
 }
+
+#[cfg(unix)]
 fn default_timeout() -> u64 {
     15
 }

@@ -107,8 +107,17 @@ owner policy 都必须允许它。查询行政回执时保留原意图，不能�
 - text/structured framing 合计最多 1 MiB。编码溢出不截断成成功：查询返回
   `query_failed`；mutation 保守返回 `outcome_unknown`，保留原 ID 与完整对账命令，
   不返回原 data。查询尽量缩小分页；无分页的超大结果暂不提供分块读取。
-- cancel/destroy **只终止本地交换**，不证明远端工作停止或回滚。真正取消 Agent 执行必须
-  显式提交匹配的 `administrative_cancel`。Stop 原生结算不等于调用方已观察进程退出。
+### 管理 CLI 取消后查询收据
+
+发送变更请求前保留原 `command`。管理 CLI 取消工具调用时（例如 RPC `abort`）可能只返回
+`plugin tool cancelled`，此时没有 `details` 或 `reconcile.command`。远端可能已经收到
+请求并继续执行。用保存的原始参数先查询收据，再决定如何处理：
+
+- `submit` 用 `receipt`，传入原 `agent_id` 和 `request_id`。
+- 行政操作用 `administrative_receipt`，传入完整原 `request`，包括历史 `epoch` 和 `action`。
+
+要取消已经运行的 Agent 任务，显式提交匹配的 `administrative_cancel`。确认 Host 进程退出
+需要单独观察进程状态。
 
 每个已加载 DLL 最多 4 个本地请求线程；没有常驻 transport runtime/reader。
 `execute` 启动有界请求，`poll` 仅观察完成，不阻塞等待 I/O。cancel 协作丢弃 future/socket；
@@ -142,9 +151,9 @@ python3 packages/rpi-host/tests/native_results.py \
 当前 core 全库严格 Clippy 被 55 项既有问题阻挡，没有扩大例外或顺手修旧模块，不能称
 core/workspace 全绿。详细范围、日志与源输入核验见[结果验收报告](docs/result-interface.md)。
 
-实际 CLI 加载 DLL 的 **10 个错误/兼容性用例**包括原有 8 类错误、v1.4 peer 无 results
-时零命令发送，以及 result 丢回复仍为 query_failed（不是 mutation unknown）。
-故障 peer 明确标注，不冒充真实 Host journal 故障；旧证据未改写。
+实际 CLI 加载 DLL 的 **11 个错误/兼容性用例**包含 v1.4 peer 无 `results` 时零命令发送、
+`result` 丢回复时报告 `query_failed`，以及 `submit` 已发送后 RPC `abort` 时关闭 socket、
+返回通用取消错误且无重发。其中故障与取消使用认证测试 peer。
 
 真实闭环是 **CLI 实际加载管理 DLL → 工具 → 认证 IPC → 实际 Host → HTTP Provider**，
 不是将分离组件测试相加：基本模式 7 次工具调用，行政模式覆盖全部 12 类命令，含受信
@@ -170,4 +179,3 @@ Host；这不是生产自动恢复或 OS 后代结算验收。两套 smoke 合�
 共享 Host **10.06 MiB**、20 个独立 RPC 进程 **100.74 MiB**；额外计入真实管理 CLI 后为
 **20.99 MiB**。这不是同进程 ChildAgent 对比，不代表插件/工具/长历史的生产功能等价。
 管理 DLL 最多 4 个本地交换不等于 Host 只能运行 4 个 Agent：本次实际同时等待 20 个请求。
-

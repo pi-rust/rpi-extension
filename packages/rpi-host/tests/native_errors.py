@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Real DLL/native error regression; no benchmark and no installed binary fallback.
 
-Status/rejection use a real empty Host. Disconnect/uncertain/large-reply cases
-use an explicitly labelled authenticated fixture peer, not a native journal.
+Status/rejection use a real empty Host. Transport failures and local abort
+use an authenticated fixture peer.
 """
 import argparse
 import hashlib
@@ -41,6 +41,8 @@ class Peer:
     def __init__(self, config, command, mode):
         self.config, self.command, self.mode = config, command, mode
         self.requests = []
+        self.request_received = threading.Event()
+        self.connection_closed = threading.Event()
         self.errors = []
         self.listener = socket.socket(socket.AF_UNIX)
         self.listener.bind(config["socket_path"])
@@ -72,6 +74,11 @@ class Peer:
                 request = frame_read(stream)
                 assert request["command"] == self.command
                 self.requests.append(request)
+                self.request_received.set()
+                if self.mode == "abort":
+                    assert stream.recv(1) == b"", "abort must close the local connection"
+                    self.connection_closed.set()
+                    return
                 if self.mode in {"closed", "result_closed"}:
                     return
                 if self.mode == "large":
@@ -181,6 +188,21 @@ def run_case(binary, plugin, case):
                        "--tools", "host", "--provider", "fixture", "--model", "manager", "--thinking", "off", "--approve"],
                       environment, workspace, root / "cli.log")
             cli.send({"id": "run", "type": "prompt", "message": "Exercise the explicit Host fixture command"})
+            if case["peer"] == "abort":
+                assert peer.request_received.wait(10), ("request deadline", peer.errors)
+                cli.send({"id": "abort-run", "type": "abort"})
+                event = cli.wait(lambda e: e.get("type") == "tool_execution_end"
+                                 and e.get("toolCallId") == "host-error-probe", timeout=10)
+                cli.wait(lambda e: e.get("type") == "agent_end", timeout=10)
+                assert event["toolName"] == "host" and event["isError"] is True, event
+                assert event["result"]["details"] is None, event
+                assert any("plugin tool cancelled" in block.get("text", "")
+                           for block in event["result"]["content"]), event
+                assert peer.connection_closed.wait(5), ("abort did not close the connection", peer.errors)
+                assert config["token"] not in json.dumps(event)
+                assert not errors and not results, (errors, results)
+                return {"name": case["name"], "peer": case["peer"], "passed": True,
+                        "status": "local_abort", "native_event": event}
             cli.done()
             assert not errors, errors
             assert len(results) == 1
@@ -236,6 +258,7 @@ def run(binary, plugin):
         {"name": "local_missing_config", "peer": "missing_config", "command": {"op": "status"}, "status": "not_sent", "error": True},
         {"name": "query_disconnected", "peer": "closed", "command": {"op": "status"}, "status": "query_failed", "error": True},
         {"name": "mutation_reply_lost", "peer": "closed", "command": submit, "status": "outcome_unknown", "error": True},
+        {"name": "rpc_abort_after_submit", "peer": "abort", "command": submit},
         {"name": "native_receipt_uncertain_projection", "peer": "uncertain", "command": close, "status": "native_not_succeeded", "error": True},
         {"name": "query_envelope_overflow", "peer": "large", "command": {"op": "status"}, "status": "query_failed", "error": True},
         {"name": "mutation_envelope_overflow", "peer": "large", "command": submit, "status": "outcome_unknown", "error": True},

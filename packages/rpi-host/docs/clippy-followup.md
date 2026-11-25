@@ -50,9 +50,9 @@
 
 ## 产物与保全
 
-- 新 CLI：`/Users/bigfish/work/rpi-projects/pi-rust-wt-host/target/debug/rpi`（dev/debug）  
+- 新 CLI：`/Users/bigfish/work/rpi-projects/pi-rust-wt-host/target/debug/rpi`（dev/debug）\
   SHA-256：`48835ce2ac25d300ceafc67bf448b8c1cf70760325580ba98b341ff9817b592a`
-- 实测管理 DLL：`/Users/bigfish/work/rpi-projects/rpi-extension-wt-host/target/release/librpi_host.dylib`（既有 release DLL，**未重建**）  
+- 实测管理 DLL：`/Users/bigfish/work/rpi-projects/rpi-extension-wt-host/target/release/librpi_host.dylib`（既有 release DLL，**未重建**）\
   SHA-256：`b21e7dfe0b7626014d9d39021fbf753570e2d3e24a3bc56b4b8c7cd075b2d477`
 - core 冻结输入 **1144** 文件，其中 **1110** 原样、34 白名单变更；extension **821/821** 既有输入原样。本轮 extension 仅新增本报告与验证 JSON，不覆盖任何旧文件。
 - 两仓四合同（`protocol.rs`、`client.rs`、`client_tests.rs`、`fixtures/control-v1.json`）逐字一致、哈希不变；每个修改源文件的前后哈希见验证 JSON。
