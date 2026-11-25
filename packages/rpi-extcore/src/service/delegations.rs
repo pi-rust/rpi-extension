@@ -23,7 +23,7 @@ const COMMANDS: [&str; 3] = [
 /// Exact native profile; legacy hosts must not be probed optimistically.
 pub fn native_profile() -> Value {
     json!({"version":1,"listCommand":COMMANDS[0],"eventsCommand":COMMANDS[1],
-        "cancelCommand":COMMANDS[2],"retention":"volatile","maxChildren":32,
+        "cancelCommand":COMMANDS[2],"parentToolCallId":true,"retention":"volatile","maxChildren":32,
         "maxEvents":256,"maxEventBytes":32768,"maxPageCount":32,
         "maxResponseBytes":PAGE_BYTES,"sequence":"childEpochSeq-v1"})
 }
@@ -36,6 +36,7 @@ pub struct Delegation {
     pub turns: u32,
     pub role: String,
     pub task_preview: String,
+    pub parent_tool_call_id: Option<String>,
     pub started_ms: u64,
     pub finished_ms: Option<u64>,
     pub earliest_seq: u64,
@@ -211,6 +212,10 @@ pub async fn roster(state: &Service, parent: &str) -> ServiceResult<DelegationRo
         ensure(
             valid_id(&child.child_id)
                 && ids.insert(&child.child_id)
+                && child
+                    .parent_tool_call_id
+                    .as_ref()
+                    .map_or(true, |id| valid_id(id) && id.len() <= 200)
                 && child.turns <= 32
                 && child.role.len() <= 200
                 && child.task_preview.chars().count() <= 200

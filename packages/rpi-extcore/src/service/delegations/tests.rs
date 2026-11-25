@@ -229,3 +229,22 @@ async fn replacing_host_before_initial_delivery_requires_resync() {
     drop(s);
     f.close().await;
 }
+
+#[tokio::test]
+async fn roster_exposes_parent_tool_call_binding_and_rejects_invalid_ids() {
+    let f = Fixture::new(true).await;
+    let mut data = json!({"version":1,"parentSessionId":"parent","epoch":"epoch","retention":"volatile",
+        "children":[{"childId":"child","status":"running","turns":0,"role":"worker","taskPreview":"task",
+        "parentToolCallId":"call-42","startedMs":1,"finishedMs":null,"earliestSeq":1,"lastSeq":0}]});
+    *f.override_data.lock().unwrap() = Some(data.clone());
+    let observed = roster(&f.service, "parent").await.unwrap();
+    assert_eq!(
+        observed.children[0].parent_tool_call_id.as_deref(),
+        Some("call-42")
+    );
+    assert_eq!(native_profile()["parentToolCallId"], true);
+    data["children"][0]["parentToolCallId"] = json!("bad\ncall");
+    *f.override_data.lock().unwrap() = Some(data);
+    assert!(roster(&f.service, "parent").await.is_err());
+    f.close().await;
+}
