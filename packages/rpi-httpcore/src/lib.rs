@@ -8,4 +8,7 @@ mod server;
 pub mod transport;
 pub use config::AppConfig;
 pub use node::node_discovery_router;
-pub use server::{router, rpi_routes, rpi_routes_with_node_discovery, run, serve_until, Listening};
+pub use server::{
+    router, rpi_routes, rpi_routes_with_node_discovery, run, serve_until,
+    serve_until_with_host_area, Listening,
+};

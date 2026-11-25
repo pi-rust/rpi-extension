@@ -74,7 +74,7 @@ const reads = [
 
 class MockHost {
   warmupAfter: Record<string, number> = {};
-  commands = [...reads, "prompt", "resume_pending", "abort"];
+  commands = [...reads, "prompt", "resume_pending", "abort", "stop_run"];
   snapshots: Record<string, Json> = { [A]: snapshot(A), [B]: snapshot(B) };
   snapshotFailure: Reply | undefined;
   unexpected: string[] = [];
@@ -101,7 +101,7 @@ class MockHost {
   }
   mutationsSent() {
     return this.calls.filter((call) =>
-      ["prompt", "resume_pending", "abort"].includes(call.kind),
+      ["prompt", "resume_pending", "abort", "stop_run"].includes(call.kind),
     );
   }
   // Explicitly plan a MOCK command, optionally keeping its HTTP response gated.
@@ -575,7 +575,7 @@ test("capabilities distinguish unsupported pending work from a failed run with p
   page,
   host,
 }) => {
-  host.commands = [...reads, "prompt", "abort"];
+  host.commands = [...reads, "prompt", "abort", "stop_run"];
   host.snapshots[A] = snapshot(A, { pendingResume: true });
   host.snapshots[B] = failed(B, "failed", true);
   await open(page, host);
@@ -593,7 +593,7 @@ test("capabilities distinguish unsupported pending work from a failed run with p
   ]);
   expect(commandBodies(host, "resume_pending")).toEqual([]);
   // Nor may a failed settlement advertise an unsupported prompt fallback.
-  host.commands = [...reads, "abort"];
+  host.commands = [...reads, "abort", "stop_run"];
   host.snapshots[A] = failed(A);
   await open(page, host);
   await ready(page, host);
@@ -651,16 +651,16 @@ test("manual Stop waits for native settlement, then empty Enter continues while 
   host.snapshots[A] = snapshot(A, { status: "running" });
   await open(page, host);
   await ready(page, host);
-  host.expectCommand(A, "abort", { json: envelope("abort", {}) });
+  host.expectCommand(A, "stop_run", { json: envelope("stop_run", {}) });
   await stopButton(page).click();
-  await received(host, A, "abort");
+  await received(host, A, "stop_run");
   await expect(stopButton(page)).toBeEnabled();
   await noContinue(page);
   expect(commandBodies(host, "prompt")).toEqual([]);
   await received(host, A, "events");
   host.snapshots[A] = snapshot(A, {
     lastSeq: 11,
-    latestSettlement: { outcome: "aborted", aborted: true },
+    latestSettlement: { outcome: "stopped", aborted: true },
   });
   host.emit(A, 11, {
     type: "agent_settled",
@@ -707,10 +707,10 @@ test("rejected Stop does not invent a settled continuation action", async ({
   host.snapshots[A] = snapshot(A, { status: "running" });
   await open(page, host);
   await ready(page, host);
-  host.expectCommand(A, "abort", rejected("abort", "Mock abort denied"));
+  host.expectCommand(A, "stop_run", rejected("stop_run", "Mock stop denied"));
   await stopButton(page).click();
   await expect(page.locator(".error-banner")).toContainText(
-    "Mock abort denied",
+    "Mock stop denied",
   );
   await expect(stopButton(page)).toBeEnabled();
   await noContinue(page);

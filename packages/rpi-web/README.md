@@ -38,6 +38,14 @@ Completed conversation runs also show a compact **Worked for … / 已用时 …
 
 Runtime: `browser → rpi --webserver (extension) or rpi-web (standalone) → rpi --mode rpc → model and project tools`. Each open session runs a separate native host process. Project files, model credentials, and session records live on the computer or server running the service.
 
+### Shared Host areas on macOS
+
+Shared Host is opt-in. By default Web opens ordinary RPC sessions. Start Web from the same workspace as `rpi --host` with `rpi-web --host-area` or `rpi --webserver --host-area`. Web joins the native default area and lists its existing Session. To join a named area, add its name after `--host-area`. Either entry can start the area first. The configured `rpiBin` must support `rpi --host`.
+
+In `web.json`, set `"hostArea": true` for the native default, `"hostArea": "work"` for a named area, or `"hostArea": false` for ordinary Web sessions. The setting follows the existing Web configuration precedence.
+
+Open the shared Session from the session list to see saved messages, send text prompts, follow live responses, and cancel runs. The native Host owns its Agent and tools. Web shuts down its connection when it exits. Other Web sessions continue to use the ordinary RPC backend.
+
 ### New-session model preference
 
 A successful **explicit** model choice in the composer, Runtime settings,

@@ -1,56 +1,98 @@
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { api, ApiError, type RunTiming, type RunTimingsPage } from "./api";
 import type { Row } from "./transcript";
 
-/** Supplemental native timing lookups never change transcript/SSE cursors. */
-export function useRunTimings(
+type TimingResult = {
+  binding: string;
+  values: RunTiming[];
+};
+
+type TimingState = {
+  binding: string;
+  cursor?: string;
+  values: Map<string, RunTiming>;
+};
+
+function isUnsupportedTimingError(error: unknown) {
+  return error instanceof ApiError && [404, 405, 501].includes(error.status);
+}
+
+/**
+ * Shared bounded, cancellable reader for supplemental native timing records.
+ * Transcript cursors are never touched.
+ */
+function useTimingQuery(
   sessionId: string,
-  rows: Row[],
   revision: string,
   ready: boolean,
   settled: number,
+  key: string,
+  body: { entryIds?: string[]; all?: boolean },
+  accept: (timing: RunTiming) => boolean,
+  enabled = true,
 ) {
-  const entryKey = JSON.stringify([
-    ...new Set(rows.flatMap((row) => (row.entryId ? [row.entryId] : []))),
-  ]);
-  const binding = `${sessionId}:${revision}`;
-  const cache = useRef<{
-    binding: string;
-    cursor?: string;
-    values: Map<string, RunTiming>;
-    unsupported: boolean;
-  }>({ binding, values: new Map(), unsupported: false });
-  const [result, setResult] = useState<{
-    binding: string;
-    values: RunTiming[];
-  }>({ binding, values: [] });
-  useEffect(() => {
-    if (cache.current.binding !== binding)
-      cache.current = { binding, values: new Map(), unsupported: false };
-    const state = cache.current;
-    if (!sessionId || !ready || state.unsupported) return;
-    const ids: string[] = JSON.parse(entryKey);
-    if (!ids.length) return;
-    const controller = new AbortController();
-    let timer: ReturnType<typeof setTimeout> | undefined;
-    const delay = (ms: number) =>
-      new Promise<void>((resolve) => {
-        const done = () => {
-          clearTimeout(timer);
-          controller.signal.removeEventListener("abort", done);
-          resolve();
-        };
-        timer = setTimeout(done, ms);
-        controller.signal.addEventListener("abort", done, { once: true });
-      });
-    const publish = () => {
-      if (!controller.signal.aborted && cache.current === state)
-        setResult({ binding, values: [...state.values.values()] });
+  const binding = `${sessionId}:${revision}:${key}`;
+  // `unsupported` is a property of the backend, not of one entry-ID selection:
+  // a host that answered 404/405/501 for the previous page would answer the
+  // same for the next one. Keying it by binding made every row change probe the
+  // endpoint again, so pagination replayed a lookup the host already refused.
+  const support = useRef({
+    binding: `${sessionId}:${revision}`,
+    unsupported: false,
+  });
+  if (support.current.binding !== `${sessionId}:${revision}`)
+    support.current = {
+      binding: `${sessionId}:${revision}`,
+      unsupported: false,
     };
-    void (async () => {
+  const cache = useRef<TimingState>({
+    binding,
+    values: new Map(),
+  });
+  const [result, setResult] = useState<TimingResult>({
+    binding,
+    values: [],
+  });
+  const nextBody = useRef(body);
+  nextBody.current = body;
+  const acceptTiming = useRef(accept);
+  acceptTiming.current = accept;
+
+  const run = useCallback(
+    async (state: TimingState, controller: AbortController) => {
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      const delay = (ms: number) =>
+        new Promise<void>((resolve) => {
+          const done = () => {
+            clearTimeout(timer);
+            controller.signal.removeEventListener("abort", done);
+            resolve();
+          };
+          timer = setTimeout(done, ms);
+          controller.signal.addEventListener("abort", done, { once: true });
+        });
+      const publish = () => {
+        if (!controller.signal.aborted && cache.current === state)
+          setResult({ binding, values: [...state.values.values()] });
+      };
       let resets = 0;
-      for (let start = 0; start < ids.length && !controller.signal.aborted;) {
-        const batch = ids.slice(start, start + 400);
+      const ids = nextBody.current.entryIds ?? [];
+      const all = nextBody.current.all === true;
+      // `all` is a single session-wide query. The row selector walks batches of
+      // at most 400 entry IDs because the server rejects larger lists. Each
+      // batch is its own request body: sending the union would exceed that
+      // bound and would also ask the server for rows this batch does not own.
+      const requests: Array<{ entryIds?: string[]; all?: boolean }> = all
+        ? [{ all: true }]
+        : Array.from({ length: Math.ceil(ids.length / 400) }, (_, index) => ({
+            entryIds: ids.slice(index * 400, index * 400 + 400),
+          }));
+      // A conflict restarts at the first batch; every other path advances by one.
+      for (
+        let start = 0;
+        start < requests.length && !controller.signal.aborted;
+      ) {
+        const batch = requests[start];
         let previousBytes = -1;
         let slices = 0;
         let failures = 0;
@@ -72,11 +114,7 @@ export function useRunTimings(
               return;
             state.cursor = page.cursor ?? undefined;
             for (const timing of page.timings) {
-              if (
-                timing &&
-                batch.includes(timing.finalEntryId) &&
-                validTiming(timing)
-              )
+              if (timing && acceptTiming.current(timing) && validTiming(timing))
                 state.values.set(timing.runId, timing);
             }
             publish();
@@ -99,27 +137,84 @@ export function useRunTimings(
               restart = true;
               break;
             }
-            if (
-              error instanceof ApiError &&
-              [404, 405, 501].includes(error.status)
-            )
-              state.unsupported = true;
+            if (isUnsupportedTimingError(error))
+              support.current.unsupported = true;
             // No invented local timer fallback. Transient unavailability may be
             // retried at the next settlement/navigation/older-page boundary.
             return;
+          } finally {
+            if (timer) clearTimeout(timer);
           }
         }
         // A conflict reset needs every earlier batch queried again too.
         if (restart) continue;
-        start += batch.length;
+        start += 1;
       }
-    })();
+    },
+    [binding, key, sessionId],
+  );
+
+  useEffect(() => {
+    if (cache.current.binding !== binding)
+      cache.current = { binding, values: new Map() };
+    const state = cache.current;
+    if (!sessionId || !ready || !enabled || support.current.unsupported) return;
+    if (!nextBody.current.all && !nextBody.current.entryIds?.length) return;
+    const controller = new AbortController();
+    void run(state, controller);
     return () => {
       controller.abort();
-      clearTimeout(timer);
     };
-  }, [binding, sessionId, entryKey, ready, settled]);
+  }, [binding, key, sessionId, ready, enabled, settled, run]);
   return result.binding === binding ? result.values : [];
+}
+
+/** Supplemental native timing lookups never change transcript/SSE cursors. */
+export function useRunTimings(
+  sessionId: string,
+  rows: Row[],
+  revision: string,
+  ready: boolean,
+  settled: number,
+) {
+  const entryKey = JSON.stringify([
+    ...new Set(rows.flatMap((row) => (row.entryId ? [row.entryId] : []))),
+  ]);
+  const entries: string[] = JSON.parse(entryKey);
+  const key = `rows:${entryKey}`;
+  const body = { entryIds: entries };
+  const accept = useCallback(
+    (timing: RunTiming) => entries.includes(timing.finalEntryId),
+    // `entries` is derived from the stable serialized `entryKey`.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [entryKey],
+  );
+  return useTimingQuery(
+    sessionId,
+    revision,
+    ready,
+    settled,
+    key,
+    body,
+    accept,
+    entries.length > 0,
+  );
+}
+
+/**
+ * Every finished native run in a session, including rounds outside the
+ * current transcript window. `all` is a metadata scan, never a browser clock.
+ */
+export function useSessionRunTimings(
+  sessionId: string,
+  revision: string,
+  ready: boolean,
+  settled: number,
+) {
+  const key = "all";
+  const body = { all: true };
+  const accept = useCallback(() => true, []);
+  return useTimingQuery(sessionId, revision, ready, settled, key, body, accept);
 }
 
 function validTiming(t: RunTiming) {

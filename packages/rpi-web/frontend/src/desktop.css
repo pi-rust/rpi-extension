@@ -1742,6 +1742,39 @@
   .workspace .empty-conversation .transcript {
     padding-top: 60px;
   }
+  /* The composer must stay an opaque layer above the empty-state project
+     name. Reserving transcript space alone is not enough on small mobile
+     viewports: with attachments the composer grows taller than that gap and
+     the text behind it shows through. Pin the empty-state copy near the
+     toolbar and let the composer own the rest of the panel. */
+  .workspace .empty-conversation .transcript-frame {
+    flex: 0 0 auto;
+  }
+  .workspace .empty-conversation .transcript {
+    flex: 0 0 auto;
+    padding-top: 12px;
+    padding-bottom: 0;
+  }
+  .workspace .empty-conversation .welcome {
+    margin: 0 auto;
+  }
+  .workspace .empty-conversation .welcome-symbol,
+  .workspace .empty-conversation .welcome h2,
+  .workspace .empty-conversation .welcome > p,
+  .workspace .empty-conversation .welcome .suggestions {
+    display: none;
+  }
+  .workspace .empty-conversation .composer-area {
+    flex: 1 1 auto;
+    display: flex;
+    flex-direction: column;
+    justify-content: flex-end;
+    min-height: 0;
+    background: var(--bg);
+  }
+  .workspace .empty-conversation .composer {
+    background: var(--bg);
+  }
   .workspace .composer-area {
     padding: 10px 13px 18px;
     --composer-pad-x: 13px;

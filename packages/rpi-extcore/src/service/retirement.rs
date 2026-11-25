@@ -38,6 +38,12 @@ fn owner_error() -> (ReplyKind, Value) {
 async fn idle_close(state: &Service, id: &str) -> ServiceResult<()> {
     let session = state.sessions.read().await.get(id).cloned();
     if let Some(session) = session {
+        if session.is_shared_area() {
+            return Err((
+                ReplyKind::Conflict,
+                json!({"error":"Session lifetime belongs to its native Host area", "code":"shared_host_session"}),
+            ));
+        }
         session.shutdown_if_idle().await.map_err(|error| match error {
             crate::host::IdleCloseError::Busy => (ReplyKind::Conflict, json!({"error":"Session is busy", "code":"session_busy"})),
             crate::host::IdleCloseError::Unavailable(_) => (ReplyKind::Unavailable, json!({"error":"Session idle state could not be confirmed", "code":"session_idle_unknown"})),
@@ -79,7 +85,12 @@ pub(super) async fn reap_idle(state: &Service, timeout: Duration) {
             .await
             .get(&id)
             .is_some_and(|last| last.elapsed() >= timeout);
-        if !expired {
+        if !expired
+            || state
+                .live_session(&id)
+                .await
+                .is_some_and(|session| session.is_shared_area())
+        {
             continue;
         }
         match idle_close(state, &id).await {
