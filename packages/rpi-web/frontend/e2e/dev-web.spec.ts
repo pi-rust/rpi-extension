@@ -1181,34 +1181,18 @@ test("rename, pin, archive and restore survive reloads", async ({ page }) => {
   ).toBeVisible();
 });
 
-test("fork is available from a session context menu", async ({ page }) => {
+test("session context menu does not offer the redundant Fork action", async ({
+  page,
+}) => {
   await mockHost(page);
-  let forkBody: { title?: string } | undefined;
-  await page.route("**/api/v1/sessions/session-1/fork", async (route) => {
-    forkBody = route.request().postDataJSON();
-    return route.fulfill({
-      status: 201,
-      json: {
-        sessionId: "fork-session",
-        sourceSessionId: sessionId,
-        status: "ready",
-      },
-    });
-  });
   await page.goto("/");
-  await page.locator(".project-session").first().click({ button: "right" });
+  await clickRowAction(page, "Session actions: Mock session");
+  await expect(
+    page.getByRole("menuitem", { name: "Clone", exact: true }),
+  ).toBeVisible();
   await expect(
     page.getByRole("menuitem", { name: "Fork", exact: true }),
-  ).toBeVisible();
-  await page.getByRole("menuitem", { name: "Fork", exact: true }).click();
-  const dialog = page.getByRole("dialog", {
-    name: "Name the new fork",
-    exact: true,
-  });
-  await expect(dialog.getByRole("textbox")).toHaveValue("Fork of Mock session");
-  await dialog.getByRole("textbox").fill("Design fork");
-  await dialog.getByRole("button", { name: "Submit", exact: true }).click();
-  await expect.poll(() => forkBody).toEqual({ title: "Design fork" });
+  ).toHaveCount(0);
 });
 
 test("session menu uses clone wording and icon for the clone action", async ({
@@ -1229,9 +1213,6 @@ test("session menu uses clone wording and icon for the clone action", async ({
   });
   await page.goto("/");
   await clickRowAction(page, "Session actions: Mock session");
-  await expect(
-    page.getByRole("menuitem", { name: "Fork", exact: true }),
-  ).toBeVisible();
   const clone = page.getByRole("menuitem", { name: "Clone", exact: true });
   await expect(clone).toBeVisible();
   await expect(clone.locator("svg.lucide-copy")).toHaveCount(1);
@@ -19031,7 +19012,7 @@ test.describe("retirement", () => {
     ).toHaveCount(1);
     await clickRowAction(page, "Session actions: Mock session");
     await expect(
-      page.getByRole("menuitem", { name: "Fork", exact: true }),
+      page.getByRole("menuitem", { name: "Clone", exact: true }),
     ).toBeVisible();
     await expect(
       page.getByRole("menuitem", { name: "Archive", exact: true }),
