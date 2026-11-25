@@ -257,7 +257,7 @@ fn validate_page(
             e.seq == expected
                 && e.seq <= p.last_seq
                 && e.event["type"].as_str().is_some_and(valid_id)
-                && serde_json::to_vec(&e.event).map_or(false, |b| b.len() <= 32768),
+                && serde_json::to_vec(&e.event).is_ok_and(|b| b.len() <= 32768),
         )?;
         next = e.seq;
         expected = expected.saturating_add(1);
