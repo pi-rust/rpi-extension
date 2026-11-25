@@ -7,6 +7,7 @@ use tokio::sync::watch;
 
 mod auth;
 mod children;
+mod delegations;
 mod events;
 mod middleware;
 mod projects;
@@ -226,6 +227,7 @@ fn routes(state: AppState) -> Router {
         .merge(auth::routes())
         .merge(sessions::routes())
         .merge(children::routes())
+        .merge(delegations::routes())
         .merge(events::routes())
         .layer(from_fn_with_state(state.clone(), admit_owner))
         .layer(from_fn_with_state(state.clone(), touch_session_activity))

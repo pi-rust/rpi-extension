@@ -1,4 +1,5 @@
 //! Session and workspace operations shared by protocol adapters.
+pub mod delegations;
 pub use crate::run_timing::RunTimingsQuery;
 mod message_queries;
 mod tool_program_access;
