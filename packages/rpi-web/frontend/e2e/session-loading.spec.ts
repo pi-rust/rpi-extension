@@ -737,6 +737,48 @@ test("live and polled settlement updates create one notification without a run I
   await expect(notification).toHaveCount(1);
 });
 
+test("skipped settlements stay quiet during live updates and later polling", async ({
+  page,
+  host,
+}) => {
+  await page.clock.install();
+  await start(page, host);
+  await hydrated(page, host);
+  await received(host, A, "events");
+  const skipped = {
+    type: "agent_settled",
+    outcome: "skipped",
+    pendingResume: false,
+  };
+  host.sessionSettlements[A] = skipped;
+  host.sessionLastSeq[A] = 11;
+  host.emit(A, [{ seq: 11, event: skipped }]);
+  await received(host, A, "snapshot", 2);
+
+  const notification = page.getByRole("button", {
+    name: "Session completed: Loading Alpha",
+    exact: true,
+  });
+  await expect(notification).toHaveCount(0);
+
+  // Later events advance the session cursor even though the settlement is unchanged.
+  for (const seq of [12, 13]) {
+    host.sessionLastSeq[A] = seq;
+    host.sessionSettlements[B] = { outcome: "completed", runId: `beta-${seq}` };
+    await page.clock.fastForward(5_000);
+    const completed = page.getByRole("button", {
+      name: "Session completed: Loading Beta",
+      exact: true,
+    });
+    await expect(completed).toBeVisible();
+    await expect(notification).toHaveCount(0);
+    await page
+      .getByRole("button", { name: "Dismiss notification", exact: true })
+      .click();
+    await expect(completed).toHaveCount(0);
+  }
+});
+
 test("settled sessions create clickable dismissible notifications", async ({
   page,
   host,

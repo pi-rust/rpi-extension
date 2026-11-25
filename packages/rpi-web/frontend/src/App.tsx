@@ -926,6 +926,8 @@ export default function App() {
       settlement: SettlementIdentity | null | undefined,
       fallbackSeq?: number,
     ) => {
+      // A skipped settlement releases an execution without finishing a run.
+      if (settlement?.outcome === "skipped") return;
       const identity =
         settlementKey(settlement, fallbackSeq) ??
         (fallbackSeq != null ? `seq:${fallbackSeq}` : null);
