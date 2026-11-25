@@ -1441,11 +1441,17 @@ test("native historical footer looks up only authoritative metadata for the disp
   enableNative(host);
   host.windows.push({ data: nativeWindowPage() });
   const queried: string[][] = [];
+  const historicalFooter = [{ runId: "historical-run", finalEntryId: "native-11", startedAt: 1000, finishedAt: 4000, elapsedMs: 3000, outcome: "completed" }];
   await page.route(`**/api/v1/sessions/${sessionId}/run-timings/query`, route => {
-    const ids = route.request().postDataJSON().entryIds as string[];
+    const body = route.request().postDataJSON();
+    // The composer footer asks for the whole session with `{all:true}`; this
+    // test asserts which entry IDs the per-row lookup requests.
+    if (body.all)
+      return route.fulfill({ json: { timings: historicalFooter, complete: true, cursor: null, scannedBytes: 0, totalBytes: 0 } });
+    const ids = body.entryIds as string[];
     queried.push(ids);
     return route.fulfill({ json: {
-      timings: ids.includes("native-11") ? [{ runId: "historical-run", finalEntryId: "native-11", startedAt: 1000, finishedAt: 4000, elapsedMs: 3000, outcome: "completed" }] : [],
+      timings: ids.includes("native-11") ? historicalFooter : [],
       complete: true, cursor: null, scannedBytes: 0, totalBytes: 0,
     } });
   });

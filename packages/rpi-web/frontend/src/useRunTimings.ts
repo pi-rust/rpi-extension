@@ -11,7 +11,6 @@ type TimingState = {
   binding: string;
   cursor?: string;
   values: Map<string, RunTiming>;
-  unsupported: boolean;
 };
 
 function isUnsupportedTimingError(error: unknown) {
@@ -33,10 +32,22 @@ function useTimingQuery(
   enabled = true,
 ) {
   const binding = `${sessionId}:${revision}:${key}`;
+  // `unsupported` is a property of the backend, not of one entry-ID selection:
+  // a host that answered 404/405/501 for the previous page would answer the
+  // same for the next one. Keying it by binding made every row change probe the
+  // endpoint again, so pagination replayed a lookup the host already refused.
+  const support = useRef({
+    binding: `${sessionId}:${revision}`,
+    unsupported: false,
+  });
+  if (support.current.binding !== `${sessionId}:${revision}`)
+    support.current = {
+      binding: `${sessionId}:${revision}`,
+      unsupported: false,
+    };
   const cache = useRef<TimingState>({
     binding,
     values: new Map(),
-    unsupported: false,
   });
   const [result, setResult] = useState<TimingResult>({
     binding,
@@ -67,11 +78,21 @@ function useTimingQuery(
       let resets = 0;
       const ids = nextBody.current.entryIds ?? [];
       const all = nextBody.current.all === true;
+      // `all` is a single session-wide query. The row selector walks batches of
+      // at most 400 entry IDs because the server rejects larger lists. Each
+      // batch is its own request body: sending the union would exceed that
+      // bound and would also ask the server for rows this batch does not own.
+      const requests: Array<{ entryIds?: string[]; all?: boolean }> = all
+        ? [{ all: true }]
+        : Array.from({ length: Math.ceil(ids.length / 400) }, (_, index) => ({
+            entryIds: ids.slice(index * 400, index * 400 + 400),
+          }));
+      // A conflict restarts at the first batch; every other path advances by one.
       for (
         let start = 0;
-        start < (all ? 1 : ids.length) && !controller.signal.aborted;
+        start < requests.length && !controller.signal.aborted;
       ) {
-        const batch = all ? [] : ids.slice(start, start + 400);
+        const batch = requests[start];
         let previousBytes = -1;
         let slices = 0;
         let failures = 0;
@@ -80,7 +101,7 @@ function useTimingQuery(
           try {
             const page: RunTimingsPage = await api.runTimings(
               sessionId,
-              nextBody.current,
+              batch,
               state.cursor,
               controller.signal,
             );
@@ -116,7 +137,8 @@ function useTimingQuery(
               restart = true;
               break;
             }
-            if (isUnsupportedTimingError(error)) state.unsupported = true;
+            if (isUnsupportedTimingError(error))
+              support.current.unsupported = true;
             // No invented local timer fallback. Transient unavailability may be
             // retried at the next settlement/navigation/older-page boundary.
             return;
@@ -126,7 +148,7 @@ function useTimingQuery(
         }
         // A conflict reset needs every earlier batch queried again too.
         if (restart) continue;
-        start += batch.length;
+        start += 1;
       }
     },
     [binding, key, sessionId],
@@ -134,9 +156,9 @@ function useTimingQuery(
 
   useEffect(() => {
     if (cache.current.binding !== binding)
-      cache.current = { binding, values: new Map(), unsupported: false };
+      cache.current = { binding, values: new Map() };
     const state = cache.current;
-    if (!sessionId || !ready || !enabled || state.unsupported) return;
+    if (!sessionId || !ready || !enabled || support.current.unsupported) return;
     if (!nextBody.current.all && !nextBody.current.entryIds?.length) return;
     const controller = new AbortController();
     void run(state, controller);

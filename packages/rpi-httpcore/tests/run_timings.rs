@@ -232,6 +232,9 @@ async fn run_timings_preserve_security_validation_and_paging() {
             .status(),
         409
     );
+    // The row scan keeps its own cached slot, so the session-total lookup does
+    // not evict it: resuming without a cursor returns the already-complete row
+    // page instead of rescanning the transcript from the first byte.
     let response = post(&url)
         .json(&json!({"entryIds":["actual"]}))
         .send()
@@ -239,7 +242,8 @@ async fn run_timings_preserve_security_validation_and_paging() {
         .unwrap();
     assert_eq!(response.status(), 200);
     let row_scan = response.json::<Value>().await.unwrap();
-    assert_eq!(row_scan["complete"], false);
+    assert_eq!(row_scan["complete"], true);
+    assert_eq!(row_scan["timings"], page["timings"]);
 
     // The 400-entry boundary is accepted, not rejected by the adapter.
     let response = post(&url).json(&json!({"entryIds":(0..400).map(|n| n.to_string()).collect::<Vec<_>>(),"cursor":row_scan["cursor"]})).send().await.unwrap();
