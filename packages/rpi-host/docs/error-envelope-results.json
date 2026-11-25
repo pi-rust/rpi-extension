@@ -1,0 +1,390 @@
+{
+  "passed": true,
+  "binary_sha256": "81501327df8cd705d389001b609bbd5eb28a3c5ed8132a971273e0cd985ae816",
+  "plugin_sha256": "f3f3d455c14fdf49374ca9a8f3c34e4f4116deb8f30c99ec49e084e247a086eb",
+  "cases": [
+    {
+      "name": "native_status_success",
+      "peer": "native",
+      "passed": true,
+      "status": "reply_received",
+      "native_event": {
+        "type": "tool_execution_end",
+        "toolCallId": "host-error-probe",
+        "toolName": "host",
+        "isError": false,
+        "result": {
+          "content": [
+            {
+              "type": "text",
+              "text": "{\"error\":false,\"status\":\"reply_received\",\"data\":{\"epoch\":\"e9c4fc79-e2d1-4f22-a954-a51867435e54\",\"registered\":0,\"resident\":0,\"executing\":0,\"busy\":0,\"mini\":0,\"max_agents\":null,\"owners\":0,\"stopping\":false},\"control\":{\"protocol\":\"rpi-shared-host\",\"version\":{\"major\":1,\"minor\":4},\"host_id\":\"7699bb51-8a4e-4a22-b6df-aaf89deec183\",\"epoch\":\"e9c4fc79-e2d1-4f22-a954-a51867435e54\",\"capabilities\":[\"status\",\"list\",\"inspect\",\"receipts\",\"submit\"],\"limits\":{\"max_frame_bytes\":1048576,\"max_in_flight\":1,\"max_page_size\":128}}}"
+            }
+          ],
+          "details": {
+            "error": false,
+            "status": "reply_received",
+            "data": {
+              "epoch": "e9c4fc79-e2d1-4f22-a954-a51867435e54",
+              "registered": 0,
+              "resident": 0,
+              "executing": 0,
+              "busy": 0,
+              "mini": 0,
+              "max_agents": null,
+              "owners": 0,
+              "stopping": false
+            },
+            "control": {
+              "protocol": "rpi-shared-host",
+              "version": {
+                "major": 1,
+                "minor": 4
+              },
+              "host_id": "7699bb51-8a4e-4a22-b6df-aaf89deec183",
+              "epoch": "e9c4fc79-e2d1-4f22-a954-a51867435e54",
+              "capabilities": [
+                "status",
+                "list",
+                "inspect",
+                "receipts",
+                "submit"
+              ],
+              "limits": {
+                "max_frame_bytes": 1048576,
+                "max_in_flight": 1,
+                "max_page_size": 128
+              }
+            }
+          },
+          "usage": null,
+          "addedToolNames": [],
+          "terminate": false
+        }
+      }
+    },
+    {
+      "name": "native_agent_not_found",
+      "peer": "native",
+      "passed": true,
+      "status": "rejected",
+      "native_event": {
+        "type": "tool_execution_end",
+        "toolCallId": "host-error-probe",
+        "toolName": "host",
+        "isError": true,
+        "result": {
+          "content": [
+            {
+              "type": "text",
+              "text": "{\"error\":true,\"status\":\"rejected\",\"message\":\"shared Host rejected request: NotFound\",\"code\":\"not_found\",\"control\":{\"protocol\":\"rpi-shared-host\",\"version\":{\"major\":1,\"minor\":4},\"host_id\":\"4f8d27d6-0b7d-45ce-a051-9b01d2e224f0\",\"epoch\":\"475dec43-3356-4746-91fe-85202212fae5\",\"capabilities\":[\"status\",\"list\",\"inspect\",\"receipts\",\"submit\"],\"limits\":{\"max_frame_bytes\":1048576,\"max_in_flight\":1,\"max_page_size\":128}}}"
+            }
+          ],
+          "details": {
+            "error": true,
+            "status": "rejected",
+            "message": "shared Host rejected request: NotFound",
+            "code": "not_found",
+            "control": {
+              "protocol": "rpi-shared-host",
+              "version": {
+                "major": 1,
+                "minor": 4
+              },
+              "host_id": "4f8d27d6-0b7d-45ce-a051-9b01d2e224f0",
+              "epoch": "475dec43-3356-4746-91fe-85202212fae5",
+              "capabilities": [
+                "status",
+                "list",
+                "inspect",
+                "receipts",
+                "submit"
+              ],
+              "limits": {
+                "max_frame_bytes": 1048576,
+                "max_in_flight": 1,
+                "max_page_size": 128
+              }
+            }
+          },
+          "usage": null,
+          "addedToolNames": [],
+          "terminate": false
+        }
+      }
+    },
+    {
+      "name": "local_missing_config",
+      "peer": "missing_config",
+      "passed": true,
+      "status": "not_sent",
+      "native_event": {
+        "type": "tool_execution_end",
+        "toolCallId": "host-error-probe",
+        "toolName": "host",
+        "isError": true,
+        "result": {
+          "content": [
+            {
+              "type": "text",
+              "text": "{\"error\":true,\"status\":\"not_sent\",\"message\":\"Set RPI_SHARED_HOST_CONFIG before loading rpi-host; tool arguments cannot choose credentials or endpoints\"}"
+            }
+          ],
+          "details": {
+            "error": true,
+            "status": "not_sent",
+            "message": "Set RPI_SHARED_HOST_CONFIG before loading rpi-host; tool arguments cannot choose credentials or endpoints"
+          },
+          "usage": null,
+          "addedToolNames": [],
+          "terminate": false
+        }
+      }
+    },
+    {
+      "name": "query_disconnected",
+      "peer": "closed",
+      "passed": true,
+      "status": "query_failed",
+      "native_event": {
+        "type": "tool_execution_end",
+        "toolCallId": "host-error-probe",
+        "toolName": "host",
+        "isError": true,
+        "result": {
+          "content": [
+            {
+              "type": "text",
+              "text": "{\"error\":true,\"status\":\"query_failed\",\"message\":\"shared Host query failed: Connection\",\"control\":{\"protocol\":\"rpi-shared-host\",\"version\":{\"major\":1,\"minor\":4},\"host_id\":\"a5c097f4-26a9-4b29-89ea-c720ae86c4d5\",\"epoch\":\"0f6609b2-55f7-48b7-921b-ab4c4c1819ce\",\"capabilities\":[\"status\",\"submit\",\"administrative_close\"],\"limits\":{\"max_frame_bytes\":1048576,\"max_in_flight\":64,\"max_page_size\":128}}}"
+            }
+          ],
+          "details": {
+            "error": true,
+            "status": "query_failed",
+            "message": "shared Host query failed: Connection",
+            "control": {
+              "protocol": "rpi-shared-host",
+              "version": {
+                "major": 1,
+                "minor": 4
+              },
+              "host_id": "a5c097f4-26a9-4b29-89ea-c720ae86c4d5",
+              "epoch": "0f6609b2-55f7-48b7-921b-ab4c4c1819ce",
+              "capabilities": [
+                "status",
+                "submit",
+                "administrative_close"
+              ],
+              "limits": {
+                "max_frame_bytes": 1048576,
+                "max_in_flight": 64,
+                "max_page_size": 128
+              }
+            }
+          },
+          "usage": null,
+          "addedToolNames": [],
+          "terminate": false
+        }
+      }
+    },
+    {
+      "name": "mutation_reply_lost",
+      "peer": "closed",
+      "passed": true,
+      "status": "outcome_unknown",
+      "native_event": {
+        "type": "tool_execution_end",
+        "toolCallId": "host-error-probe",
+        "toolName": "host",
+        "isError": true,
+        "result": {
+          "content": [
+            {
+              "type": "text",
+              "text": "{\"error\":true,\"status\":\"outcome_unknown\",\"message\":\"shared Host outcome unknown for request a8555f96-3e8a-4480-acca-37ae83729cdf: Connection; query its receipt before retrying\",\"request_id\":\"a8555f96-3e8a-4480-acca-37ae83729cdf\",\"reconcile\":{\"command\":{\"op\":\"receipt\",\"agent_id\":\"f1e212d5-33ac-4f15-a308-85150e0d2d2a\",\"request_id\":\"a8555f96-3e8a-4480-acca-37ae83729cdf\"}},\"control\":{\"protocol\":\"rpi-shared-host\",\"version\":{\"major\":1,\"minor\":4},\"host_id\":\"5c06490a-2c93-4b69-9882-0ced740e2724\",\"epoch\":\"d0225599-cbce-4c63-bf9e-46ad4b559646\",\"capabilities\":[\"status\",\"submit\",\"administrative_close\"],\"limits\":{\"max_frame_bytes\":1048576,\"max_in_flight\":64,\"max_page_size\":128}}}"
+            }
+          ],
+          "details": {
+            "error": true,
+            "status": "outcome_unknown",
+            "message": "shared Host outcome unknown for request a8555f96-3e8a-4480-acca-37ae83729cdf: Connection; query its receipt before retrying",
+            "request_id": "a8555f96-3e8a-4480-acca-37ae83729cdf",
+            "reconcile": {
+              "command": {
+                "op": "receipt",
+                "agent_id": "f1e212d5-33ac-4f15-a308-85150e0d2d2a",
+                "request_id": "a8555f96-3e8a-4480-acca-37ae83729cdf"
+              }
+            },
+            "control": {
+              "protocol": "rpi-shared-host",
+              "version": {
+                "major": 1,
+                "minor": 4
+              },
+              "host_id": "5c06490a-2c93-4b69-9882-0ced740e2724",
+              "epoch": "d0225599-cbce-4c63-bf9e-46ad4b559646",
+              "capabilities": [
+                "status",
+                "submit",
+                "administrative_close"
+              ],
+              "limits": {
+                "max_frame_bytes": 1048576,
+                "max_in_flight": 64,
+                "max_page_size": 128
+              }
+            }
+          },
+          "usage": null,
+          "addedToolNames": [],
+          "terminate": false
+        }
+      }
+    },
+    {
+      "name": "native_receipt_uncertain_projection",
+      "peer": "uncertain",
+      "passed": true,
+      "status": "native_not_succeeded",
+      "native_event": {
+        "type": "tool_execution_end",
+        "toolCallId": "host-error-probe",
+        "toolName": "host",
+        "isError": true,
+        "result": {
+          "content": [
+            {
+              "type": "text",
+              "text": "{\"error\":true,\"status\":\"native_not_succeeded\",\"data\":{\"receipt\":{\"request\":{\"scope\":\"cc3fa7ba-5cf6-4236-b05c-eb1934e56245\",\"request_id\":\"62b2467d-6769-4c7f-bb3e-2e719bb9f619\",\"epoch\":\"ab2afe4f-0356-43d8-ac39-3fe5b3a5d9eb\",\"action\":{\"op\":\"close\",\"agent_id\":\"8422fe60-6a5f-4d49-82cc-452ea41cd474\",\"revision\":7}},\"status\":{\"state\":\"uncertain\"}}},\"message\":\"Native receipt is not succeeded; inspect its state. Do not blindly retry or replace the request identity\",\"reconcile\":{\"command\":{\"op\":\"administrative_receipt\",\"request\":{\"scope\":\"cc3fa7ba-5cf6-4236-b05c-eb1934e56245\",\"request_id\":\"62b2467d-6769-4c7f-bb3e-2e719bb9f619\",\"epoch\":\"ab2afe4f-0356-43d8-ac39-3fe5b3a5d9eb\",\"action\":{\"op\":\"close\",\"agent_id\":\"8422fe60-6a5f-4d49-82cc-452ea41cd474\",\"revision\":7}}}},\"control\":{\"protocol\":\"rpi-shared-host\",\"version\":{\"major\":1,\"minor\":4},\"host_id\":\"41d94576-7a86-44ea-867c-40af8f462708\",\"epoch\":\"ab2afe4f-0356-43d8-ac39-3fe5b3a5d9eb\",\"capabilities\":[\"status\",\"submit\",\"administrative_close\"],\"limits\":{\"max_frame_bytes\":1048576,\"max_in_flight\":64,\"max_page_size\":128}}}"
+            }
+          ],
+          "details": {
+            "error": true,
+            "status": "native_not_succeeded",
+            "data": {
+              "receipt": {
+                "request": {
+                  "scope": "cc3fa7ba-5cf6-4236-b05c-eb1934e56245",
+                  "request_id": "62b2467d-6769-4c7f-bb3e-2e719bb9f619",
+                  "epoch": "ab2afe4f-0356-43d8-ac39-3fe5b3a5d9eb",
+                  "action": {
+                    "op": "close",
+                    "agent_id": "8422fe60-6a5f-4d49-82cc-452ea41cd474",
+                    "revision": 7
+                  }
+                },
+                "status": {
+                  "state": "uncertain"
+                }
+              }
+            },
+            "message": "Native receipt is not succeeded; inspect its state. Do not blindly retry or replace the request identity",
+            "reconcile": {
+              "command": {
+                "op": "administrative_receipt",
+                "request": {
+                  "scope": "cc3fa7ba-5cf6-4236-b05c-eb1934e56245",
+                  "request_id": "62b2467d-6769-4c7f-bb3e-2e719bb9f619",
+                  "epoch": "ab2afe4f-0356-43d8-ac39-3fe5b3a5d9eb",
+                  "action": {
+                    "op": "close",
+                    "agent_id": "8422fe60-6a5f-4d49-82cc-452ea41cd474",
+                    "revision": 7
+                  }
+                }
+              }
+            },
+            "control": {
+              "protocol": "rpi-shared-host",
+              "version": {
+                "major": 1,
+                "minor": 4
+              },
+              "host_id": "41d94576-7a86-44ea-867c-40af8f462708",
+              "epoch": "ab2afe4f-0356-43d8-ac39-3fe5b3a5d9eb",
+              "capabilities": [
+                "status",
+                "submit",
+                "administrative_close"
+              ],
+              "limits": {
+                "max_frame_bytes": 1048576,
+                "max_in_flight": 64,
+                "max_page_size": 128
+              }
+            }
+          },
+          "usage": null,
+          "addedToolNames": [],
+          "terminate": false
+        }
+      }
+    },
+    {
+      "name": "query_envelope_overflow",
+      "peer": "large",
+      "passed": true,
+      "status": "query_failed",
+      "native_event": {
+        "type": "tool_execution_end",
+        "toolCallId": "host-error-probe",
+        "toolName": "host",
+        "isError": true,
+        "result": {
+          "content": [
+            {
+              "type": "text",
+              "text": "{\"error\":true,\"status\":\"query_failed\",\"message\":\"Host reply exceeds the 1 MiB tool-result envelope budget; no reply data is returned. Use smaller query pages where available. A mutation may have succeeded; reconcile the original request before retrying\"}"
+            }
+          ],
+          "details": {
+            "error": true,
+            "status": "query_failed",
+            "message": "Host reply exceeds the 1 MiB tool-result envelope budget; no reply data is returned. Use smaller query pages where available. A mutation may have succeeded; reconcile the original request before retrying"
+          },
+          "usage": null,
+          "addedToolNames": [],
+          "terminate": false
+        }
+      }
+    },
+    {
+      "name": "mutation_envelope_overflow",
+      "peer": "large",
+      "passed": true,
+      "status": "outcome_unknown",
+      "native_event": {
+        "type": "tool_execution_end",
+        "toolCallId": "host-error-probe",
+        "toolName": "host",
+        "isError": true,
+        "result": {
+          "content": [
+            {
+              "type": "text",
+              "text": "{\"error\":true,\"status\":\"outcome_unknown\",\"message\":\"Host reply exceeds the 1 MiB tool-result envelope budget; no reply data is returned. Use smaller query pages where available. A mutation may have succeeded; reconcile the original request before retrying\",\"request_id\":\"a8555f96-3e8a-4480-acca-37ae83729cdf\",\"reconcile\":{\"command\":{\"op\":\"receipt\",\"agent_id\":\"f1e212d5-33ac-4f15-a308-85150e0d2d2a\",\"request_id\":\"a8555f96-3e8a-4480-acca-37ae83729cdf\"}}}"
+            }
+          ],
+          "details": {
+            "error": true,
+            "status": "outcome_unknown",
+            "message": "Host reply exceeds the 1 MiB tool-result envelope budget; no reply data is returned. Use smaller query pages where available. A mutation may have succeeded; reconcile the original request before retrying",
+            "request_id": "a8555f96-3e8a-4480-acca-37ae83729cdf",
+            "reconcile": {
+              "command": {
+                "op": "receipt",
+                "agent_id": "f1e212d5-33ac-4f15-a308-85150e0d2d2a",
+                "request_id": "a8555f96-3e8a-4480-acca-37ae83729cdf"
+              }
+            }
+          },
+          "usage": null,
+          "addedToolNames": [],
+          "terminate": false
+        }
+      }
+    }
+  ],
+  "all_fixture_processes_and_threads_reaped": true
+}

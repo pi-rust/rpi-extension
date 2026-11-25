@@ -49,6 +49,7 @@ crates.io 发布并创建各包标签，入口是
 | [rpi-mcp-adapter](packages/rpi-mcp-adapter/README.md) | 通过 `mcp_list`、`mcp_call`、`mcp_resource` 发现/调用工具并管理资源；`mcp_request` 提供原始诊断 |
 | [rpi-mcp-server](packages/rpi-mcp-server/README.md) | 用 `--mcp` 将代理发布为 MCP 服务器，或运行独立的 `rpi-mcp-bridge` |
 | [rpi-subagents](packages/rpi-subagents/README.md) | 用 `delegate_task` 委派任务 |
+| [rpi-host](packages/rpi-host/README.md) | 可选、尚未发布的 `host` 管理工具：显式连接共享 Host，查询、提交/收据及受控生命周期操作，不回退子进程 |
 | [rpi-codemode](packages/rpi-codemode/README.md) | 用受限 JavaScript 组合原生工具，支持无损业务 JSON 和显式精确原生结果选择（内联限额内）；已发布/预编译扩展，需要配套的 ToolProgram v1 能力 |
 | [rpi-orchestrator](packages/rpi-orchestrator/README.md) | 通过 `subagent`、`plan`、`dispatch` 实现有边界的子代理与任务图 |
 | [rpi-lens](packages/rpi-lens/README.md) | 用 `code_lens` 检查代码 |

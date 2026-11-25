@@ -42,5 +42,6 @@ pub mod run;
 pub mod run_timing;
 pub mod service;
 pub mod session_catalog;
+pub mod shared_host;
 pub mod timing;
 pub mod workspace;

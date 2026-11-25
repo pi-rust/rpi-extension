@@ -1,0 +1,116 @@
+{
+  "feature_functional_acceptance": true,
+  "full_workspace_all_green": false,
+  "no_memory_benchmark_rerun": true,
+  "source_inputs": {
+    "core": {
+      "root": "/Users/bigfish/work/rpi-projects/pi-rust-wt-host",
+      "before_count": 1028,
+      "unchanged_count": 1019,
+      "changed_existing": [
+        "crates/rpi-cli/src/host/client_tests.rs",
+        "crates/rpi-cli/src/host/daemon_administration_tests.rs",
+        "crates/rpi-cli/src/host/fixtures/control-v1.json",
+        "crates/rpi-cli/src/host/protocol.rs",
+        "crates/rpi-cli/src/host/server.rs",
+        "crates/rpi-cli/src/host/server_tests.rs",
+        "crates/rpi-cli/src/host/README.md",
+        "crates/rpi-cli/src/host/ordinary/mod.rs",
+        "crates/rpi-cli/src/host/ordinary/supervisor.rs"
+      ]
+    },
+    "extension": {
+      "root": "/Users/bigfish/work/rpi-projects/rpi-extension-wt-host",
+      "before_count": 648,
+      "unchanged_count": 635,
+      "changed_existing": [
+        "packages/rpi-extcore/src/shared_host/README.md",
+        "packages/rpi-extcore/src/shared_host/client_tests.rs",
+        "packages/rpi-extcore/src/shared_host/fixtures/control-v1.json",
+        "packages/rpi-extcore/src/shared_host/protocol.rs",
+        "packages/rpi-extcore/tests/shared_host_daemon.rs",
+        "packages/rpi-host/README.md",
+        "packages/rpi-host/docs/error-envelope.md",
+        "packages/rpi-host/docs/functional-review.md",
+        "packages/rpi-host/src/control.rs",
+        "packages/rpi-host/src/control/tests.rs",
+        "packages/rpi-host/src/schema.json",
+        "packages/rpi-host/src/tests.rs",
+        "packages/rpi-host/tests/native_errors.py"
+      ]
+    }
+  },
+  "four_contracts_identical": {
+    "protocol.rs": "920a93636c7e87c5a9c7053557e9f044f6030327c0be9466ec274e34ce4721e0",
+    "client.rs": "55cb9897c61594dc554baddcc06dc80dcf88d11458b1a14fff1bc137c5d9e97a",
+    "client_tests.rs": "8df4c991962ddf635b34e7dd67d9821ee3b59f411104b42e1898d2f6433759ae",
+    "fixtures/control-v1.json": "33560f0b5d074b7822710493f7bcb16bec21c63ba5237629db4765bb25dab320"
+  },
+  "new_files": [
+    "/Users/bigfish/work/rpi-projects/pi-rust-wt-host/crates/rpi-cli/src/host/submission_result.rs",
+    "/Users/bigfish/work/rpi-projects/rpi-extension-wt-host/packages/rpi-host/tests/native_results.py",
+    "/Users/bigfish/work/rpi-projects/rpi-extension-wt-host/packages/rpi-host/docs/result-interface.md",
+    "/Users/bigfish/work/rpi-projects/rpi-extension-wt-host/packages/rpi-host/docs/result-interface-results.json",
+    "/Users/bigfish/work/rpi-projects/rpi-extension-wt-host/packages/rpi-host/docs/result-interface-error-results.json",
+    "/Users/bigfish/work/rpi-projects/rpi-extension-wt-host/packages/rpi-host/docs/result-interface-validation.json"
+  ],
+  "syntax_json_whitespace_and_git_diff_check": true,
+  "historical_memory_script_sha256": "912e94f5bd9bf09c488247c740f90e7d41201cfb4a9bcb59ce912a49990f510a",
+  "historic_error_and_memory_evidence_unchanged": true,
+  "artifacts": {
+    "binary_sha256": "dbe0288ae3459e216212643ff5d8d0cf538bd2b99c639f37c88c4f6718f353dd",
+    "plugin_sha256": "b21e7dfe0b7626014d9d39021fbf753570e2d3e24a3bc56b4b8c7cd075b2d477",
+    "core_profile": "dev/debug; not release benchmark artifact",
+    "extension_profile": "release"
+  },
+  "native": {
+    "checks": [
+      "real_running_native_run",
+      "exact_utf8_multipage_answer",
+      "wrong_run_and_invalid_offsets_rejected",
+      "duplicate_and_result_queries_do_not_replay",
+      "same_request_id_is_agent_scoped",
+      "old_answer_is_not_current_session_tip",
+      "real_provider_failure_outcome",
+      "real_running_cancel_then_aborted_outcome",
+      "crash_restart_unknown_without_replay"
+    ],
+    "management_tool_calls": 33,
+    "native_provider_calls": 6,
+    "error_cases": 10,
+    "legacy_basic_tool_calls": 7,
+    "legacy_administrative_tool_calls": 21,
+    "all_fixture_resources_joined": true,
+    "fixture_only_stale_socket_cleanup_after_reaping": true
+  },
+  "tests": {
+    "core_host_passed": 284,
+    "extension_package_passed": 19,
+    "sdk_contract_passed": 22,
+    "sdk_real_daemon_passed": 1,
+    "ignored_in_these_runs": 0,
+    "extension_strict_scoped_clippy": "passed; sole existing -A clippy::not_unsafe_ptr_arg_deref",
+    "scoped_fmt": "passed"
+  },
+  "core_strict_clippy": {
+    "passed": false,
+    "existing_diagnostics": 55,
+    "host_primary_spans": [
+      [
+        "crates/rpi-cli/src/host/ordinary/mod.rs",
+        235
+      ]
+    ],
+    "projection_and_added_methods_diagnostics": 0,
+    "note": "Pre-existing 55-warning baseline documented in Host README A batch; no new lint suppression, not a claim of full core/workspace green."
+  },
+  "scripts_sha256": {
+    "native_results.py": "cf2c1926e2d3506c67deb7849f2c4fc7bab86296832f4f2f45d6e0c68602094f",
+    "native_errors.py": "6eb44edf1bf6589d042ee340839d151ccedac42e7fb520b41b5449a545913809"
+  },
+  "evidence_sha256": {
+    "result-interface-results.json": "0a0f0dc183dc23e7b78d58ae22e65c4d9ad9db071da021477387768373df0835",
+    "result-interface-error-results.json": "23af72e6e96936b15278db34abcb5272ece91289e461c66585aa89a3f217f3a9"
+  },
+  "logs_directory": "/tmp/rpi-host-integration-checks"
+}
