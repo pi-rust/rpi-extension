@@ -201,6 +201,12 @@ standalone`, or `navigator.standalone`) never show it. There is no service
 worker: installation relies on the manifest alone, so nothing is cached for
 offline use and a deploy is always fetched from the server.
 
+An installed app keeps the artwork it was installed with: the icon URLs carry a
+`?v=` suffix so a new build hands browsers different files, but Chromium stores one
+icon per manifest `id`/origin and reuses it when the same site is installed again.
+After an icon change, remove the existing app (**Remove from Chrome** / 从 Chrome 中移除)
+and install once more; reinstalling over the old entry keeps the stale icon.
+
 
 ## Installation
 
