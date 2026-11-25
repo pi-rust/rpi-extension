@@ -975,13 +975,13 @@ export const api = {
   },
   runTimings: (
     id: string,
-    entryIds: string[],
+    query: { entryIds?: string[]; all?: boolean },
     cursor?: string,
     signal?: AbortSignal,
   ) =>
     request<RunTimingsPage>(`/sessions/${id}/run-timings/query`, {
       method: "POST",
-      body: JSON.stringify({ entryIds, ...(cursor ? { cursor } : {}) }),
+      body: JSON.stringify({ ...query, ...(cursor ? { cursor } : {}) }),
       signal,
     }),
   messageSummaries: (

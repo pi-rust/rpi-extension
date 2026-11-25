@@ -10461,23 +10461,39 @@ test.describe("run timing regressions", () => {
     page,
   }) => {
     await mockHost(page);
-    await history(page, [
-      { role: "user", entryId: "work-prompt", content: "Do work" },
-      finalMessage("work-final", "Worked"),
-    ]);
-    await page.route(timingRoute, (route) =>
-      route.fulfill({
-        json: timingPage([
-          nativeTiming("work-final", "work-run-1", "completed", 138_000),
-          nativeTiming("work-final", "work-run-2", "failed", 2_000),
-        ]),
-      }),
-    );
+    // Only the newest round is in the loaded transcript. The footer must
+    // still add the older native run discovered by the all-session lookup.
+    await history(page, [finalMessage("work-final", "Worked")]);
+    const queries: unknown[] = [];
+    await page.route(timingRoute, (route) => {
+      const body = route.request().postDataJSON();
+      queries.push(body);
+      return route.fulfill({
+        json: timingPage(
+          body.all
+            ? [
+                nativeTiming("older-final", "older-run", "completed", 60_000),
+                nativeTiming("work-final", "work-run-1", "completed", 138_000),
+                nativeTiming("work-final", "work-run-2", "failed", 2_000),
+              ]
+            : [
+                nativeTiming("work-final", "work-run-1", "completed", 138_000),
+                nativeTiming("work-final", "work-run-2", "failed", 2_000),
+              ],
+        ),
+      });
+    });
     await page.goto("/");
     const metrics = page.locator(".composer-metrics.slim-metrics");
+    // The older run has no row in the loaded transcript, so summing the
+    // per-row timings would report only the most recent round.
     await expect(
-      metrics.getByLabel("Session work: 2m 20s", { exact: true }),
-    ).toContainText("2m 20s");
+      metrics.getByLabel("Session work: 3m 20s", { exact: true }),
+    ).toContainText("3m 20s");
+    expect(queries).toContainEqual({ all: true });
+    expect(queries).toContainEqual({
+      entryIds: ["work-final"],
+    });
     const labels = await metrics
       .locator(".composer-metric")
       .evaluateAll((nodes) =>
@@ -10486,7 +10502,7 @@ test.describe("run timing regressions", () => {
     expect(labels).toEqual(["Cache hit", "Context", "Session work"]);
     await chooseLanguage(page, "zh");
     await expect(
-      metrics.getByLabel("会话工作时长: 2m 20s", { exact: true }),
+      metrics.getByLabel("会话工作时长: 3m 20s", { exact: true }),
     ).toBeVisible();
   });
 

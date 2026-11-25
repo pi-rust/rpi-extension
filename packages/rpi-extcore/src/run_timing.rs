@@ -24,6 +24,9 @@ pub struct RunTimingsQuery {
     #[serde(rename = "entryIds", default)]
     pub entry_ids: Vec<String>,
     pub cursor: Option<String>,
+    /// Return every finished run in the session instead of selecting by entry IDs.
+    #[serde(default, rename = "all")]
+    pub all: bool,
 }
 impl RunTimingsQuery {
     pub fn validate(&self) -> Result<(), ServiceError> {
@@ -68,6 +71,7 @@ struct Active {
 struct Scan {
     path: PathBuf,
     generation: String,
+    all: bool,
     identity: Identity,
     modified: Option<SystemTime>,
     length: u64,
@@ -128,6 +132,13 @@ impl RunTimingCache {
         query: &RunTimingsQuery,
     ) -> Result<RunTimingsPage, ServiceError> {
         query.validate()?;
+        // `all` is the session-total lookup: entry selection is intentionally
+        // ignored so runs outside a bounded transcript window still count.
+        let selected: HashSet<_> = if query.all {
+            HashSet::new()
+        } else {
+            query.entry_ids.iter().map(String::as_str).collect()
+        };
         let existing = self.scans.iter().position(|(key, _)| key == id);
         let mut scan = if let Some(index) = existing {
             // A stale client must not evict or promote a healthy newer generation.
@@ -148,6 +159,7 @@ impl RunTimingCache {
             Scan {
                 path,
                 generation: format!("{id}:{}", uuid::Uuid::new_v4()),
+                all: query.all,
                 identity: identity(&m),
                 modified: m.modified().ok(),
                 length: m.len(),
@@ -161,6 +173,11 @@ impl RunTimingCache {
         };
         // Once the cursor matches, errors invalidate the affected cached scan.
         // File changes must still invalidate it, unlike a stale-client rejection.
+        // Each batch is a separate lookup; a filter change within one cached
+        // scan must not silently reuse timings collected under another filter.
+        if scan.all != query.all {
+            return Err(conflict());
+        }
         let canonical_root = fs::canonicalize(root).map_err(io_error)?;
         let canonical = fs::canonicalize(&scan.path).map_err(io_error)?;
         if !canonical.starts_with(&canonical_root) {
@@ -245,12 +262,11 @@ impl RunTimingCache {
         }
         scan.modified = m.modified().ok();
         scan.length = total;
-        let selected: HashSet<_> = query.entry_ids.iter().map(String::as_str).collect();
         let page = RunTimingsPage {
             timings: scan
                 .timings
                 .iter()
-                .filter(|t| selected.contains(t.final_entry_id.as_str()))
+                .filter(|t| query.all || selected.contains(t.final_entry_id.as_str()))
                 .cloned()
                 .collect(),
             complete: scan.header && scan.offset == total && scan.pending.is_empty(),
@@ -548,6 +564,7 @@ mod tests {
                 &RunTimingsQuery {
                     entry_ids: ids.iter().map(|s| s.to_string()).collect(),
                     cursor,
+                    all: false,
                 },
             )
         }
@@ -557,6 +574,44 @@ mod tests {
             let _ = fs::remove_dir_all(&self.root);
         }
     }
+    #[test]
+    fn all_runs_query_is_not_limited_by_visible_entry_ids() {
+        let f = Fixture::new(false);
+        f.start("older", "main", 1, "run");
+        f.message("older-answer", "main");
+        f.finish("older", "main", 11);
+        f.start("newer", "main", 20, "run");
+        f.message("newer-answer", "main");
+        f.finish("newer", "main", 25);
+
+        let mut cache = RunTimingCache::default();
+        // The footer asks for every run, including rounds outside the
+        // transcript window that backs per-row timing footers.
+        let page = cache
+            .query(
+                &f.id,
+                &f.root,
+                &RunTimingsQuery {
+                    all: true,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert!(page.complete);
+        assert_eq!(page.timings.len(), 2);
+        assert_eq!(page.timings.iter().map(|t| t.elapsed_ms).sum::<u64>(), 15);
+
+        // The row query still selects by entry ID, and cannot inherit the
+        // broader result set from the session-total scan.
+        assert_eq!(
+            f.query(&mut cache, None, &["newer-answer"]).unwrap_err().0,
+            ReplyKind::Conflict
+        );
+        let row = f.query(&mut cache, None, &["newer-answer"]).unwrap();
+        assert_eq!(row.timings.len(), 1);
+        assert_eq!(row.timings[0].run_id, "newer");
+    }
+
     #[test]
     fn native_multirun_multilane_and_exact_timestamps() {
         for nested in [false, true] {
@@ -885,7 +940,8 @@ mod tests {
             assert_eq!(
                 RunTimingsQuery {
                     entry_ids: ids,
-                    cursor: None
+                    cursor: None,
+                    all: false
                 }
                 .validate()
                 .unwrap_err()
