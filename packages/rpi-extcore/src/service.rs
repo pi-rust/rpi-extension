@@ -1980,6 +1980,7 @@ mod run_timing_service_tests {
         let query = || RunTimingsQuery {
             entry_ids: vec!["actual".into()],
             cursor: None,
+            all: false,
         };
         assert_eq!(
             run_timings(&state, "../escape".into(), query()).await.kind,
