@@ -99,6 +99,7 @@ import {
   reopenHost,
   roleOf,
   type AbortResult,
+  type StopRunResult,
   type AuthProviderStatus,
   type Capabilities,
   type HistoryResponse,
@@ -2021,7 +2022,10 @@ export default function App() {
     [],
   );
   const composerAbort =
-    busy && supported.has("abort") && !loadingSession && !connectionFailed;
+    busy &&
+    (supported.has("stop_run") || supported.has("abort")) &&
+    !loadingSession &&
+    !connectionFailed;
   // While a run is active the main button is Stop for an empty composer and
   // Send for a draft: touch keyboards use Enter for a newline, so the icon is
   // the only way to queue a follow-up from the same field.
@@ -2122,7 +2126,7 @@ export default function App() {
         name: "/abort",
         usage: "/abort",
         hint: t("slashAbort"),
-        enabled: supported.has("abort"),
+        enabled: supported.has("stop_run") || supported.has("abort"),
       },
       {
         name: "/new",
@@ -3821,7 +3825,7 @@ export default function App() {
         return;
       }
       if (name === "/abort") {
-        if (!supported.has("abort")) {
+        if (!supported.has("stop_run") && !supported.has("abort")) {
           note("/abort is not advertised by this host.");
           return;
         }
@@ -4793,10 +4797,25 @@ export default function App() {
   }
 
   async function abort() {
-    if (!sessionId || !supported.has("abort")) return;
+    if (!sessionId) return;
     const navigation = navigationRevision.current;
     const targetSession = sessionId;
+    // Use the queue-preserving stop command when the host advertises it.
+    // `abort` is the fallback for older hosts: it drains steering/follow-up
+    // queues and hands them back, which is useful for recovery but is the old
+    // Stop behaviour being fixed here.
+    const preserveQueue = supported.has("stop_run");
+    if (!preserveQueue && !supported.has("abort")) return;
     try {
+      if (preserveQueue) {
+        await commandData<StopRunResult>(targetSession, "stop_run");
+        if (navigation !== navigationRevision.current) return;
+        // The host left the queue alone: keep the table rows and do not restore
+        // the staged text into the composer. The queue read is authoritative
+        // after the command acknowledgement, even if the poll won this race.
+        await refreshQueue(targetSession);
+        return;
+      }
       const result = await commandData<AbortResult>(targetSession, "abort");
       if (navigation !== navigationRevision.current) return;
       // The native host drains both queues as part of the cancel and hands the

@@ -48,6 +48,7 @@ const capabilities = {
     "navigate",
     "prompt",
     "abort",
+    "stop_run",
     "get_auth_status",
     "set_api_key",
   ],
@@ -832,52 +833,39 @@ test("editing a queued message re-enqueues it as a follow-up", async ({
     ]);
 });
 
-test("stopping a run restores the reclaimed queue to the composer", async ({
-  page,
-}) => {
+test("stopping a run keeps queued messages in the queue", async ({ page }) => {
   await mockHost(page);
-  // A run is active and the host holds one follow-up for it. `abort` replies
-  // with the reclaimed message instead of keeping it, so the UI has to restore
-  // that text or the staged input is silently lost.
+  // A run is active and the host holds one follow-up for it. Stop cancels the
+  // run but must leave the queue pending and visible; it must not restore the
+  // staged text into the composer.
   await page.route(`**/api/v1/sessions/${sessionId}/events**`, async (route) =>
     route.fulfill({
       contentType: "text/event-stream",
       body: 'id: 5\nevent: agent_start\ndata: {"type":"agent_start"}\n\n',
     }),
   );
-  let aborted = false;
   const commands: string[] = [];
   await page.route(
     `**/api/v1/sessions/${sessionId}/commands`,
     async (route) => {
       const body = route.request().postDataJSON() as { type: string };
       if (body.type === "get_queue") {
-        const items = aborted
-          ? []
-          : [
-              {
-                entryId: "queue-1",
-                queue: "followUp",
-                status: "queued",
-                text: "staged while running",
-              },
-            ];
+        const items = [
+          {
+            entryId: "queue-1",
+            queue: "followUp",
+            status: "queued",
+            text: "staged while running",
+          },
+        ];
         return route.fulfill({
           json: response({ items, count: items.length }, body.type),
         });
       }
-      if (body.type === "abort") {
-        aborted = true;
-        commands.push("abort");
+      if (body.type === "stop_run") {
+        commands.push("stop_run");
         return route.fulfill({
-          json: response(
-            {
-              aborted: true,
-              steer: [],
-              followUp: [{ text: "staged while running", images: [] }],
-            },
-            body.type,
-          ),
+          json: response({ stopped: true }, body.type),
         });
       }
       return route.fallback();
@@ -891,13 +879,11 @@ test("stopping a run restores the reclaimed queue to the composer", async ({
     page.getByRole("button", { name: "Abort", exact: true }),
   ).toBeEnabled();
   await page.getByRole("button", { name: "Abort", exact: true }).click();
-  await expect.poll(() => commands).toEqual(["abort"]);
-  await expect(input).toHaveValue("staged while running");
-  await expect(
-    page
-      .locator(".transcript-note")
-      .filter({ hasText: "Restored 1 queued message(s) to the composer" }),
-  ).toBeVisible();
+  await expect.poll(() => commands).toEqual(["stop_run"]);
+  await expect(input).toHaveValue("");
+  await expect(page.locator(".composer-queue-item")).toContainText(
+    "staged while running",
+  );
 });
 
 test("history records expand and queue history toggles", async ({ page }) => {

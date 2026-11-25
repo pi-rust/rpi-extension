@@ -200,6 +200,11 @@ export interface AbortResult {
   followUp?: ReclaimedQueuedMessage[];
 }
 
+/** Native `stop_run` reply: the run is cancelled and its queue is untouched. */
+export interface StopRunResult {
+  stopped?: boolean;
+}
+
 export interface QueueItem {
   entryId: string;
   queue: string;
