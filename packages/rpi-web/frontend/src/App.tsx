@@ -8181,7 +8181,7 @@ function ToolRowView({
           {history}
         </div>
       </ToolDisclosure>
-      {showReadImages && images}
+      {showReadImages && <div className="read-image-previews">{images}</div>}
     </>
   );
 }

@@ -1545,6 +1545,14 @@ details[open] > summary:before {
   object-fit: contain;
 }
 
+.read-image-previews .transcript-image {
+  width: fit-content;
+  max-width: min(100%, 320px);
+}
+.read-image-previews img {
+  max-height: 200px;
+}
+
 .zoomable-image {
   cursor: zoom-in;
   touch-action: manipulation;

@@ -6743,9 +6743,9 @@ test("read images show outside tool details on live completion and reload", asyn
   page,
 }) => {
   await mockHost(page);
-  const png =
-    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=";
-  const content = [{ type: "image", data: png, mimeType: "image/png" }];
+  const data =
+    "iVBORw0KGgoAAAANSUhEUgAAA8AAAALQAQAAAAB3DCQZAAAAa0lEQVR42u3BAQ0AAADCoPdPbQ43oAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAHgyVF8AAZzfEVQAAAAASUVORK5CYII=";
+  const content = [{ type: "image", data, mimeType: "image/png" }];
   let finished = false;
   await page.route(snapshotRoute, (route) =>
     route.fulfill({
@@ -6811,17 +6811,23 @@ test("read images show outside tool details on live completion and reload", asyn
     await expect(card).toHaveClass(/tool-done/);
     await expect(card).not.toHaveAttribute("open", "");
     await expect(preview).toBeVisible();
+    await expect(preview).toHaveJSProperty("naturalWidth", 960);
+    const thumbnail = await preview.boundingBox();
+    expect(thumbnail!.width).toBeLessThanOrEqual(320);
+    expect(thumbnail!.height).toBeLessThanOrEqual(200);
     await expect(card.locator("img")).toHaveCount(0);
     await preview.focus();
     await preview.press("Enter");
     const viewer = page.getByRole("dialog", { name: "Image viewer" });
-    await expect(viewer.getByRole("img", { name: "diagram.png" })).toBeVisible();
+    const fullImage = viewer.getByRole("img", { name: "diagram.png" });
+    await expect(fullImage).toBeVisible();
+    await expect(fullImage).toHaveJSProperty("naturalWidth", 960);
     await page.keyboard.press("Escape");
     await expect(viewer).toHaveCount(0);
     await expect(preview).toBeFocused();
     await card.locator("summary").click();
     await expect(card.locator(".tool-arguments")).toContainText("diagram.png");
-    await expect(card).not.toContainText(png);
+    await expect(card).not.toContainText(data);
     await expect(preview).toHaveCount(1);
 
     finished = true;
