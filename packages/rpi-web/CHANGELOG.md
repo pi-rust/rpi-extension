@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [0.1.94-preview](https://github.com/pi-rust/rpi-extension/compare/rpi-web-v0.1.93-preview...rpi-web-v0.1.94-preview) - 2026-11-26
+
 ### Fixed
 
 - *(web)* archive multi-selected sessions in one batch request and stay on the project view after archiving
