@@ -6739,6 +6739,101 @@ test("snapshot overlap neither duplicates committed messages nor downgrades comp
   await expect(page.locator(".transcript-note")).toHaveText(["Completed once"]);
 });
 
+test("read images show outside tool details on live completion and reload", async ({
+  page,
+}) => {
+  await mockHost(page);
+  const png =
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=";
+  const content = [{ type: "image", data: png, mimeType: "image/png" }];
+  let finished = false;
+  await page.route(snapshotRoute, (route) =>
+    route.fulfill({
+      json: {
+        sessionId,
+        lastSeq: finished ? 5 : 4,
+        events: [],
+        messages: [
+          {
+            role: "assistant",
+            entryId: "read-image-assistant",
+            content: [
+              {
+                type: "toolCall",
+                id: "read-image",
+                name: "read",
+                arguments: { path: "assets/diagram.png" },
+              },
+            ],
+          },
+          ...(finished
+            ? [
+                {
+                  role: "toolResult",
+                  entryId: "read-image-result",
+                  toolCallId: "read-image",
+                  toolName: "read",
+                  content,
+                },
+              ]
+            : []),
+        ],
+      },
+    }),
+  );
+  let release!: () => void;
+  const started = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  await page.route(`**/api/v1/sessions/${sessionId}/events?*`, async (route) => {
+    await started;
+    const event = {
+      type: "tool_execution_end",
+      toolCallId: "read-image",
+      toolName: "read",
+      result: { content },
+    };
+    return route.fulfill({
+      contentType: "text/event-stream",
+      body: `retry: 60000\nid: 5\nevent: tool_execution_end\ndata: ${JSON.stringify(event)}\n\n`,
+    });
+  });
+
+  try {
+    await page.goto("/");
+    const card = page.locator(".tool-card").filter({ hasText: "diagram.png" });
+    const preview = page.getByRole("button", {
+      name: "Enlarge image: diagram.png",
+    });
+    await expect(card).toBeVisible();
+    await expect(preview).toHaveCount(0);
+    release();
+    await expect(card).toHaveClass(/tool-done/);
+    await expect(card).not.toHaveAttribute("open", "");
+    await expect(preview).toBeVisible();
+    await expect(card.locator("img")).toHaveCount(0);
+    await preview.focus();
+    await preview.press("Enter");
+    const viewer = page.getByRole("dialog", { name: "Image viewer" });
+    await expect(viewer.getByRole("img", { name: "diagram.png" })).toBeVisible();
+    await page.keyboard.press("Escape");
+    await expect(viewer).toHaveCount(0);
+    await expect(preview).toBeFocused();
+    await card.locator("summary").click();
+    await expect(card.locator(".tool-arguments")).toContainText("diagram.png");
+    await expect(card).not.toContainText(png);
+    await expect(preview).toHaveCount(1);
+
+    finished = true;
+    await page.reload();
+    await expect(card).not.toHaveAttribute("open", "");
+    await expect(preview).toBeVisible();
+    await expect(preview).toHaveCount(1);
+  } finally {
+    release();
+  }
+});
+
 test("native permission dialog blocks global new-chat shortcuts", async ({
   page,
 }) => {
