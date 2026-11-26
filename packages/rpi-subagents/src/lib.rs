@@ -83,24 +83,6 @@ fn parse_request(params: &Value) -> Result<Request, String> {
     })
 }
 
-impl Request {
-    fn start_args(&self, tool_call_id: &str) -> Value {
-        let role = &self.role;
-        let turns = self.max_turns;
-        let task = &self.task;
-        let prompt = format!("You are a delegated {role} subagent. Complete the task in at most {turns} turns. Do not delegate, spawn, or ask another agent to do work. Work only in the current project and return a concise final report.\n\nTask:\n{task}");
-        json!({
-            "op": "start",
-            "task": task,
-            "prompt": prompt,
-            "role": role,
-            "maxTurns": turns,
-            "timeoutSeconds": self.timeout_seconds,
-            "toolCallId": tool_call_id,
-        })
-    }
-}
-
 type Action = dyn Fn(Value) -> Result<Value, String> + Send + Sync;
 
 fn host_action(
@@ -149,6 +131,40 @@ fn validate_context(expected: &Value, actual: &Value) -> Result<(), String> {
 struct Child<'a> {
     action: &'a Action,
     id: String,
+    session_id: Value,
+}
+impl<'a> Child<'a> {
+    fn start(action: &'a Action, request: &Request, tool_call_id: &str) -> Result<Self, String> {
+        let mut reply = action(json!({
+            "op": "start",
+            "task": request.task,
+            "role": request.role,
+            "maxTurns": request.max_turns,
+            "timeoutSeconds": request.timeout_seconds,
+            "toolCallId": tool_call_id,
+        }))
+        .map_err(|error| format!("Cannot start a host-managed subagent: {error}. This plugin requires a host supporting ChildAgent; no default-config subprocess fallback is used."))?;
+        let id = reply
+            .get("childId")
+            .and_then(Value::as_str)
+            .filter(|id| !id.is_empty())
+            .ok_or("child start returned no childId")?
+            .to_owned();
+        let session_id = reply.get_mut("sessionId").map_or(Value::Null, Value::take);
+        Ok(Self {
+            action,
+            id,
+            session_id,
+        })
+    }
+
+    fn poll(&self) -> Result<Value, String> {
+        (self.action)(json!({"op":"poll","childId":self.id}))
+    }
+
+    fn cancel(&self) {
+        let _ = (self.action)(json!({"op":"cancel","childId":self.id}));
+    }
 }
 impl Drop for Child<'_> {
     fn drop(&mut self) {
@@ -166,27 +182,19 @@ fn run_request(
     if cancelled.load(Ordering::Acquire) {
         return Err("subagent cancelled".into());
     }
-    let start = action(request.start_args(&tool_call_id))
-        .map_err(|error| format!("Cannot start a host-managed subagent: {error}. This plugin requires a host supporting ChildAgent; no default-config subprocess fallback is used."))?;
-    let id = start
-        .get("childId")
-        .and_then(Value::as_str)
-        .filter(|id| !id.is_empty())
-        .ok_or("child start returned no childId")?
-        .to_owned();
-    let child = Child { action, id };
+    let child = Child::start(action, &request, &tool_call_id)?;
     let deadline = Instant::now() + Duration::from_secs(request.timeout_seconds + 3);
     let mut bytes = 0usize;
     let mut events = 0usize;
     loop {
         if cancelled.load(Ordering::Acquire) {
-            let _ = action(json!({"op":"cancel","childId":child.id}));
+            child.cancel();
             return Err("subagent cancelled".into());
         }
         if Instant::now() >= deadline {
             return Err("host-managed subagent timed out".into());
         }
-        let value = action(json!({"op":"poll","childId":child.id}))?;
+        let value = child.poll()?;
         if let Some(deltas) = value.get("deltas").and_then(Value::as_array) {
             for delta in deltas {
                 let text = delta.as_str().ok_or("invalid child text delta")?;
@@ -232,7 +240,7 @@ fn run_request(
                 }
                 output.send(JobMessage::Done(json!({"kind":"rpi-delegation", "task":request.task,
                     "role":request.role, "maxTurns":request.max_turns, "timeoutSeconds":request.timeout_seconds,
-                    "childId":child.id, "sessionId":start.get("sessionId"), "status":"completed",
+                    "childId":child.id, "sessionId":child.session_id, "status":"completed",
                     "turns":result.get("turns"), "turnLimited":result.get("turnLimited"), "report":report}).to_string()))
                     .map_err(|_| "subagent receiver closed")?;
                 return Ok(());

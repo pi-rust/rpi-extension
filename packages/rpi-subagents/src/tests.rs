@@ -202,11 +202,13 @@ fn forwards_deltas_and_returns_delegation_metadata_then_disposes() {
     assert_eq!(result["report"], "report");
     assert_eq!(result["sessionId"], "child-1");
     let calls = calls.lock().unwrap();
-    assert_eq!(calls[0]["toolCallId"], "tool-1");
-    assert_eq!(calls[0]["task"], "inspect");
-    assert_eq!(calls[0]["maxTurns"], 8);
-    assert_eq!(calls[0]["timeoutSeconds"], 300);
-    assert_eq!(calls[0]["prompt"], "You are a delegated worker subagent. Complete the task in at most 8 turns. Do not delegate, spawn, or ask another agent to do work. Work only in the current project and return a concise final report.\n\nTask:\ninspect");
+    assert_eq!(
+        calls[0],
+        json!({
+            "op":"start", "task":"inspect", "role":"worker",
+            "maxTurns":8, "timeoutSeconds":300, "toolCallId":"tool-1"
+        })
+    );
     assert_eq!(calls.last().unwrap()["op"], "dispose");
 }
 

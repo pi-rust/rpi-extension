@@ -111,9 +111,6 @@ Top-level `additionalProperties: true` accepts reserved `__rpi` invocation
 capabilities without exposing them as model schema properties. Execution requires
 valid host-injected capabilities and matching session/project context.
 
-The extension sends the prepared prompt alongside the original task and budgets.
-Earlier `ChildAgent` hosts use the task to build the prompt.
-
 Requires a host implementing `RuntimeActionId::ChildAgent` (24), with per-call
 `__rpi.runtimeHandle` and `runtimeKey` capabilities. Unsupported
 hosts fail with an upgrade diagnostic. There is deliberately **no legacy RPC
