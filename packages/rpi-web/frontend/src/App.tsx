@@ -132,6 +132,8 @@ import {
   useRunTimings,
   useSessionRunTimings,
   timingByRow,
+  activeWorkMs,
+  finishedWorkMs,
 } from "./useRunTimings";
 import { groupTodoUpdates, isTodoTool } from "./todoGroups";
 import { RunElapsed } from "./RunElapsed";
@@ -1294,28 +1296,49 @@ export default function App() {
     : runTimings;
   // The footer totals every finished native run in the session. Per-row
   // timing queries are limited to the visible transcript window, which can
-  // exclude all but the newest round in history views.
-  const sessionTimings = useSessionRunTimings(
+  // exclude all but the newest round in history views. While a run is in
+  // flight the same lookup also reports its native start, which the metric
+  // advances live from the server's own clock.
+  const sessionWork = useSessionRunTimings(
     sessionId,
     `${connectionRevision}:${navigationRevision.current}`,
     !loadingSession && Boolean(capabilities),
     settleTick,
+    runActive,
   );
   // A missing or unsupported timing lookup is unknown, not zero work: the
   // footer shows "—" exactly like cache hit and context, and only an actually
   // recorded run can produce "0s".
-  const sessionWorkMs = useMemo(
-    () =>
-      sessionTimings.length
-        ? sessionTimings.reduce(
-            (total, timing) =>
-              total +
-              (Number.isFinite(timing.elapsedMs) ? timing.elapsedMs : 0),
-            0,
-          )
-        : null,
-    [sessionTimings],
+  const finishedWork = useMemo(
+    () => finishedWorkMs(sessionWork.values),
+    [sessionWork.values],
   );
+  // Sample the anchored clock on a slow tick. The elapsed value itself is the
+  // server anchor plus monotonic local time, so this interval only bounds how
+  // late a redraw is. It runs while the transcript reports a run and while the
+  // server still reports one in flight, so a tab that missed the start event
+  // never shows a frozen timer.
+  const liveTiming = runActive || sessionWork.activeRuns.length > 0;
+  const [liveClock, setLiveClock] = useState<number | null>(null);
+  useEffect(() => {
+    if (!liveTiming) return;
+    setLiveClock(performance.now());
+    const timer = window.setInterval(
+      () => setLiveClock(performance.now()),
+      1000,
+    );
+    return () => window.clearInterval(timer);
+  }, [liveTiming]);
+  const runningWork = activeWorkMs(
+    sessionWork.activeRuns,
+    sessionWork.now,
+    sessionWork.anchoredAt,
+    liveClock ?? performance.now(),
+  );
+  const sessionWorkMs =
+    finishedWork == null && !sessionWork.activeRuns.length
+      ? null
+      : (finishedWork ?? 0) + runningWork;
   const runFooters = useMemo(
     () => timingByRow(displayedRows, displayedTimings),
     [displayedRows, displayedTimings],

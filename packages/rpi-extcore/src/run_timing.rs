@@ -7,7 +7,7 @@ use std::{
     fs::{self, File, Metadata},
     io::{Read, Seek, SeekFrom},
     path::{Path, PathBuf},
-    time::SystemTime,
+    time::{SystemTime, UNIX_EPOCH},
 };
 
 const BYTE_BUDGET: usize = 4 * 1024 * 1024;
@@ -55,10 +55,31 @@ pub struct RunTiming {
     pub elapsed_ms: u64,
     pub outcome: String,
 }
+/// A native run whose `operation_started` record has no matching
+/// `operation_finished` yet. Its start timestamp is authoritative; clients use
+/// it only to display a live elapsed time, never to invent a finished timing.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ActiveRunTiming {
+    pub run_id: String,
+    pub lane: String,
+    pub started_at: i64,
+}
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RunTimingsPage {
     pub timings: Vec<RunTiming>,
+    /// In-flight native runs seen by this scan. Each entry is the latest
+    /// `run` intent per lane, mirroring how a finished timing binds to its last
+    /// operation segment. Empty when nothing is running.
+    ///
+    /// Additive: an older backend omits the field entirely, which a client
+    /// reads as "live elapsed time is unavailable" rather than "idle".
+    pub active_runs: Vec<ActiveRunTiming>,
+    /// Server wall clock (Unix ms) when this page was produced. A client reads
+    /// `now - startedAt` for the in-flight elapsed time instead of subtracting
+    /// its own clock from a host timestamp, so clock skew cannot fabricate time.
+    pub now: i64,
     pub complete: bool,
     pub cursor: Option<String>,
     pub scanned_bytes: u64,
@@ -131,6 +152,12 @@ fn conflict() -> ServiceError {
 }
 fn short(v: &Value) -> Option<&str> {
     v.as_str().filter(|s| !s.is_empty() && s.len() <= 256)
+}
+fn now_ms() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as i64)
+        .unwrap_or_default()
 }
 
 impl RunTimingCache {
@@ -276,6 +303,18 @@ impl RunTimingCache {
         }
         scan.modified = m.modified().ok();
         scan.length = total;
+        // Lane order keeps a live total stable across polls; a HashMap walk
+        // would reorder the same entries on every request.
+        let mut active_runs: Vec<ActiveRunTiming> = scan
+            .active
+            .iter()
+            .map(|(lane, active)| ActiveRunTiming {
+                run_id: active.id.clone(),
+                lane: lane.clone(),
+                started_at: active.start,
+            })
+            .collect();
+        active_runs.sort_by(|left, right| left.lane.cmp(&right.lane));
         let page = RunTimingsPage {
             timings: scan
                 .timings
@@ -283,6 +322,8 @@ impl RunTimingCache {
                 .filter(|t| query.all || selected.contains(t.final_entry_id.as_str()))
                 .cloned()
                 .collect(),
+            active_runs,
+            now: now_ms(),
             complete: scan.header && scan.offset == total && scan.pending.is_empty(),
             cursor: Some(scan.generation.clone()),
             scanned_bytes: scan.offset,
@@ -656,6 +697,98 @@ mod tests {
                 .0,
             ReplyKind::Conflict
         );
+    }
+
+    #[test]
+    fn active_runs_report_the_native_start_until_the_run_settles() {
+        let f = Fixture::new(false);
+        f.start("finished", "main", 1_000, "run");
+        f.message("done-answer", "main");
+        f.finish("finished", "main", 2_000);
+        f.start("live", "main", 5_000, "run");
+        f.message("live-answer", "main");
+        f.start("side-live", "side", 6_000, "run");
+
+        let before = now_ms();
+        let mut cache = RunTimingCache::default();
+        let page = cache
+            .query(
+                &f.id,
+                &f.root,
+                &RunTimingsQuery {
+                    all: true,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let after = now_ms();
+        assert!(page.complete);
+        // A started-but-unfinished run is never invented as a finished timing.
+        assert_eq!(page.timings.len(), 1);
+        assert_eq!(page.timings[0].run_id, "finished");
+        // Lane order is stable across polls, so a live total never reorders.
+        assert_eq!(
+            page.active_runs,
+            vec![
+                ActiveRunTiming {
+                    run_id: "live".into(),
+                    lane: "main".into(),
+                    started_at: 5_000,
+                },
+                ActiveRunTiming {
+                    run_id: "side-live".into(),
+                    lane: "side".into(),
+                    started_at: 6_000,
+                },
+            ]
+        );
+        // The clock anchor belongs to the server, so a client never subtracts
+        // its own wall clock from a host timestamp.
+        assert!(page.now >= before && page.now <= after);
+
+        f.message("live-final", "main");
+        f.finish("live", "main", 9_000);
+        let resumed = cache
+            .query(
+                &f.id,
+                &f.root,
+                &RunTimingsQuery {
+                    all: true,
+                    cursor: page.cursor,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        // The finished lane leaves `activeRuns`; the still-running side lane
+        // keeps its original start so the accumulated total never resets.
+        assert_eq!(
+            resumed.active_runs,
+            vec![ActiveRunTiming {
+                run_id: "side-live".into(),
+                lane: "side".into(),
+                started_at: 6_000,
+            }]
+        );
+        assert_eq!(
+            resumed
+                .timings
+                .iter()
+                .map(|t| t.elapsed_ms)
+                .sum::<u64>(),
+            1_000 + 4_000
+        );
+    }
+
+    #[test]
+    fn row_selectors_report_no_finished_timing_for_a_live_run() {
+        let f = Fixture::new(false);
+        f.start("live", "main", 5_000, "run");
+        f.message("live-answer", "main");
+        let page = f.query(&mut RunTimingCache::default(), None, &["live-answer"]).unwrap();
+        // Row footers describe committed runs. A live run has no final entry to
+        // bind to yet, so the row query must not produce a timing object that a
+        // client could render as a finished duration.
+        assert!(page.timings.is_empty());
     }
 
     #[test]

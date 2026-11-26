@@ -184,12 +184,17 @@ async fn run_timings_preserve_security_validation_and_paging() {
     assert_eq!(response.status(), 200);
     let page: Value = response.json().await.unwrap();
     assert_eq!(
-        page,
-        json!({
-            "timings":[{"runId":"run","lane":"main","finalEntryId":"actual","startedAt":1234,"finishedAt":7890,"elapsedMs":6656,"outcome":"completed"}],
-            "complete":true,"cursor":first["cursor"],"scannedBytes":total_bytes,"totalBytes":total_bytes
-        })
+        page["timings"],
+        json!([{"runId":"run","lane":"main","finalEntryId":"actual","startedAt":1234,"finishedAt":7890,"elapsedMs":6656,"outcome":"completed"}])
     );
+    assert_eq!(page["complete"], true);
+    assert_eq!(page["cursor"], first["cursor"]);
+    assert_eq!(page["scannedBytes"], total_bytes);
+    assert_eq!(page["totalBytes"], total_bytes);
+    // Every run in the fixture is finished, so no in-flight run is reported.
+    assert_eq!(page["activeRuns"], json!([]));
+    // The live anchor is the server's own clock, not a host or browser value.
+    assert!(page["now"].as_i64().unwrap() > 0);
     // A session-total lookup needs no entry IDs and must find runs outside
     // the narrow per-row selection, through the same HTTP contract. It starts
     // a fresh scan; a cursor belonging to the row scan must be rejected.

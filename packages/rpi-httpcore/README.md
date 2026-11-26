@@ -80,6 +80,14 @@ repeat the query with the returned cursor to continue the bounded scan. A 409
 invalidates accumulated timings and the cursor; retry without the cursor.
 Invalid requests return 400 and unknown session UUIDs return 404.
 
+The response additionally carries `activeRuns` (one `{runId, lane, startedAt}`
+per native run still in flight, sorted by lane) and `now` (the service's wall
+clock in Unix milliseconds). A client computes a live elapsed time as
+`now - startedAt` plus its own monotonic time since the response, so a running
+round counts up without trusting the browser's clock against a host timestamp.
+An older core omits both fields and the client keeps showing finished totals
+only.
+
 ## Read-only Code Mode child queries
 
 These additive routes inspect an **already opened, live** session through the

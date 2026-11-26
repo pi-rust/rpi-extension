@@ -550,10 +550,25 @@ Success is a `run_timing::RunTimingsPage` serialized as:
     "startedAt": 1234, "finishedAt": 7890, "elapsedMs": 6656,
     "outcome": "completed"
   }],
+  "activeRuns": [{
+    "runId": "in-flight-operation-start-id", "lane": "main",
+    "startedAt": 9100
+  }],
+  "now": 9438,
   "complete": true, "cursor": "opaque-generation-token",
   "scannedBytes": 1042, "totalBytes": 1042
 }
 ```
+
+`activeRuns` lists native runs whose `operation_started` has no matching
+`operation_finished` yet — one entry per lane, sorted by lane so a client total
+never reorders across polls. It is not a timing record: it carries only the
+authoritative native start, never an invented finish. `now` is this service's
+wall clock at response time, so a client displays in-flight elapsed time as
+`now - startedAt` advanced by its own monotonic clock. Subtracting a browser
+clock from a host timestamp would turn clock skew into fake work time. Both
+fields are additive; an older service omits them and a client then shows only
+finished totals.
 
 Timestamps are native signed Unix milliseconds; elapsed is a checked,
 nonnegative `u64` difference, never message timestamps or client wall time.

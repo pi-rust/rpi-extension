@@ -6839,19 +6839,22 @@ test("read images show outside tool details on live completion and reload", asyn
   const started = new Promise<void>((resolve) => {
     release = resolve;
   });
-  await page.route(`**/api/v1/sessions/${sessionId}/events?*`, async (route) => {
-    await started;
-    const event = {
-      type: "tool_execution_end",
-      toolCallId: "read-image",
-      toolName: "read",
-      result: { content },
-    };
-    return route.fulfill({
-      contentType: "text/event-stream",
-      body: `retry: 60000\nid: 5\nevent: tool_execution_end\ndata: ${JSON.stringify(event)}\n\n`,
-    });
-  });
+  await page.route(
+    `**/api/v1/sessions/${sessionId}/events?*`,
+    async (route) => {
+      await started;
+      const event = {
+        type: "tool_execution_end",
+        toolCallId: "read-image",
+        toolName: "read",
+        result: { content },
+      };
+      return route.fulfill({
+        contentType: "text/event-stream",
+        body: `retry: 60000\nid: 5\nevent: tool_execution_end\ndata: ${JSON.stringify(event)}\n\n`,
+      });
+    },
+  );
 
   try {
     await page.goto("/");
@@ -10700,6 +10703,99 @@ test.describe("run timing regressions", () => {
     await expect(
       metrics.getByLabel("Session work: 0s", { exact: true }),
     ).toContainText("0s");
+  });
+
+  test("composer footer accumulates a finished total and a live in-flight run", async ({
+    page,
+  }) => {
+    await mockHost(page);
+    await history(page, [finalMessage("live-final", "Working")]);
+    // The recorded round is authoritative; the in-flight run is anchored to the
+    // server clock the response carries, never to the browser's own wall clock.
+    const finishedMs = 138_000;
+    const startedAt = 1_700_000_000_000;
+    let live = true;
+    await page.route(timingRoute, (route) => {
+      const { all } = route.request().postDataJSON() as TimingQuery;
+      if (!all)
+        return route.fulfill({
+          json: timingPage([
+            nativeTiming("live-final", "live-run", "completed"),
+          ]),
+        });
+      return route.fulfill({
+        json: timingPage(
+          [nativeTiming("live-final", "live-run", "completed")],
+          {
+            now: startedAt + (live ? 65_000 : 0),
+            activeRuns: live
+              ? [{ runId: "open-run", lane: "main", startedAt }]
+              : [],
+          },
+        ),
+      });
+    });
+    await page.goto("/");
+    const metrics = page.locator(".composer-metrics.slim-metrics");
+    // 2m 18s recorded plus 1m 05s in flight.
+    await expect(
+      metrics.getByLabel("Session work: 3m 23s", { exact: true }),
+    ).toContainText("3m 23s");
+    // The counter advances on its own while the round is still running.
+    await expect(metrics.getByLabel(/^Session work: 3m 2[4-9]s$/)).toBeVisible({
+      timeout: 5_000,
+    });
+    // Once the run settles, only the adopted native total remains and the
+    // finished round is not counted twice.
+    live = false;
+    await expect(
+      metrics.getByLabel("Session work: 2m 18s", { exact: true }),
+    ).toBeVisible({ timeout: 10_000 });
+  });
+
+  test("composer footer keeps counting across rounds instead of resetting", async ({
+    page,
+  }) => {
+    await mockHost(page);
+    await history(page, [finalMessage("round-two", "Second round")]);
+    const first = nativeTiming("round-one", "run-one", "completed", 60_000);
+    const second = nativeTiming("round-two", "run-two", "completed", 30_000);
+    await page.route(timingRoute, (route) =>
+      route.fulfill({
+        json: timingPage([first, second], {
+          now: 1_700_000_090_000,
+          activeRuns: [],
+        }),
+      }),
+    );
+    await page.goto("/");
+    const metrics = page.locator(".composer-metrics.slim-metrics");
+    // The earlier round outside the loaded transcript still counts, so a later
+    // round adds to it rather than replacing it.
+    await expect(
+      metrics.getByLabel("Session work: 1m 30s", { exact: true }),
+    ).toContainText("1m 30s");
+  });
+
+  test("composer footer ignores a live anchor from a backend without one", async ({
+    page,
+  }) => {
+    await mockHost(page);
+    await history(page, [finalMessage()]);
+    await page.route(timingRoute, (route) =>
+      // An older backend answers without `now`/`activeRuns`. The metric must
+      // show the recorded total and never invent a local timer.
+      route.fulfill({ json: timingPage([nativeTiming()]) }),
+    );
+    await page.goto("/");
+    const metrics = page.locator(".composer-metrics.slim-metrics");
+    await expect(
+      metrics.getByLabel("Session work: 2m 18s", { exact: true }),
+    ).toContainText("2m 18s");
+    await page.waitForTimeout(2_500);
+    await expect(
+      metrics.getByLabel("Session work: 2m 18s", { exact: true }),
+    ).toContainText("2m 18s");
   });
 
   test("run elapsed history attaches once after the final projected row and survives reload", async ({

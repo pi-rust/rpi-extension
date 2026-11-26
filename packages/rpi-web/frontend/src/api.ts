@@ -278,8 +278,25 @@ export interface RunTiming {
   elapsedMs: number;
   outcome: "completed" | "aborted" | "failed" | "declined";
 }
+/** A native run that started but has not finished yet. */
+export interface ActiveRunTiming {
+  runId: string;
+  lane: string;
+  startedAt: number;
+}
 export interface RunTimingsPage {
   timings: RunTiming[];
+  /**
+   * In-flight native runs. Optional so an older backend that only returns
+   * finished timings still type-checks; absent means "no live timing known".
+   */
+  activeRuns?: ActiveRunTiming[];
+  /**
+   * Server wall clock (Unix ms) at response time. The live elapsed time is
+   * `now - startedAt` sampled against a server-anchored clock, never the
+   * browser's offset from the host, so clock skew cannot invent time.
+   */
+  now?: number;
   complete: boolean;
   cursor: string | null;
   scannedBytes: number;
