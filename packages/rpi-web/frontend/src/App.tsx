@@ -3372,13 +3372,14 @@ export default function App() {
       };
     };
 
-    // A sidebar refresh should not restart an open already in progress.
+    // Only remembered offline sessions can supply a saved preview. The list
+    // can lag a newly-created session, which already has a live host.
     const knownStatus = sessionListValue.current?.find(
       (session) => session.sessionId === sessionId,
     )?.status;
     if (
       !rowsBySession.current.get(sessionId)?.length &&
-      (!knownStatus || knownStatus === "offline" || knownStatus === "closed")
+      (knownStatus === "offline" || knownStatus === "closed")
     ) {
       void api.sessionPreview(sessionId, previewRequest.signal)
         .then((preview) => {
