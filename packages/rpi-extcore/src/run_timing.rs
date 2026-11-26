@@ -770,11 +770,7 @@ mod tests {
             }]
         );
         assert_eq!(
-            resumed
-                .timings
-                .iter()
-                .map(|t| t.elapsed_ms)
-                .sum::<u64>(),
+            resumed.timings.iter().map(|t| t.elapsed_ms).sum::<u64>(),
             1_000 + 4_000
         );
     }
@@ -784,7 +780,9 @@ mod tests {
         let f = Fixture::new(false);
         f.start("live", "main", 5_000, "run");
         f.message("live-answer", "main");
-        let page = f.query(&mut RunTimingCache::default(), None, &["live-answer"]).unwrap();
+        let page = f
+            .query(&mut RunTimingCache::default(), None, &["live-answer"])
+            .unwrap();
         // Row footers describe committed runs. A live run has no final entry to
         // bind to yet, so the row query must not produce a timing object that a
         // client could render as a finished duration.
