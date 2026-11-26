@@ -894,6 +894,12 @@ export default function App() {
   const [sending, setSending] = useState(false);
   const sendingRef = useRef(false);
   const sendingRevision = useRef(0);
+  // Which composer action is awaiting acknowledgement: "send" / "continue"
+  // use the same submit path, "stop" uses abort(). Drives the progress ring
+  // so a click is visibly accepted until the host answers.
+  const [composerActionPending, setComposerActionPending] = useState<
+    "send" | "continue" | "stop" | null
+  >(null);
   const localMessageSeq = useRef(0);
   const activeSessionRef = useRef(sessionId);
   activeSessionRef.current = sessionId;
@@ -2075,6 +2081,16 @@ export default function App() {
     (key: MessageKey, values?: Record<string, string | number>) =>
       translate(language, key, values),
     [language],
+  );
+  // Only the newest action for the still-active navigation may own the ring.
+  // A stale finally (session switch, superseded submit) must not clear it.
+  const setActionPending = useCallback(
+    (value: "send" | "continue" | "stop" | null, navigation?: number) => {
+      if (navigation !== undefined && navigation !== navigationRevision.current)
+        return;
+      setComposerActionPending(value);
+    },
+    [],
   );
   const connectionLabel = t(
     (status === "awaiting_input" ? "waitingForAnswer" : status) as MessageKey,
@@ -4118,6 +4134,7 @@ export default function App() {
     };
     sendingRef.current = true;
     setSending(true);
+    setActionPending(continuing ? "continue" : "send");
     updateDraft("");
     setError("");
     setInterrupted(false);
@@ -4187,6 +4204,7 @@ export default function App() {
       if (submission === sendingRevision.current) {
         sendingRef.current = false;
         setSending(false);
+        setActionPending(null, navigation);
       }
     }
   }
@@ -4203,9 +4221,10 @@ export default function App() {
     )
       return;
     const submission = ++sendingRevision.current;
+    const navigation = navigationRevision.current;
     sendingRef.current = true;
     setSending(true);
-    const navigation = navigationRevision.current;
+    setActionPending("continue", navigation);
     const cursor = lastSeq.current;
     const priorStatus = status;
     const priorActive = runActive;
@@ -4247,6 +4266,7 @@ export default function App() {
       if (submission === sendingRevision.current) {
         sendingRef.current = false;
         setSending(false);
+        setActionPending(null, navigation);
       }
     }
   }
@@ -4855,6 +4875,9 @@ export default function App() {
     // Stop behaviour being fixed here.
     const preserveQueue = stopPreservesQueue;
     if (!preserveQueue && !hostSupports("abort")) return;
+    // Spin until the host acknowledges the stop, so the click is visibly
+    // accepted even though the run is still winding down.
+    setActionPending("stop", navigation);
     try {
       if (preserveQueue) {
         await commandData<StopRunResult>(targetSession, "stop_run");
@@ -4903,6 +4926,8 @@ export default function App() {
       setSendNowSent(null);
       if (targetSession === activeSessionRef.current)
         void refreshQueue(targetSession);
+    } finally {
+      setActionPending(null, navigation);
     }
   }
 
@@ -7300,7 +7325,7 @@ export default function App() {
                       // makes long-press-for-newline impossible. The button and
                       // the desktop Enter handler both call `submit()` instead.
                       type="button"
-                      className={`send-button${composerAbort && !composerRunningSend ? " composer-action-stop" : composerContinue ? " composer-action-continue" : ""}`}
+                      className={`send-button${composerActionPending === "stop" || (!composerActionPending && composerAbort && !composerRunningSend) ? " composer-action-stop" : composerActionPending === "continue" || (!composerActionPending && composerContinue) ? " composer-action-continue" : ""}${composerActionPending ? " composer-action-pending" : ""}`}
                       aria-label={
                         composerRunningSend
                           ? t("send")
@@ -7335,8 +7360,22 @@ export default function App() {
                           ? () => void abort()
                           : () => void submit()
                       }
+                      aria-busy={composerActionPending !== null}
                     >
-                      {composerAbort && !composerRunningSend ? (
+                      {composerActionPending ? (
+                        <span
+                          className="composer-action-progress"
+                          aria-hidden="true"
+                        >
+                          {composerActionPending === "stop" ? (
+                            <span className="stop-indicator" />
+                          ) : composerActionPending === "continue" ? (
+                            <Play size={15} aria-hidden="true" />
+                          ) : (
+                            <ArrowUp size={15} />
+                          )}
+                        </span>
+                      ) : composerAbort && !composerRunningSend ? (
                         <span className="stop-indicator" aria-hidden="true" />
                       ) : composerContinue ? (
                         <Play size={17} aria-hidden="true" />
@@ -8189,7 +8228,8 @@ function ToolRowView({
     isRead && row.status !== "error" ? readOutput(row.result) : null;
   const readResult = readResultText !== null;
   const readPath = isRead ? pathOfArgs(row.args) : "";
-  const showReadImages = isRead && row.status !== "error" && !!row.images?.length;
+  const showReadImages =
+    isRead && row.status !== "error" && !!row.images?.length;
   const filename = readPath.split(/[\\/]/).pop();
   const images = row.images?.map((image, index) => (
     <ImagePreview

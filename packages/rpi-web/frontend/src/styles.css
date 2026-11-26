@@ -1077,6 +1077,10 @@ code {
   .send-button:hover:not(:disabled) {
     background: #0066cf;
   }
+  /* Keep the pale disc while an action is pending. */
+  .send-button.composer-action-pending:hover:not(:disabled) {
+    background: var(--soft);
+  }
 }
 .composer-controls .session-command-button {
   min-width: 44px;
