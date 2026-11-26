@@ -1089,7 +1089,6 @@ export function ProjectSidebar({
     setBulkPending(true);
     try {
       await onBulkMetadata(selectedSessions, patch);
-      if (patch.archived && !archived) setArchivedView(true);
       exitSelectMode();
     } finally {
       setBulkPending(false);

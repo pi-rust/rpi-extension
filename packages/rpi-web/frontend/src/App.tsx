@@ -2936,9 +2936,27 @@ export default function App() {
             now: Date.now(),
             protectedIds,
           });
-          if (stale.length) {
-            // Sequential on purpose: the native host serves one session at a
-            // time, and a startup burst of parallel writes buys nothing.
+          if (
+            stale.length &&
+            caps.supportedActions?.includes("session_bulk_metadata")
+          ) {
+            try {
+              const result = await api.bulkSessionMetadata(stale, {
+                archived: true,
+              });
+              if (cancelled) return;
+              if (result.updated.length) {
+                const refreshed = await refreshSessions();
+                if (cancelled || !refreshed) return;
+                activeList = refreshed;
+              }
+            } catch {
+              // A single failure must not abort bootstrap; the next page
+              // load retries the whole stale set.
+            }
+          } else if (stale.length) {
+            // Legacy fallback: older services only expose a single-session
+            // metadata endpoint. Keep writes serial there.
             const archivedIds = new Set<string>();
             for (const id of stale) {
               if (cancelled) return;
@@ -5105,14 +5123,56 @@ export default function App() {
   ) {
     const entries = targets.filter((session) => !retirementBusy(session));
     if (!entries.length) return;
-    // One metadata write at a time: the native host is a single child process,
-    // and a burst of parallel writes neither helps nor reports better. Each
-    // failure still surfaces through updateSessionMetadata's own banner.
+    const metadata = {
+      ...patch,
+      ...(patch.archived ? { pinned: undefined } : {}),
+    };
+    const navigation = navigationRevision.current;
+    if (actions.has("session_bulk_metadata")) {
+      try {
+        const result = await api.bulkSessionMetadata(
+          entries.map((session) => session.sessionId),
+          metadata,
+        );
+        const list = await refreshSessions();
+        if (
+          !list ||
+          navigation !== navigationRevision.current ||
+          !result.updated.length
+        )
+          return;
+        if (
+          patch.archived &&
+          result.updated.includes(activeSessionRef.current)
+        ) {
+          const active = entries.find(
+            (session) => session.sessionId === activeSessionRef.current,
+          );
+          const next = list.find(
+            (entry) =>
+              entry.projectId === active?.projectId &&
+              !entry.archived &&
+              !entry.deleting,
+          );
+          // Archiving from the sidebar should leave the menu open so
+          // repeated session management does not need a reopen each time.
+          select(next?.sessionId ?? "", next?.projectId ?? active?.projectId, {
+            keepSidebarOpen: true,
+          });
+        }
+        for (const skipped of result.skipped) {
+          if (navigation !== navigationRevision.current) return;
+          setError(errorText(new ApiError(skipped.error, 409, skipped.code)));
+        }
+      } catch (cause) {
+        if (navigation === navigationRevision.current)
+          setError(errorText(cause));
+      }
+      return;
+    }
+    // Legacy fallback: older services only expose a single-session endpoint.
     for (const session of entries) {
-      await updateSessionMetadata(session, {
-        ...patch,
-        ...(patch.archived ? { pinned: undefined } : {}),
-      });
+      await updateSessionMetadata(session, metadata);
     }
   }
 

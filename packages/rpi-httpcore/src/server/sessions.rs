@@ -11,8 +11,8 @@ use rpi_extcore::{
     protocol::ApiCommand,
     reply::{IntoReply, ReplyKind, ServiceReply},
     service::{
-        self, CreateSessionRequest, ForkRequest, MetadataRequest, RenameRequest, RunTimingsQuery,
-        SessionListQuery,
+        self, BulkMetadataRequest, CreateSessionRequest, ForkRequest, MetadataRequest,
+        RenameRequest, RunTimingsQuery, SessionListQuery,
     },
 };
 use serde_json::json;
@@ -65,6 +65,26 @@ pub(super) async fn session_metadata(
     };
     HttpReply(
         service::session_metadata(&state.backend, id, request)
+            .await
+            .into_reply(),
+    )
+    .into_response()
+}
+
+pub(super) async fn bulk_session_metadata(
+    State(state): State<AppState>,
+    Extension(authorization): Extension<RequestAuthorization>,
+    body: axum::body::Bytes,
+) -> axum::response::Response {
+    let Some(_commit_fence) = security::commit_fence(&state.security, &authorization).await else {
+        return security::unauthorized_response();
+    };
+    let request: BulkMetadataRequest = match optional_json(&body) {
+        Ok(request) => request,
+        Err(error) => return error.into_response(),
+    };
+    HttpReply(
+        service::bulk_session_metadata(&state.backend, request)
             .await
             .into_reply(),
     )
@@ -246,6 +266,10 @@ pub(super) fn routes() -> axum::Router<AppState> {
         .route(
             "/api/v1/sessions/{id}/rename",
             axum::routing::post(rename_session),
+        )
+        .route(
+            "/api/v1/sessions/metadata/batch",
+            axum::routing::post(bulk_session_metadata),
         )
         .route(
             "/api/v1/sessions/{id}/metadata",
