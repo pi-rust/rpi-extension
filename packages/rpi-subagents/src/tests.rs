@@ -202,7 +202,13 @@ fn forwards_deltas_and_returns_delegation_metadata_then_disposes() {
     assert_eq!(result["report"], "report");
     assert_eq!(result["sessionId"], "child-1");
     let calls = calls.lock().unwrap();
-    assert_eq!(calls[0]["toolCallId"], "tool-1");
+    assert_eq!(
+        calls[0],
+        json!({
+            "op":"start", "task":"inspect", "role":"worker",
+            "maxTurns":8, "timeoutSeconds":300, "toolCallId":"tool-1"
+        })
+    );
     assert_eq!(calls.last().unwrap()["op"], "dispose");
 }
 
