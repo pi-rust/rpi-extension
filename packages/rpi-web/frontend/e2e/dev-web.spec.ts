@@ -19189,6 +19189,14 @@ test("startup auto-archives stale sessions by last completed turn", async ({
       return route.fulfill({ json: { sessions } });
     return route.fallback();
   });
+  await page.route(
+    "**/api/v1/sessions/metadata/batch",
+    async (route: Route) => {
+      const body = route.request().postDataJSON() as { sessionIds: string[] };
+      archived.push(...body.sessionIds);
+      return route.fallback();
+    },
+  );
   await page.route(/\/sessions\/[^/]+\/metadata$/, async (route: Route) => {
     const id = new URL(route.request().url()).pathname.split("/")[4];
     archived.push(id);
@@ -19259,6 +19267,10 @@ test("changing auto-archive settings never re-runs startup or moves the chat", a
     if (route.request().method() === "GET")
       return route.fulfill({ json: { sessions: [session, stale] } });
     sessionMutations.push(`${route.request().method()} /sessions`);
+    return route.fallback();
+  });
+  await page.route("**/api/v1/sessions/metadata/batch", (route: Route) => {
+    sessionMutations.push("metadata");
     return route.fallback();
   });
   await page.route(/\/sessions\/[^/]+\/metadata$/, (route: Route) => {
