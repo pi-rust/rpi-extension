@@ -1644,11 +1644,12 @@ details[open] > summary:before {
   --tool-summary-inline-padding: 4px;
   --tool-status-width: 14px;
   --tool-summary-gap: 8px;
-}
-.tool-card {
   width: min(100%, 760px);
   max-width: 100%;
-  margin: 0 auto 2px;
+  margin-inline: auto;
+}
+.tool-card {
+  margin-block: 0 2px;
   border: 0;
   border-radius: 0;
   background: transparent;
@@ -2957,7 +2958,8 @@ details[open] > summary:before {
   .message-list,
   .message,
   .message-body,
-  .tool-card {
+  .tool-card,
+  .read-image-previews {
     width: 100%;
     min-width: 0;
     max-width: 100%;
