@@ -51,7 +51,51 @@ struct Request {
     timeout_seconds: u64,
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+struct BudgetPolicy {
+    max_turns: Option<u64>,
+    timeout_seconds: Option<u64>,
+}
+
 fn parse_request(params: &Value) -> Result<Request, String> {
+    parse_request_with_budget_policy(params, configured_budget_policy()?)
+}
+
+/// Independent operator policies. Neither changes native cancellation, output
+/// bounds or ownership; zero disables only the turn guard.
+fn configured_budget_policy() -> Result<BudgetPolicy, String> {
+    Ok(BudgetPolicy {
+        max_turns: configured_limit("RPI_SUBAGENT_MAX_TURNS", 0, 32)?,
+        timeout_seconds: configured_limit("RPI_SUBAGENT_TIMEOUT_SECONDS", 10, 1800)?,
+    })
+}
+
+fn configured_limit(name: &str, minimum: u64, maximum: u64) -> Result<Option<u64>, String> {
+    match std::env::var(name) {
+        Err(std::env::VarError::NotPresent) => Ok(None),
+        Ok(value) => parse_operator_limit(name, &value, minimum, maximum).map(Some),
+        Err(_) => Err(format!("{name} must be valid UTF-8")),
+    }
+}
+
+fn parse_operator_limit(
+    name: &str,
+    value: &str,
+    minimum: u64,
+    maximum: u64,
+) -> Result<u64, String> {
+    value
+        .trim()
+        .parse::<u64>()
+        .ok()
+        .filter(|value| (minimum..=maximum).contains(value))
+        .ok_or_else(|| format!("{name} must be an integer between {minimum} and {maximum}"))
+}
+
+fn parse_request_with_budget_policy(
+    params: &Value,
+    policy: BudgetPolicy,
+) -> Result<Request, String> {
     let task = params
         .get("task")
         .and_then(Value::as_str)
@@ -70,16 +114,20 @@ fn parse_request(params: &Value) -> Result<Request, String> {
     Ok(Request {
         task: task.into(),
         role: role.into(),
-        max_turns: params
-            .get("maxTurns")
-            .and_then(Value::as_u64)
-            .unwrap_or(8)
-            .clamp(1, 32),
-        timeout_seconds: params
-            .get("timeoutSeconds")
-            .and_then(Value::as_u64)
-            .unwrap_or(300)
-            .clamp(10, 1800),
+        max_turns: policy.max_turns.unwrap_or_else(|| {
+            params
+                .get("maxTurns")
+                .and_then(Value::as_u64)
+                .unwrap_or(8)
+                .clamp(0, 32)
+        }),
+        timeout_seconds: policy.timeout_seconds.unwrap_or_else(|| {
+            params
+                .get("timeoutSeconds")
+                .and_then(Value::as_u64)
+                .unwrap_or(300)
+                .clamp(10, 1800)
+        }),
     })
 }
 
@@ -342,7 +390,11 @@ extern "C" fn destroy(handle: StepHandle) {
 
 /// Keep registration and schema tests on the same metadata path.
 fn delegate_schema() -> rpi_plugin_sdk::StableToolSchema {
-    schema(
+    delegate_schema_with_budget_policy(configured_budget_policy().unwrap_or_default())
+}
+
+fn delegate_schema_with_budget_policy(policy: BudgetPolicy) -> rpi_plugin_sdk::StableToolSchema {
+    let mut registered = schema(
         "delegate_task",
         "Delegate one bounded, non-recursive task to a host-managed in-memory child session, not a subagent subprocess or isolated worktree. The child inherits the current model/provider, tools, cwd and approval hooks; it shares the workspace and extension state. Supply necessary context, exact scope/file ownership, constraints, acceptance checks and expected report in task; do not assume the child knows the parent conversation. Coordinate overlapping writes. role is a label, not a tool/permission profile. The child cannot delegate further. Streams progress and returns a JSON report; review the report and verify acceptance, including turnLimited. Requires host ChildAgent support.",
         r#"{
@@ -360,23 +412,35 @@ fn delegate_schema() -> rpi_plugin_sdk::StableToolSchema {
                 },
                 "maxTurns": {
                     "type": "integer",
-                    "minimum": 1,
+                    "minimum": 0,
                     "maximum": 32,
                     "default": 8,
-                    "description": "Per-child turn budget, 1-32; default 8. A completed report may be turnLimited; verify task acceptance."
+                    "description": "Per-child turn budget: 0 disables the turn limit and requires host support; 1-32 selects a finite budget; default 8 unless overridden by operator policy. A completed report may be turnLimited; verify task acceptance."
                 },
                 "timeoutSeconds": {
                     "type": "integer",
                     "minimum": 10,
                     "maximum": 1800,
                     "default": 300,
-                    "description": "Child timeout in seconds, 10-1800; default 300. Timeout/cancellation triggers host-managed cleanup."
+                    "description": "Child total wall-clock timeout in seconds, 10-1800; default 300 unless overridden by operator policy. Includes model generation, tools and waiting; independent of maxTurns. Timeout/cancellation triggers host-managed cleanup."
                 }
             },
             "required": ["task"],
             "additionalProperties": true
         }"#,
-    )
+    );
+    let mut parameters: Value = serde_json::from_str(&registered.parameters.to_string_lossy())
+        .expect("static delegate schema");
+    if let Some(turns) = policy.max_turns {
+        parameters["properties"]["maxTurns"] = json!({"type":"integer", "enum":[turns], "default":turns,
+            "description":if turns == 0 { "Operator policy disables the turn limit. Timeout and cancellation still apply; omit maxTurns or use 0.".to_string() } else { format!("Operator policy fixes the per-child turn budget at {turns}.") }});
+    }
+    if let Some(seconds) = policy.timeout_seconds {
+        parameters["properties"]["timeoutSeconds"] = json!({"type":"integer", "enum":[seconds], "default":seconds,
+            "description":format!("Operator policy fixes the child total wall-clock timeout at {seconds} seconds. Includes model generation, tools and waiting; independent of maxTurns.")});
+    }
+    registered.parameters = StbString::from_string(parameters.to_string());
+    registered
 }
 
 rpi_plugin_sdk::export_plugin!(|api| {
