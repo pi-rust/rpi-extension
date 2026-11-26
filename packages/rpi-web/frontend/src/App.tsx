@@ -8129,53 +8129,60 @@ function ToolRowView({
     isRead && row.status !== "error" ? readOutput(row.result) : null;
   const readResult = readResultText !== null;
   const readPath = isRead ? pathOfArgs(row.args) : "";
-  const summary = toolSummary(row.name, row.args, row.status, language);
-  return (
-    <ToolDisclosure
-      expansion={expansion}
-      toolName={row.name}
-      {...summary}
-      status={row.status}
+  const showReadImages = isRead && row.status !== "error" && !!row.images?.length;
+  const filename = readPath.split(/[\\/]/).pop();
+  const images = row.images?.map((image, index) => (
+    <ImagePreview
+      key={`${row.id}-image-${index}`}
+      image={showReadImages && !image.alt ? { ...image, alt: filename } : image}
       language={language}
-      timing={
-        row.timing && <ToolElapsed timing={row.timing} language={language} />
-      }
-    >
-      <div className="tool-detail">
-        {row.images?.map((image, index) => (
-          <ImagePreview
-            key={`${row.id}-image-${index}`}
-            image={image}
-            language={language}
-          />
-        ))}
-        {row.args !== undefined && (
-          <>
-            <h4>{t("input")}</h4>
-            <pre className="tool-arguments">{safeJson(row.args)}</pre>
-          </>
-        )}
-        <h4>{t("output")}</h4>
-        {readResult ? (
-          <ReadCode
-            path={readPath}
-            text={readResultText ?? ""}
-            language={language}
-          />
-        ) : resultText !== null ? (
-          isMarkdownText(resultText) ? (
-            <MarkdownBody text={resultText} language={language} />
-          ) : (
-            <pre className="tool-result-pre">{resultText}</pre>
-          )
-        ) : row.result !== undefined ? (
-          <pre>{safeJson(row.result)}</pre>
-        ) : (
-          <pre className="muted">{t("noOutput")}</pre>
-        )}
-        {history}
-      </div>
-    </ToolDisclosure>
+    />
+  ));
+  const summary = toolSummary(row.name, row.args, row.status, language);
+  const output = readResult ? (
+    <ReadCode path={readPath} text={readResultText} language={language} />
+  ) : showReadImages ? null : resultText !== null ? (
+    isMarkdownText(resultText) ? (
+      <MarkdownBody text={resultText} language={language} />
+    ) : (
+      <pre className="tool-result-pre">{resultText}</pre>
+    )
+  ) : row.result !== undefined ? (
+    <pre>{safeJson(row.result)}</pre>
+  ) : (
+    <pre className="muted">{t("noOutput")}</pre>
+  );
+  return (
+    <>
+      <ToolDisclosure
+        expansion={expansion}
+        toolName={row.name}
+        {...summary}
+        status={row.status}
+        language={language}
+        timing={
+          row.timing && <ToolElapsed timing={row.timing} language={language} />
+        }
+      >
+        <div className="tool-detail">
+          {!showReadImages && images}
+          {row.args !== undefined && (
+            <>
+              <h4>{t("input")}</h4>
+              <pre className="tool-arguments">{safeJson(row.args)}</pre>
+            </>
+          )}
+          {output && (
+            <>
+              <h4>{t("output")}</h4>
+              {output}
+            </>
+          )}
+          {history}
+        </div>
+      </ToolDisclosure>
+      {showReadImages && <div className="read-image-previews">{images}</div>}
+    </>
   );
 }
 
