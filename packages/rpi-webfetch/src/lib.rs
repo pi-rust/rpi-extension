@@ -1,4 +1,4 @@
-#![forbid(unsafe_code)]
+#![deny(unsafe_code)]
 // `export_plugin!` generates extern "C" entry points; the SDK's `guard`
 // wrapper owns the safety contract (same allow as sibling extension crates).
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
@@ -14,6 +14,8 @@ use std::net::{IpAddr, ToSocketAddrs};
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 use url::Url;
+// Each tool call owns its Drive and cancellation state. Registrations store
+// no host callback context and can use this synchronized handle table together.
 static HANDLES: ToolHandles<Drive> = ToolHandles::new();
 
 struct Drive {
@@ -241,6 +243,12 @@ fn tool_schema() -> StableToolSchema {
     }
 }
 
+// Matches the Host's optional shared-session ABI export. Keep the standard
+// entrypoint for hosts using the published SDK and isolated library images.
+#[allow(unsafe_code)] // Only the symbol name crosses this additional ABI boundary.
+#[no_mangle]
+pub extern "C" fn rpi_plugin_shared_sessions_v1() {}
+
 rpi_plugin_sdk::export_plugin!(|api| {
     let Some(register) = api.register_tool else {
         return 1;
@@ -256,6 +264,29 @@ mod tests {
     #[test]
     fn rejects_private() {
         assert!(validate("http://127.0.0.1").is_err());
+    }
+
+    #[test]
+    fn overlapping_tool_calls_keep_independent_state() {
+        let open = |url: &str| {
+            execute(
+                StbStringRef::from_str("call"),
+                StbString::from_string(json!({"url": url}).to_string()),
+                Some(free_string),
+            )
+        };
+        let first = open("https://example.com/first");
+        let second = open("https://example.com/second");
+        assert_ne!(first, second);
+
+        cancel(first);
+        assert!(HANDLES.get(first).unwrap().cancelled.load(Ordering::SeqCst));
+        destroy(first);
+        assert!(HANDLES.get(first).is_none());
+        let active = HANDLES.get(second).unwrap();
+        assert!(!active.cancelled.load(Ordering::SeqCst));
+        assert_eq!(active.lock().params["url"], "https://example.com/second");
+        destroy(second);
     }
 
     #[test]
