@@ -19,7 +19,8 @@ overridden by the agent-dir file.
 --init creates a project config without overwriting an existing file.
 Paths in JSON are relative to the config file; a bare rpiBin uses PATH.
 --host-area joins the native default area, or NAME if specified (macOS).
-Use hostArea: true or hostArea: \"NAME\" in web.json. Use false for ordinary sessions.";
+Use hostArea: true or hostArea: \"NAME\" in web.json. Use false for ordinary sessions.
+Set localHostSocket and sessionDir in web.json to use a local Host for every session.";
 
 pub const AGENT_DIR_ENV: &str = "RPI_CODING_AGENT_DIR";
 
@@ -86,6 +87,8 @@ struct FileConfig {
     session_timeout_seconds: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     host_area: Option<HostArea>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    local_host_socket: Option<PathBuf>,
 }
 
 impl FileConfig {
@@ -108,6 +111,7 @@ impl FileConfig {
             (self.projects_root, &mut config.projects_root),
             (self.assets, &mut config.assets),
             (self.session_dir, &mut config.session_dir),
+            (self.local_host_socket, &mut config.local_host_socket),
         ] {
             if let Some(path) = value {
                 *target = Some(resolve_home_path(base, &path, home)?);
@@ -328,6 +332,7 @@ fn configure_with_agent(
             bind: (config.bind != "127.0.0.1").then_some(config.bind),
             port: Some(config.port),
             session_dir: config.session_dir,
+            local_host_socket: config.local_host_socket,
             registry: (config.registry != rpi_extcore::registry::default_path())
                 .then_some(config.registry),
             allowed_hosts: None,
@@ -471,6 +476,22 @@ mod tests {
         assert_eq!(launch(&[]), None);
         assert_eq!(launch(&["--host-area"]).as_deref(), Some(""));
         assert_eq!(launch(&["--host-area", "other"]).as_deref(), Some("other"));
+    }
+
+    #[test]
+    fn local_host_socket_is_opt_in_and_relative_to_its_config_file() {
+        let f = Fixture::new();
+        assert_eq!(f.run(&[]).local_host_socket, None);
+        f.write(
+            "work/.rpi/web.json",
+            r#"{"localHostSocket":"run/rpc.sock","sessionDir":"history"}"#,
+        );
+        let config = f.run(&[]);
+        assert_eq!(
+            config.local_host_socket,
+            Some(f.0.join("work/.rpi/run/rpc.sock")),
+        );
+        assert_eq!(config.session_dir, Some(f.0.join("work/.rpi/history")));
     }
 
     #[test]
