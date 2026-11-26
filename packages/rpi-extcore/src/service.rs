@@ -827,11 +827,20 @@ pub async fn rename_session(state: &Service, id: String, request: RenameRequest)
     (ReplyKind::Success, json!({"sessionId": id, "title": title})).into_reply()
 }
 
-#[derive(Deserialize)]
+#[derive(Default, Deserialize)]
 pub struct MetadataRequest {
     pub pinned: Option<bool>,
     pub archived: Option<bool>,
     pub tags: Option<Vec<String>>,
+}
+
+pub const MAX_BULK_METADATA_SESSIONS: usize = 64;
+
+#[derive(Default, Deserialize)]
+pub struct BulkMetadataRequest {
+    #[serde(rename = "sessionIds")]
+    pub session_ids: Vec<String>,
+    pub patch: MetadataRequest,
 }
 
 pub async fn session_metadata(
@@ -840,6 +849,13 @@ pub async fn session_metadata(
     request: MetadataRequest,
 ) -> (ReplyKind, Value) {
     retirement::metadata(state, id, request).await
+}
+
+pub async fn bulk_session_metadata(
+    state: &Service,
+    request: BulkMetadataRequest,
+) -> (ReplyKind, Value) {
+    retirement::bulk_metadata(state, request).await
 }
 
 pub async fn fork_session(state: &Service, id: String, request: ForkRequest) -> ServiceReply {

@@ -62,6 +62,7 @@ const capabilities = {
     "history_mutation",
     "provider_auth",
     "session_metadata",
+    "session_bulk_metadata",
     "projects",
     "create_project",
     "session_organization",
@@ -110,6 +111,8 @@ async function mockHost(
       if (await close.count()) await close.click();
     },
   );
+  const bulkMetadataBodies: unknown[] = [];
+  let listSessionCalls = 0;
   const projects = [
     {
       id: "project-a",
@@ -142,6 +145,12 @@ async function mockHost(
       archived: false,
     });
   }
+  (page as Page & { __bulkMetadataBodies?: unknown[] }).__bulkMetadataBodies =
+    bulkMetadataBodies;
+  Object.defineProperty(page, "__listSessionCalls", {
+    configurable: true,
+    get: () => listSessionCalls,
+  });
   await page.route("**/api/v1/**", async (route: Route) => {
     const request = route.request();
     const url = new URL(request.url());
@@ -251,7 +260,34 @@ async function mockHost(
     if (path === "/api/v1/capabilities") {
       return route.fulfill({ json: capabilities });
     }
+    if (path === "/api/v1/sessions/metadata/batch") {
+      const body = request.postDataJSON() as {
+        sessionIds: string[];
+        patch: { archived?: boolean; pinned?: boolean };
+      };
+      bulkMetadataBodies.push(body);
+      const updated: string[] = [];
+      for (const id of body.sessionIds) {
+        const entry = sessions.find((s) => s.sessionId === id);
+        if (!entry) continue;
+        Object.assign(entry ?? {}, body.patch);
+        updated.push(id);
+      }
+      return route.fulfill({
+        json: {
+          updated,
+          updatedSessions: updated.map((id) => ({
+            sessionId: id,
+            pinned: body.patch.pinned ?? false,
+            archived: body.patch.archived ?? false,
+            tags: [],
+          })),
+          skipped: [],
+        },
+      });
+    }
     if (path === "/api/v1/sessions" && request.method() === "GET") {
+      listSessionCalls += 1;
       return route.fulfill({ json: { sessions } });
     }
     if (path === "/api/v1/sessions" && request.method() === "POST") {
@@ -1258,11 +1294,29 @@ test("multi-select session actions pin and archive in bulk", async ({
     .click();
   await page.getByRole("button", { name: "Select all", exact: true }).click();
   await expect(selectionBar).toContainText("3 selected");
+  const listCallsBeforeArchive = (page as Page & { __listSessionCalls: number })
+    .__listSessionCalls;
   await page.getByRole("button", { name: "Archive", exact: true }).click();
   await expect(page.locator(".session-selection-bar")).toHaveCount(0);
   await expect(page.getByRole("checkbox")).toHaveCount(0);
+  // One actual batch write, not one metadata request per checked row.
+  const batches = (page as Page & { __bulkMetadataBodies?: unknown[] })
+    .__bulkMetadataBodies;
+  expect(batches).toHaveLength(2);
+  expect((batches![1] as { sessionIds: string[] }).sessionIds.sort()).toEqual([
+    "session-1",
+    "session-2",
+    "session-3",
+  ]);
+  expect(
+    (batches![1] as { patch: { archived?: boolean } }).patch.archived,
+  ).toBe(true);
+  expect(
+    (page as Page & { __listSessionCalls: number }).__listSessionCalls,
+  ).toBe(listCallsBeforeArchive + 1);
+  // Bulk archive stays on the project view instead of jumping to archived.
   await expect(
-    page.getByRole("button", { name: "Show projects", exact: true }),
+    page.getByRole("button", { name: "Show archived chats", exact: true }),
   ).toBeVisible();
 });
 
@@ -19236,6 +19290,14 @@ test("startup auto-archives stale sessions by last completed turn", async ({
       return route.fulfill({ json: { sessions } });
     return route.fallback();
   });
+  await page.route(
+    "**/api/v1/sessions/metadata/batch",
+    async (route: Route) => {
+      const body = route.request().postDataJSON() as { sessionIds: string[] };
+      archived.push(...body.sessionIds);
+      return route.fallback();
+    },
+  );
   await page.route(/\/sessions\/[^/]+\/metadata$/, async (route: Route) => {
     const id = new URL(route.request().url()).pathname.split("/")[4];
     archived.push(id);
@@ -19306,6 +19368,10 @@ test("changing auto-archive settings never re-runs startup or moves the chat", a
     if (route.request().method() === "GET")
       return route.fulfill({ json: { sessions: [session, stale] } });
     sessionMutations.push(`${route.request().method()} /sessions`);
+    return route.fallback();
+  });
+  await page.route("**/api/v1/sessions/metadata/batch", (route: Route) => {
+    sessionMutations.push("metadata");
     return route.fallback();
   });
   await page.route(/\/sessions\/[^/]+\/metadata$/, (route: Route) => {

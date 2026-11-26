@@ -169,6 +169,59 @@ async fn archive_idle_closes_preserves_history_and_restore_never_spawns() {
 }
 
 #[tokio::test]
+async fn bulk_archive_updates_many_sessions_and_skips_unknown() {
+    let f = Fixture::new().await;
+    let second_id = uuid::Uuid::new_v4().to_string();
+    let unknown_id = uuid::Uuid::new_v4().to_string();
+    f.service
+        .registry
+        .write()
+        .await
+        .upsert(RegistryEntry {
+            session_id: second_id.clone(),
+            project_id: Some(f.service.default_project_id.clone()),
+            title: None,
+            parent_session_id: None,
+            fork_entry_id: None,
+            relation: None,
+            created_at: 2,
+            updated_at: 2,
+            last_turn_ended_at: None,
+        })
+        .unwrap();
+    let ids = vec![f.id.clone(), second_id, unknown_id.clone()];
+    let reply = bounded(bulk_session_metadata(
+        &f.service,
+        super::BulkMetadataRequest {
+            session_ids: ids.clone(),
+            patch: MetadataRequest {
+                pinned: None,
+                archived: Some(true),
+                tags: None,
+            },
+        },
+    ))
+    .await;
+    assert_eq!(reply.0, ReplyKind::Success);
+    assert_eq!(
+        reply.1["updated"].as_array().map(Vec::len),
+        Some(2),
+        "unexpected reply: {reply:?}"
+    );
+    assert_eq!(reply.1["skipped"][0]["sessionId"], unknown_id);
+    assert_eq!(reply.1["skipped"][0]["code"], "session_not_found");
+    let registry = f.service.registry.read().await;
+    assert!(registry.preferences(&f.id).archived);
+    assert!(
+        registry
+            .preferences(&reply.1["updated"][1].as_str().unwrap())
+            .archived
+    );
+    drop(registry);
+    f.finish().await;
+}
+
+#[tokio::test]
 async fn idle_reaper_closes_expired_host_but_keeps_saved_session() {
     let f = Fixture::new().await;
     let (host, events, peer) = f.connect().await;

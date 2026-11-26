@@ -195,13 +195,13 @@ impl Registry {
         self.preferences.get(id).cloned().unwrap_or_default()
     }
 
-    pub fn update_preferences(
+    fn update_preferences_in_memory(
         &mut self,
         id: &str,
         pinned: Option<bool>,
         archived: Option<bool>,
         tags: Option<Vec<String>>,
-    ) -> Result<SessionPreferences, String> {
+    ) -> Result<(SessionPreferences, SessionPreferences), String> {
         if self.get(id).is_none() {
             return Err("session not found".into());
         }
@@ -217,12 +217,62 @@ impl Registry {
         if let Some(tags) = normalized_tags {
             value.tags = tags;
         }
-        let result = value.clone();
+        Ok((previous, value.clone()))
+    }
+
+    pub fn update_preferences(
+        &mut self,
+        id: &str,
+        pinned: Option<bool>,
+        archived: Option<bool>,
+        tags: Option<Vec<String>>,
+    ) -> Result<SessionPreferences, String> {
+        let (previous, result) = self.update_preferences_in_memory(id, pinned, archived, tags)?;
         if let Err(error) = self.save_result() {
             self.preferences.insert(id.into(), previous);
             return Err(error);
         }
         Ok(result)
+    }
+
+    /// Apply one metadata patch to several known sessions and persist the
+    /// registry once. On a save failure every preference is restored, so a
+    /// bulk update is atomic from the registry's point of view.
+    pub fn update_preferences_bulk(
+        &mut self,
+        ids: &[String],
+        pinned: Option<bool>,
+        archived: Option<bool>,
+        tags: Option<Vec<String>>,
+    ) -> Result<Vec<SessionPreferences>, String> {
+        let normalized_tags = tags.map(normalize_tags).transpose()?;
+        let mut previous = Vec::with_capacity(ids.len());
+        let mut results = Vec::with_capacity(ids.len());
+        for id in ids {
+            if self.get(id).is_none() {
+                return Err("session not found".into());
+            }
+            let old = self.preferences(id);
+            let value = self.preferences.entry(id.clone()).or_default();
+            if let Some(pinned) = pinned {
+                value.pinned = pinned;
+            }
+            if let Some(archived) = archived {
+                value.archived = archived;
+            }
+            if let Some(tags) = normalized_tags.clone() {
+                value.tags = tags;
+            }
+            previous.push((id.clone(), old));
+            results.push(value.clone());
+        }
+        if let Err(error) = self.save_result() {
+            for (id, old) in previous {
+                self.preferences.insert(id, old);
+            }
+            return Err(error);
+        }
+        Ok(results)
     }
 
     // Host areas are rediscovered on startup. An ordinary Web server sharing

@@ -751,6 +751,23 @@ export const api = {
       method: "POST",
       body: JSON.stringify(metadata),
     }),
+  bulkSessionMetadata: (
+    sessionIds: string[],
+    metadata: { pinned?: boolean; archived?: boolean; tags?: string[] },
+  ) =>
+    request<{
+      updated: string[];
+      updatedSessions: {
+        sessionId: string;
+        pinned: boolean;
+        archived: boolean;
+        tags: string[];
+      }[];
+      skipped: { sessionId: string; code: string; error: string }[];
+    }>("/sessions/metadata/batch", {
+      method: "POST",
+      body: JSON.stringify({ sessionIds, patch: metadata }),
+    }),
   files: (projectId: string, path = "", root?: string) => {
     const query = new URLSearchParams({ path });
     if (root) query.set("root", root);
