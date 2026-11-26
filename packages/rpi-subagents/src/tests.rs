@@ -188,7 +188,6 @@ fn forwards_deltas_and_returns_delegation_metadata_then_disposes() {
     run_request(
         request(),
         "tool-1".into(),
-        true,
         &*action,
         tx,
         Arc::new(AtomicBool::new(false)),
@@ -204,11 +203,10 @@ fn forwards_deltas_and_returns_delegation_metadata_then_disposes() {
     assert_eq!(result["sessionId"], "child-1");
     let calls = calls.lock().unwrap();
     assert_eq!(calls[0]["toolCallId"], "tool-1");
-    assert_eq!(calls[0]["taskPreview"], "inspect");
+    assert_eq!(calls[0]["task"], "inspect");
     assert_eq!(calls[0]["maxTurns"], 8);
     assert_eq!(calls[0]["timeoutSeconds"], 300);
     assert_eq!(calls[0]["prompt"], "You are a delegated worker subagent. Complete the task in at most 8 turns. Do not delegate, spawn, or ask another agent to do work. Work only in the current project and return a concise final report.\n\nTask:\ninspect");
-    assert!(calls[0].get("task").is_none());
     assert_eq!(calls.last().unwrap()["op"], "dispose");
 }
 
@@ -219,17 +217,13 @@ fn unsupported_host_is_explicit_and_never_spawns_a_process() {
     let error = run_request(
         request(),
         "t".into(),
-        false,
         &*action,
         tx,
         Arc::new(AtomicBool::new(false)),
     )
     .unwrap_err();
     assert!(error.contains("requires a host supporting ChildAgent"));
-    let calls = calls.lock().unwrap();
-    assert_eq!(calls.len(), 1);
-    assert_eq!(calls[0]["task"], "inspect");
-    assert!(calls[0].get("prompt").is_none());
+    assert_eq!(calls.lock().unwrap().len(), 1);
 }
 
 #[test]
@@ -239,7 +233,6 @@ fn cancellation_before_start_has_no_host_side_effects() {
     assert!(run_request(
         request(),
         "t".into(),
-        false,
         &*action,
         tx,
         Arc::new(AtomicBool::new(true))
@@ -266,11 +259,9 @@ fn cancellation_after_start_cancels_and_disposes() {
         }
     };
     let (tx, _rx) = mpsc::channel();
-    assert!(
-        run_request(request(), "t".into(), false, &action, tx, cancelled)
-            .unwrap_err()
-            .contains("cancelled")
-    );
+    assert!(run_request(request(), "t".into(), &action, tx, cancelled)
+        .unwrap_err()
+        .contains("cancelled"));
     let ops: Vec<_> = calls
         .lock()
         .unwrap()
@@ -294,7 +285,6 @@ fn errors_and_malformed_replies_always_dispose() {
         assert!(run_request(
             request(),
             "t".into(),
-            false,
             &*action,
             tx,
             Arc::new(AtomicBool::new(false))
@@ -315,7 +305,6 @@ fn streamed_and_final_text_share_a_budget() {
     assert!(run_request(
         request(),
         "t".into(),
-        false,
         &*action,
         tx,
         Arc::new(AtomicBool::new(false))
@@ -335,7 +324,6 @@ fn partial_count_is_bounded_independently_of_bytes() {
     assert!(run_request(
         request(),
         "t".into(),
-        false,
         &*action,
         tx,
         Arc::new(AtomicBool::new(false))

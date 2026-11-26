@@ -84,24 +84,20 @@ fn parse_request(params: &Value) -> Result<Request, String> {
 }
 
 impl Request {
-    fn start_args(&self, tool_call_id: &str, explicit_prompt: bool) -> Value {
-        let mut args = json!({
+    fn start_args(&self, tool_call_id: &str) -> Value {
+        let role = &self.role;
+        let turns = self.max_turns;
+        let task = &self.task;
+        let prompt = format!("You are a delegated {role} subagent. Complete the task in at most {turns} turns. Do not delegate, spawn, or ask another agent to do work. Work only in the current project and return a concise final report.\n\nTask:\n{task}");
+        json!({
             "op": "start",
-            "role": self.role,
-            "maxTurns": self.max_turns,
+            "task": task,
+            "prompt": prompt,
+            "role": role,
+            "maxTurns": turns,
             "timeoutSeconds": self.timeout_seconds,
             "toolCallId": tool_call_id,
-        });
-        if explicit_prompt {
-            let role = &self.role;
-            let turns = self.max_turns;
-            let task = &self.task;
-            args["prompt"] = json!(format!("You are a delegated {role} subagent. Complete the task in at most {turns} turns. Do not delegate, spawn, or ask another agent to do work. Work only in the current project and return a concise final report.\n\nTask:\n{task}"));
-            args["taskPreview"] = json!(task.chars().take(200).collect::<String>());
-        } else {
-            args["task"] = json!(self.task);
-        }
-        args
+        })
     }
 }
 
@@ -163,7 +159,6 @@ impl Drop for Child<'_> {
 fn run_request(
     request: Request,
     tool_call_id: String,
-    explicit_prompt: bool,
     action: &Action,
     output: Sender<JobMessage>,
     cancelled: Arc<AtomicBool>,
@@ -171,7 +166,7 @@ fn run_request(
     if cancelled.load(Ordering::Acquire) {
         return Err("subagent cancelled".into());
     }
-    let start = action(request.start_args(&tool_call_id, explicit_prompt))
+    let start = action(request.start_args(&tool_call_id))
         .map_err(|error| format!("Cannot start a host-managed subagent: {error}. This plugin requires a host supporting ChildAgent; no default-config subprocess fallback is used."))?;
     let id = start
         .get("childId")
@@ -280,8 +275,7 @@ rpi_plugin_sdk::execute_handler!(fn execute(tool_call_id, params, free_params) {
                             args["__rpiRuntimeKey"] = json!(runtime_key);
                             host_action(&host, runtime_handle, CHILD_AGENT, args)
                         };
-                        let explicit_prompt = actual["childAgentPromptVersion"].as_u64() == Some(1);
-                        run_request(request, id, explicit_prompt, &action, sender.clone(), token)
+                        run_request(request, id, &action, sender.clone(), token)
                     });
                     match result {
                         Ok(Ok(())) => {},
