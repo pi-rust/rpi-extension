@@ -1689,13 +1689,17 @@
 .workspace .stat-row {
   padding: 7px 0;
 }
+.workspace .tool-card,
+.workspace .read-image-previews {
+  --tool-summary-inline-padding: 0px;
+}
 .workspace .tool-card {
   border-width: 0 0 1px;
   margin-bottom: 6px;
 }
 .workspace .tool-card > summary {
   min-height: 30px;
-  padding: 3px 0;
+  padding-block: 3px;
 }
 .workspace .tool-detail {
   padding: 6px 12px 10px 26px;
@@ -2023,7 +2027,7 @@
 }
 .workspace .tool-card > summary {
   min-height: 34px;
-  padding: 5px 0;
+  padding-block: 5px;
 }
 .workspace .tool-detail {
   border-top: 0;

@@ -1545,6 +1545,12 @@ details[open] > summary:before {
   object-fit: contain;
 }
 
+.read-image-previews {
+  padding-inline-start: calc(
+    var(--tool-summary-inline-padding) + var(--tool-status-width) +
+      var(--tool-summary-gap)
+  );
+}
 .read-image-previews .transcript-image {
   width: fit-content;
   max-width: min(100%, 320px);
@@ -1633,6 +1639,12 @@ details[open] > summary:before {
 }
 
 /* Codex-style activity rows: quiet summaries, one toggle, indented details. */
+.tool-card,
+.read-image-previews {
+  --tool-summary-inline-padding: 4px;
+  --tool-status-width: 14px;
+  --tool-summary-gap: 8px;
+}
 .tool-card {
   width: min(100%, 760px);
   max-width: 100%;
@@ -1646,8 +1658,8 @@ details[open] > summary:before {
   width: 100%;
   min-width: 0;
   min-height: 34px;
-  gap: 8px;
-  padding: 5px 4px;
+  gap: var(--tool-summary-gap);
+  padding: 5px var(--tool-summary-inline-padding);
   border-radius: 5px;
   color: var(--muted);
 }
@@ -1715,7 +1727,7 @@ details[open] > summary:before {
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  width: 14px;
+  width: var(--tool-status-width, 14px);
   height: 14px;
   color: var(--muted);
 }
