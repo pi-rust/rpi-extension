@@ -13,10 +13,10 @@ use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-// ABI-compatible with RuntimeActionId::ChildAgent in the host SDK. Like
-// rpi-ask-user, retain the published SDK until that enum is released.
+// Stable runtime action IDs while this package uses the published SDK.
 const GET_EXECUTION_CONTEXT: u32 = 23;
 const CHILD_AGENT: u32 = 24;
+const INDEPENDENT_RUN: u32 = 33;
 const MAX_OUTPUT_BYTES: usize = 4 * 1024 * 1024;
 const MAX_PARTIAL_EVENTS: usize = 8192;
 static JOBS: ToolHandles<Job> = ToolHandles::new();
@@ -83,14 +83,28 @@ fn parse_request(params: &Value) -> Result<Request, String> {
     })
 }
 
-type Action = dyn Fn(Value) -> Result<Value, String> + Send + Sync;
+enum ActionError {
+    UnknownAction,
+    Failed(String),
+}
+
+impl std::fmt::Display for ActionError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::UnknownAction => f.write_str("unsupported runtime action"),
+            Self::Failed(message) => f.write_str(message),
+        }
+    }
+}
+
+type Action = dyn Fn(u32, Value) -> Result<Value, ActionError> + Send + Sync;
 
 fn host_action(
     host: &RuntimeFns,
     runtime_handle: usize,
     action: u32,
     args: Value,
-) -> Result<Value, String> {
+) -> Result<Value, ActionError> {
     let encoded = args.to_string();
     let mut out = StbString::empty();
     let rc = (host.action)(
@@ -102,13 +116,19 @@ fn host_action(
     let text = out.to_string_lossy();
     (host.free)(out);
     let value: Value = serde_json::from_str(&text)
-        .map_err(|e| format!("invalid child response (status {rc}): {e}"))?;
+        .map_err(|e| ActionError::Failed(format!("invalid runtime response (status {rc}): {e}")))?;
     if rc != 0 {
-        return Err(value
+        let message = value
             .get("error")
             .and_then(Value::as_str)
-            .unwrap_or("child action failed")
-            .into());
+            .unwrap_or("runtime action failed");
+        return Err(
+            if rc == 2 && message == format!("unknown runtime action id {action}") {
+                ActionError::UnknownAction
+            } else {
+                ActionError::Failed(message.into())
+            },
+        );
     }
     Ok(value)
 }
@@ -130,51 +150,87 @@ fn validate_context(expected: &Value, actual: &Value) -> Result<(), String> {
 /// Always release the host handle, including malformed replies and local cancellation.
 struct Child<'a> {
     action: &'a Action,
+    action_id: u32,
+    id_key: &'static str,
     id: String,
     session_id: Value,
 }
 impl<'a> Child<'a> {
-    fn start(action: &'a Action, request: &Request, tool_call_id: &str) -> Result<Self, String> {
-        let mut reply = action(json!({
-            "op": "start",
-            "task": request.task,
-            "role": request.role,
-            "maxTurns": request.max_turns,
-            "timeoutSeconds": request.timeout_seconds,
-            "toolCallId": tool_call_id,
-        }))
-        .map_err(|error| format!("Cannot start a host-managed subagent: {error}. This plugin requires a host supporting ChildAgent; no default-config subprocess fallback is used."))?;
+    fn start(
+        action: &'a Action,
+        request: &Request,
+        tool_call_id: &str,
+        tools: &[Value],
+    ) -> Result<Self, String> {
+        let Request {
+            task,
+            role,
+            max_turns,
+            timeout_seconds,
+        } = request;
+        let input = format!("You are a delegated {role} subagent. Complete the task in at most {max_turns} turns. Do not delegate, spawn, or ask another agent to do work. Work only in the current project and return a concise final report.\n\nTask:\n{task}");
+        // The extension owns its tool selection. The host checks the subset and
+        // also prevents re-entry through aliases using invocation provenance.
+        let tools: Vec<_> = tools
+            .iter()
+            .filter_map(Value::as_str)
+            .filter(|name| *name != "delegate_task")
+            .collect();
+        let generic = action(
+            INDEPENDENT_RUN,
+            json!({
+                "op": "start", "input": input, "tools": tools,
+                "maxTurns": max_turns, "timeoutSeconds": timeout_seconds,
+            }),
+        );
+        let (action_id, id_key, reply) = match generic {
+            // An unknown action is rejected before admission. Other errors may
+            // have come from an admitted run and must never trigger a retry.
+            Err(ActionError::UnknownAction) => (
+                CHILD_AGENT,
+                "childId",
+                action(
+                    CHILD_AGENT,
+                    json!({
+                        "op": "start", "task": task, "role": role, "maxTurns": max_turns,
+                        "timeoutSeconds": timeout_seconds, "toolCallId": tool_call_id,
+                    }),
+                ),
+            ),
+            reply => (INDEPENDENT_RUN, "runId", reply),
+        };
+        let mut reply = reply.map_err(|error| format!("Cannot start a host-managed subagent: {error}. This plugin requires host support for IndependentRun or ChildAgent."))?;
         let id = reply
-            .get("childId")
+            .get(id_key)
             .and_then(Value::as_str)
             .filter(|id| !id.is_empty())
-            .ok_or("child start returned no childId")?
+            .ok_or_else(|| format!("run start returned no {id_key}"))?
             .to_owned();
         let session_id = reply.get_mut("sessionId").map_or(Value::Null, Value::take);
         Ok(Self {
             action,
+            action_id,
+            id_key,
             id,
             session_id,
         })
     }
 
-    fn poll(&self) -> Result<Value, String> {
-        (self.action)(json!({"op":"poll","childId":self.id}))
-    }
-
-    fn cancel(&self) {
-        let _ = (self.action)(json!({"op":"cancel","childId":self.id}));
+    fn call(&self, op: &str) -> Result<Value, String> {
+        (self.action)(self.action_id, json!({"op":op,(self.id_key):self.id}))
+            .map_err(|error| error.to_string())
     }
 }
 impl Drop for Child<'_> {
     fn drop(&mut self) {
-        let _ = (self.action)(json!({"op":"dispose","childId":self.id}));
+        let _ = self.call("dispose");
     }
 }
 
 fn run_request(
     request: Request,
     tool_call_id: String,
+    tools: &[Value],
     action: &Action,
     output: Sender<JobMessage>,
     cancelled: Arc<AtomicBool>,
@@ -182,19 +238,19 @@ fn run_request(
     if cancelled.load(Ordering::Acquire) {
         return Err("subagent cancelled".into());
     }
-    let child = Child::start(action, &request, &tool_call_id)?;
+    let child = Child::start(action, &request, &tool_call_id, tools)?;
     let deadline = Instant::now() + Duration::from_secs(request.timeout_seconds + 3);
     let mut bytes = 0usize;
     let mut events = 0usize;
     loop {
         if cancelled.load(Ordering::Acquire) {
-            child.cancel();
+            let _ = child.call("cancel");
             return Err("subagent cancelled".into());
         }
         if Instant::now() >= deadline {
             return Err("host-managed subagent timed out".into());
         }
-        let value = child.poll()?;
+        let value = child.call("poll")?;
         if let Some(deltas) = value.get("deltas").and_then(Value::as_array) {
             for delta in deltas {
                 let text = delta.as_str().ok_or("invalid child text delta")?;
@@ -275,15 +331,16 @@ rpi_plugin_sdk::execute_handler!(fn execute(tool_call_id, params, free_params) {
                             .and_then(|id| usize::try_from(id).ok()).filter(|id| *id != 0)
                             .ok_or("ChildAgent requires a host-provided tool invocation runtimeHandle; upgrade the host")?;
                         let actual = host_action(&host, runtime_handle, GET_EXECUTION_CONTEXT, json!({})).map_err(|error|
-                            format!("Cannot read execution context: {error}; upgrade to a host supporting GetExecutionContext/ChildAgent"))?;
+                            format!("Cannot read execution context: {error}; upgrade to a host supporting GetExecutionContext"))?;
                         validate_context(&expected_context, &actual)?;
                         let runtime_key = expected_context.get("runtimeKey").and_then(Value::as_str)
                             .ok_or("ChildAgent requires a host-provided invocation runtimeKey; upgrade the host")?.to_owned();
-                        let action = move |mut args: Value| {
+                        let action = move |action_id, mut args: Value| {
                             args["__rpiRuntimeKey"] = json!(runtime_key);
-                            host_action(&host, runtime_handle, CHILD_AGENT, args)
+                            host_action(&host, runtime_handle, action_id, args)
                         };
-                        run_request(request, id, &action, sender.clone(), token)
+                        let tools = actual["tools"].as_array().map(Vec::as_slice).unwrap_or_default();
+                        run_request(request, id, tools, &action, sender.clone(), token)
                     });
                     match result {
                         Ok(Ok(())) => {},
@@ -369,7 +426,7 @@ extern "C" fn destroy(handle: StepHandle) {
 fn delegate_schema() -> rpi_plugin_sdk::StableToolSchema {
     schema(
         "delegate_task",
-        "Delegate one bounded, non-recursive task to a host-managed in-memory child session, not a subagent subprocess or isolated worktree. The child inherits the current model/provider, tools, cwd and approval hooks; it shares the workspace and extension state. Supply necessary context, exact scope/file ownership, constraints, acceptance checks and expected report in task; do not assume the child knows the parent conversation. Coordinate overlapping writes. role is a label, not a tool/permission profile. The child cannot delegate further. Streams progress and returns a JSON report; review the report and verify acceptance, including turnLimited. Requires host ChildAgent support.",
+        "Delegate one bounded, non-recursive task to a host-managed in-memory child session, not a subagent subprocess or isolated worktree. The child inherits the current model/provider, tools, cwd and approval hooks; it shares the workspace and extension state. Supply necessary context, exact scope/file ownership, constraints, acceptance checks and expected report in task; do not assume the child knows the parent conversation. Coordinate overlapping writes. role is a label, not a tool/permission profile. The child cannot delegate further. Streams progress and returns a JSON report; review the report and verify acceptance, including turnLimited. Requires a host supporting independent runs or legacy delegation.",
         r#"{
             "type": "object",
             "properties": {

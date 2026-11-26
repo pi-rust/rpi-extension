@@ -9,12 +9,15 @@ fn completed() -> Value {
     json!({"status":"done","result":{"status":"completed","text":"report","turns":1,"turnLimited":false}})
 }
 
-fn scripted(replies: Vec<Result<Value, String>>) -> (Box<Action>, Arc<Mutex<Vec<Value>>>) {
+fn scripted(replies: Vec<Result<Value, ActionError>>) -> (Box<Action>, Arc<Mutex<Vec<Value>>>) {
     let calls = Arc::new(Mutex::new(Vec::new()));
     let saved = calls.clone();
     let replies = Mutex::new(VecDeque::from(replies));
-    let action = Box::new(move |value: Value| {
-        saved.lock().unwrap().push(value.clone());
+    let action = Box::new(move |action_id, value: Value| {
+        saved
+            .lock()
+            .unwrap()
+            .push(json!({"actionId":action_id,"args":value}));
         if value["op"] == "dispose" || value["op"] == "cancel" {
             return Ok(json!({}));
         }
@@ -180,7 +183,7 @@ fn validates_and_clamps_limits_while_accepting_host_context() {
 #[test]
 fn forwards_deltas_and_returns_delegation_metadata_then_disposes() {
     let (action, calls) = scripted(vec![
-        Ok(json!({"childId":"child-1","sessionId":"child-1"})),
+        Ok(json!({"runId":"child-1","sessionId":"child-1"})),
         Ok(json!({"status":"running","deltas":["hello"]})),
         Ok(completed()),
     ]);
@@ -188,6 +191,7 @@ fn forwards_deltas_and_returns_delegation_metadata_then_disposes() {
     run_request(
         request(),
         "tool-1".into(),
+        &[json!("read"), json!("delegate_task")],
         &*action,
         tx,
         Arc::new(AtomicBool::new(false)),
@@ -202,29 +206,87 @@ fn forwards_deltas_and_returns_delegation_metadata_then_disposes() {
     assert_eq!(result["report"], "report");
     assert_eq!(result["sessionId"], "child-1");
     let calls = calls.lock().unwrap();
+    assert_eq!(calls[0]["actionId"], INDEPENDENT_RUN);
     assert_eq!(
-        calls[0],
+        calls[0]["args"],
         json!({
-            "op":"start", "task":"inspect", "role":"worker",
-            "maxTurns":8, "timeoutSeconds":300, "toolCallId":"tool-1"
+            "op":"start", "tools":["read"], "maxTurns":8, "timeoutSeconds":300,
+            "input":"You are a delegated worker subagent. Complete the task in at most 8 turns. Do not delegate, spawn, or ask another agent to do work. Work only in the current project and return a concise final report.\n\nTask:\ninspect"
         })
     );
-    assert_eq!(calls.last().unwrap()["op"], "dispose");
+    assert_eq!(
+        calls.last().unwrap(),
+        &json!({
+            "actionId":INDEPENDENT_RUN,"args":{"op":"dispose","runId":"child-1"}
+        })
+    );
 }
 
 #[test]
 fn unsupported_host_is_explicit_and_never_spawns_a_process() {
-    let (action, calls) = scripted(vec![Err("unknown runtime action id 24".into())]);
+    let (action, calls) = scripted(vec![
+        Err(ActionError::UnknownAction),
+        Err(ActionError::UnknownAction),
+    ]);
     let (tx, _) = mpsc::channel();
     let error = run_request(
         request(),
         "t".into(),
+        &[],
         &*action,
         tx,
         Arc::new(AtomicBool::new(false)),
     )
     .unwrap_err();
-    assert!(error.contains("requires a host supporting ChildAgent"));
+    assert!(error.contains("requires host support for IndependentRun or ChildAgent"));
+    assert_eq!(calls.lock().unwrap().len(), 2);
+}
+
+#[test]
+fn only_an_unknown_action_can_fall_back_to_the_legacy_lifecycle() {
+    let (action, calls) = scripted(vec![
+        Err(ActionError::UnknownAction),
+        Ok(json!({"childId":"legacy","sessionId":"s"})),
+        Ok(completed()),
+    ]);
+    let (tx, _rx) = mpsc::channel();
+    run_request(
+        request(),
+        "t".into(),
+        &[],
+        &*action,
+        tx,
+        Arc::new(AtomicBool::new(false)),
+    )
+    .unwrap();
+    let calls = calls.lock().unwrap();
+    assert_eq!(
+        calls[1],
+        json!({"actionId":CHILD_AGENT,"args":{
+            "op":"start","task":"inspect","role":"worker","maxTurns":8,"timeoutSeconds":300,"toolCallId":"t"
+        }})
+    );
+    assert_eq!(
+        calls[2],
+        json!({"actionId":CHILD_AGENT,"args":{"op":"poll","childId":"legacy"}})
+    );
+    assert_eq!(
+        calls[3],
+        json!({"actionId":CHILD_AGENT,"args":{"op":"dispose","childId":"legacy"}})
+    );
+
+    let (action, calls) = scripted(vec![Err(ActionError::Failed("permission denied".into()))]);
+    let (tx, _rx) = mpsc::channel();
+    assert!(run_request(
+        request(),
+        "t".into(),
+        &[],
+        &*action,
+        tx,
+        Arc::new(AtomicBool::new(false))
+    )
+    .unwrap_err()
+    .contains("permission denied"));
     assert_eq!(calls.lock().unwrap().len(), 1);
 }
 
@@ -235,6 +297,7 @@ fn cancellation_before_start_has_no_host_side_effects() {
     assert!(run_request(
         request(),
         "t".into(),
+        &[],
         &*action,
         tx,
         Arc::new(AtomicBool::new(true))
@@ -249,10 +312,11 @@ fn cancellation_after_start_cancels_and_disposes() {
     let token = cancelled.clone();
     let calls = Arc::new(Mutex::new(Vec::new()));
     let saved = calls.clone();
-    let action = move |value: Value| {
+    let action = move |action_id, value: Value| {
+        assert_eq!(action_id, INDEPENDENT_RUN);
         saved.lock().unwrap().push(value.clone());
         match value["op"].as_str().unwrap() {
-            "start" => Ok(json!({"childId":"c"})),
+            "start" => Ok(json!({"runId":"c"})),
             "poll" => {
                 token.store(true, Ordering::Release);
                 Ok(json!({"status":"running"}))
@@ -261,9 +325,11 @@ fn cancellation_after_start_cancels_and_disposes() {
         }
     };
     let (tx, _rx) = mpsc::channel();
-    assert!(run_request(request(), "t".into(), &action, tx, cancelled)
-        .unwrap_err()
-        .contains("cancelled"));
+    assert!(
+        run_request(request(), "t".into(), &[], &action, tx, cancelled)
+            .unwrap_err()
+            .contains("cancelled")
+    );
     let ops: Vec<_> = calls
         .lock()
         .unwrap()
@@ -276,30 +342,34 @@ fn cancellation_after_start_cancels_and_disposes() {
 #[test]
 fn errors_and_malformed_replies_always_dispose() {
     for reply in [
-        Err("lost bridge".into()),
+        Err(ActionError::Failed("lost bridge".into())),
         Ok(json!({"status":"failed","error":"permission denied"})),
         Ok(json!({"status":"invalid"})),
         Ok(json!({"status":"done"})),
         Ok(json!({"status":"done","result":{"status":"failed","error":"provider failed"}})),
     ] {
-        let (action, calls) = scripted(vec![Ok(json!({"childId":"c"})), reply]);
+        let (action, calls) = scripted(vec![Ok(json!({"runId":"c"})), reply]);
         let (tx, _rx) = mpsc::channel();
         assert!(run_request(
             request(),
             "t".into(),
+            &[],
             &*action,
             tx,
             Arc::new(AtomicBool::new(false))
         )
         .is_err());
-        assert_eq!(calls.lock().unwrap().last().unwrap()["op"], "dispose");
+        assert_eq!(
+            calls.lock().unwrap().last().unwrap()["args"]["op"],
+            "dispose"
+        );
     }
 }
 
 #[test]
 fn streamed_and_final_text_share_a_budget() {
     let (action, calls) = scripted(vec![
-        Ok(json!({"childId":"c"})),
+        Ok(json!({"runId":"c"})),
         Ok(json!({"status":"running","deltas":["a".repeat(MAX_OUTPUT_BYTES)]})),
         Ok(completed()),
     ]);
@@ -307,25 +377,30 @@ fn streamed_and_final_text_share_a_budget() {
     assert!(run_request(
         request(),
         "t".into(),
+        &[],
         &*action,
         tx,
         Arc::new(AtomicBool::new(false))
     )
     .unwrap_err()
     .contains("output limit"));
-    assert_eq!(calls.lock().unwrap().last().unwrap()["op"], "dispose");
+    assert_eq!(
+        calls.lock().unwrap().last().unwrap()["args"]["op"],
+        "dispose"
+    );
 }
 
 #[test]
 fn partial_count_is_bounded_independently_of_bytes() {
     let (action, _) = scripted(vec![
-        Ok(json!({"childId":"c"})),
+        Ok(json!({"runId":"c"})),
         Ok(json!({"status":"running","deltas":vec!["";MAX_PARTIAL_EVENTS+1]})),
     ]);
     let (tx, _rx) = mpsc::channel();
     assert!(run_request(
         request(),
         "t".into(),
+        &[],
         &*action,
         tx,
         Arc::new(AtomicBool::new(false))
