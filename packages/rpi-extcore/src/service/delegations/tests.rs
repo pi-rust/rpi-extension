@@ -248,3 +248,25 @@ async fn roster_exposes_parent_tool_call_binding_and_rejects_invalid_ids() {
     assert!(roster(&f.service, "parent").await.is_err());
     f.close().await;
 }
+
+#[tokio::test]
+async fn roster_preserves_unlimited_turn_counts_with_typed_wire_bounds() {
+    let f = Fixture::new(true).await;
+    let mut data = json!({"version":1,"parentSessionId":"parent","epoch":"epoch","retention":"volatile",
+        "children":[{"childId":"child","status":"done","turns":41,"role":"worker","taskPreview":"task",
+        "parentToolCallId":"call-42","startedMs":1,"finishedMs":2,"earliestSeq":1,"lastSeq":0}]});
+    for turns in [41, u32::MAX] {
+        data["children"][0]["turns"] = json!(turns);
+        *f.override_data.lock().unwrap() = Some(data.clone());
+        assert_eq!(
+            roster(&f.service, "parent").await.unwrap().children[0].turns,
+            turns
+        );
+    }
+    for turns in [json!(-1), json!(u64::from(u32::MAX) + 1), json!("41")] {
+        data["children"][0]["turns"] = turns;
+        *f.override_data.lock().unwrap() = Some(data.clone());
+        assert!(roster(&f.service, "parent").await.is_err());
+    }
+    f.close().await;
+}

@@ -865,6 +865,10 @@ hosts return Unsupported rather than an empty roster. No method launches a host
 or creates a replacement transcript store. Native plugin owner checks remain
 unchanged, and children cannot be independently prompted/resumed.
 
+`turns` is the native unsigned 32-bit observation counter, not a configured turn
+budget. Unlimited children may report more than 32 turns; roster/event capacity
+limits remain independent of the number of model turns.
+
 The complete cursor is `(parentSessionId, epoch, childId, afterSeq)`. Pages are
 bounded to 32 events / 128 KiB; native retains 256 events / 1 MiB per child and at
 most 32 children. Process restart loses this volatile data. `resyncRequired` and

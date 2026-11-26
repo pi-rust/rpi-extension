@@ -216,7 +216,6 @@ pub async fn roster(state: &Service, parent: &str) -> ServiceResult<DelegationRo
                     .parent_tool_call_id
                     .as_ref()
                     .map_or(true, |id| valid_id(id) && id.len() <= 200)
-                && child.turns <= 32
                 && child.role.len() <= 200
                 && child.task_preview.chars().count() <= 200
                 && child.earliest_seq <= child.last_seq.saturating_add(1)
