@@ -15,17 +15,21 @@ impl Service {
     /// filtering: treating a deleting host as absent could spawn a replacement.
     pub(crate) async fn check_session_admission(&self, id: &str) -> ServiceResult<()> {
         let registry = self.registry.read().await;
-        if registry.deletion(id).is_some() {
-            return Err(deleting_error());
-        }
-        if registry.preferences(id).archived {
-            return Err((
-                ReplyKind::Conflict,
-                json!({"error":"Session is archived; restore it before opening", "code":"session_archived"}),
-            ));
-        }
-        Ok(())
+        check_session_admission(&registry, id)
     }
+}
+
+pub(super) fn check_session_admission(registry: &Registry, id: &str) -> ServiceResult<()> {
+    if registry.deletion(id).is_some() {
+        return Err(deleting_error());
+    }
+    if registry.preferences(id).archived {
+        return Err((
+            ReplyKind::Conflict,
+            json!({"error":"Session is archived; restore it before opening", "code":"session_archived"}),
+        ));
+    }
+    Ok(())
 }
 
 fn owner_error() -> (ReplyKind, Value) {

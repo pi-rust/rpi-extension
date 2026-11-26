@@ -15,7 +15,9 @@ pub use tool_program_queries::{
 pub use tool_program_snapshot::{
     child_snapshot, child_snapshot_for_host, ChildSnapshot, ChildSnapshotQuery,
 };
+mod preview;
 mod resources;
+pub use preview::session_preview;
 mod retirement;
 #[cfg(test)]
 #[path = "service_retirement_tests.rs"]
@@ -149,6 +151,7 @@ pub struct Service {
     run_timing_cache: Arc<std::sync::Mutex<crate::run_timing::RunTimingCache>>,
     run_timing_workers: Arc<tokio::sync::Semaphore>,
     resource_workers: Arc<tokio::sync::Semaphore>,
+    preview_workers: Arc<tokio::sync::Semaphore>,
     retirement_workers: Arc<tokio::sync::Semaphore>,
     closing: Arc<std::sync::atomic::AtomicBool>,
     resource_storage_failed: Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
@@ -192,6 +195,7 @@ impl Service {
             run_timing_cache: Arc::new(std::sync::Mutex::new(Default::default())),
             run_timing_workers: Arc::new(tokio::sync::Semaphore::new(2)),
             resource_workers: Arc::new(tokio::sync::Semaphore::new(2)),
+            preview_workers: Arc::new(tokio::sync::Semaphore::new(2)),
             retirement_workers: Arc::new(tokio::sync::Semaphore::new(16)),
             closing: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             resource_storage_failed: Arc::new(std::sync::Mutex::new(
@@ -703,7 +707,7 @@ async fn create_session_owned(
             return resources::reply_error(error);
         }
     }
-    match spawn_host(state, &id, &project).await {
+    match spawn_host(state, &id, &project, false).await {
         Ok((session, record)) => {
             let ready = session.ready();
             let snapshot = session.snapshot().await;
@@ -747,6 +751,7 @@ async fn spawn_host(
     state: &Service,
     id: &str,
     project: &Project,
+    reopening: bool,
 ) -> Result<
     (
         Arc<HostSession>,
@@ -757,7 +762,11 @@ async fn spawn_host(
     let options = resources::host_options(state, id, project)
         .await
         .map_err(|e| e.to_string())?;
-    let session = HostSession::spawn_options(options).await?;
+    let session = if reopening {
+        HostSession::reopen_options(options).await?
+    } else {
+        HostSession::spawn_options(options).await?
+    };
     match resources::prepare_open_observation(state, id, &session).await {
         Ok(record) => Ok((session, record)),
         Err(error) => {
@@ -1193,7 +1202,7 @@ async fn open_session_owned(state: &Service, id: String) -> (ReplyKind, Value) {
         Ok(project) => project,
         Err(error) => return (ReplyKind::InvalidInput, json!({"error":error})),
     };
-    match spawn_host(state, &id, &project).await {
+    match spawn_host(state, &id, &project, true).await {
         Ok((session, record)) => {
             let snapshot = session.snapshot().await;
             // Configuration publication preserves the latest stored metadata,

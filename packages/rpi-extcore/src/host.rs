@@ -772,7 +772,12 @@ impl HostSession {
         options: SessionOptions,
         fork_cut: Option<&str>,
     ) -> Result<Arc<Self>, String> {
-        Self::spawn_transport(options, fork_cut, None).await
+        let reopening = options.saved_session.is_some();
+        Self::spawn_transport(options, fork_cut, None, reopening).await
+    }
+
+    pub(crate) async fn reopen_options(options: SessionOptions) -> Result<Arc<Self>, String> {
+        Self::spawn_transport(options, None, None, true).await
     }
 
     pub(crate) async fn attach_area(
@@ -798,6 +803,7 @@ impl HostSession {
             },
             None,
             Some(area),
+            false,
         )
         .await
     }
@@ -806,6 +812,7 @@ impl HostSession {
         mut options: SessionOptions,
         fork_cut: Option<&str>,
         area: Option<&str>,
+        reopening: bool,
     ) -> Result<Arc<Self>, String> {
         let launch_guard = if area.is_none() {
             Some(startup::LaunchGuard::acquire(&options)?)
@@ -903,10 +910,15 @@ impl HostSession {
         let child_owner = child::NativeChild::start(child, launch_guard);
         let diagnostics = startup::StderrCapture::start(stderr, child_owner.exit_signal());
         let mut reader = BufReader::new(stdout);
-        // A first area entry may have to create the Host and its profile, so it
-        // gets a longer deadline than an ordinary child. It is still bounded:
-        // startup must fail with a message instead of hanging a Web launch.
-        let timeout = Duration::from_secs(if area.is_some() { 120 } else { 15 });
+        // A saved journal may need a full replay to initialize its indexes.
+        // Keep new-child startup bounded separately from saved restore and area creation.
+        let timeout = if area.is_some() {
+            Duration::from_secs(120)
+        } else if reopening {
+            Duration::from_secs(60)
+        } else {
+            Duration::from_secs(15)
+        };
         let mut ready = match read_ready(&mut reader, timeout).await {
             Ok(ready) => ready,
             Err(error) => return Err(diagnostics.failure(error, &child_owner).await),
