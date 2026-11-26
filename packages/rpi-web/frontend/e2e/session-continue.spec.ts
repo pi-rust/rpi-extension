@@ -237,6 +237,9 @@ class MockHost {
           json: { name: "notes.txt", path: ".rpi/uploads/notes.txt", size: 5 },
         });
       }
+      const preview = path.match(/^\/api\/v1\/sessions\/([^/]+)\/preview$/);
+      if (preview && method === "GET" && [A, B].includes(preview[1]))
+        return route.fulfill({ status: 204 });
       const match = path.match(
         /^\/api\/v1\/sessions\/([^/]+)\/(open|snapshot|commands|events|run-timings\/query)$/,
       );

@@ -900,6 +900,12 @@ export default function App() {
   const diagnosticsRevision = useRef(0);
   const diagnosticsAbort = useRef<AbortController | null>(null);
   const sessionReadsAbort = useRef<AbortController | null>(null);
+  const liveConnection = useRef<{
+    sessionId: string;
+    navigation: number;
+    revision: number;
+    requests: AbortController;
+  } | null>(null);
   const navigationRevision = useRef(0);
   const sessionListRevision = useRef(0);
   const sessionListRequest = useRef<Promise<SessionSummary[] | null> | null>(
@@ -1034,7 +1040,18 @@ export default function App() {
   const transcriptRef = useRef<HTMLDivElement>(null);
   const followingRef = useRef(true);
   const [following, setFollowing] = useState(true);
-  const [rows, setRows] = useState<Row[]>([]);
+  const [liveRows, setRows] = useState<Row[]>([]);
+  const [previewRows, setPreviewRows] = useState<{
+    sessionId: string;
+    navigation: number;
+    rows: Row[];
+  } | null>(null);
+  const visiblePreview =
+    previewRows?.sessionId === sessionId &&
+    previewRows.navigation === navigationRevision.current
+      ? previewRows.rows
+      : null;
+  const rows = visiblePreview ?? liveRows;
   const streamingAssistant = useRef<string | null>(null);
   const [assistantStreamRevision, setAssistantStreamRevision] = useState(0);
   const rowsBySession = useRef(new Map<string, Row[]>());
@@ -2053,16 +2070,31 @@ export default function App() {
     },
     [],
   );
-  const composerAbort =
-    busy && canStopRun && !loadingSession && !connectionFailed;
+  const readyConnection = liveConnection.current;
+  const liveReady =
+    readyConnection !== null &&
+    readyConnection.sessionId === sessionId &&
+    readyConnection.navigation === navigationRevision.current &&
+    readyConnection.revision === connectionRevision &&
+    !readyConnection.requests.signal.aborted &&
+    !loadingSession && !connectionFailed && !visiblePreview &&
+    status !== "closed" && status !== "error";
+  // Queue operations can await an acknowledgement before sending another command.
+  // Check the current connection again at that boundary.
+  function canWriteSession() {
+    return liveReady && liveConnection.current === readyConnection &&
+      readyConnection.navigation === navigationRevision.current &&
+      !readyConnection.requests.signal.aborted && !hostClosedRef.current;
+  }
+  const composerAbort = busy && canStopRun && liveReady;
   // While a run is active the main button is Stop for an empty composer and
   // Send for a draft: touch keyboards use Enter for a newline, so the icon is
   // the only way to queue a follow-up from the same field.
   const composerDraftReady = draft.trim().length > 0 || attachments.length > 0;
   const composerRunningSend = composerAbort && composerDraftReady;
   const composerContinue =
+    liveReady &&
     !busy &&
-    status !== "closed" &&
     !queueEditId &&
     !draft.trim() &&
     attachments.length === 0 &&
@@ -2552,6 +2584,7 @@ export default function App() {
     sessionReadsAbort.current?.abort();
     diagnosticsAbort.current?.abort();
     rowsBySession.current.clear();
+    setPreviewRows(null);
     clearTrace();
     setTraceOpen(false);
     source.current?.close();
@@ -3089,6 +3122,7 @@ export default function App() {
     setConnectionFailed(false);
     hostClosedRef.current = false;
     setStatus("connecting");
+    setRunActive(false);
     setLoadingSession(Boolean(sessionId));
     setNativeMessageQueries(false);
     setHostCommands(null);
@@ -3113,12 +3147,15 @@ export default function App() {
       return;
     }
 
+    const navigation = navigationRevision.current;
     let cancelled = false;
     const requests = new AbortController();
+    const previewRequest = new AbortController();
     sessionReadsAbort.current = requests;
     const isCurrent = () =>
       !cancelled &&
       !requests.signal.aborted &&
+      navigation === navigationRevision.current &&
       activeSessionRef.current === sessionId &&
       sessionReadsAbort.current === requests;
     let stream: EventSource | null = null;
@@ -3126,6 +3163,7 @@ export default function App() {
     let bufferedEvents: MessageEvent[] = [];
     const failConnection = (cause: unknown) => {
       if (!isCurrent()) return;
+      liveConnection.current = null;
       if (cause instanceof ApiError && cause.status === 401) {
         cancelled = true;
         requests.abort();
@@ -3334,6 +3372,30 @@ export default function App() {
       };
     };
 
+    // Only remembered offline sessions can supply a saved preview. The list
+    // can lag a newly-created session, which already has a live host.
+    const knownStatus = sessionListValue.current?.find(
+      (session) => session.sessionId === sessionId,
+    )?.status;
+    if (
+      !rowsBySession.current.get(sessionId)?.length &&
+      (knownStatus === "offline" || knownStatus === "closed")
+    ) {
+      void api.sessionPreview(sessionId, previewRequest.signal)
+        .then((preview) => {
+          if (
+            !isCurrent() || previewRequest.signal.aborted ||
+            preview?.sessionId !== sessionId || !Array.isArray(preview.messages)
+          ) return;
+          const restored = rowsFromMessages(preview.messages);
+          if (restored.length)
+            setPreviewRows({ sessionId, navigation, rows: restored });
+        })
+        .catch(() => {
+          // This read is optional, including on services without the preview route.
+        });
+    }
+
     void (async () => {
       // Open is idempotent for a live host. Prioritize the bounded transcript:
       // native reads can share a queue, so even a parallel get_state can delay it.
@@ -3369,6 +3431,8 @@ export default function App() {
         if (!isCurrent()) return;
 
         if (snapshot) {
+          previewRequest.abort();
+          setPreviewRows(null);
           traceSnapshot(snapshot, "initial");
           setRows((previous) => {
             const restored = rowsFromMessages(snapshot.messages);
@@ -3414,7 +3478,10 @@ export default function App() {
         return;
       }
       if (!isCurrent()) return;
+      previewRequest.abort();
+      setPreviewRows(null);
       connect(after);
+      liveConnection.current = { sessionId, navigation, revision: connectionRevision, requests };
       setLoadingSession(false);
 
       // Snapshot + replay own lifecycle status. Metadata never delays first
@@ -3474,6 +3541,9 @@ export default function App() {
     return () => {
       cancelled = true;
       requests.abort();
+      previewRequest.abort();
+      if (liveConnection.current?.requests === requests)
+        liveConnection.current = null;
       if (sessionReadsAbort.current === requests)
         sessionReadsAbort.current = null;
       diagnosticsAbort.current?.abort();
@@ -3497,12 +3567,12 @@ export default function App() {
       return;
     }
     if (!sessionId) return;
-    rowsBySession.current.set(sessionId, rows);
+    rowsBySession.current.set(sessionId, liveRows);
     if (rowsBySession.current.size > 24) {
       const oldest = rowsBySession.current.keys().next().value;
       if (oldest && oldest !== sessionId) rowsBySession.current.delete(oldest);
     }
-  }, [rows, sessionId]);
+  }, [liveRows, sessionId]);
 
   const queueAbort = useRef<AbortController | null>(null);
   /** Server truth for the waiting queue; the host owns delivery. */
@@ -3837,8 +3907,7 @@ export default function App() {
     const [name = "", ...rest] = raw.trim().split(/\s+/);
     const arg = rest.join(" ").trim();
     if (!slashCommands.some((command) => command.name === name)) return;
-    if ((loadingSession || connectionFailed) && !LOCAL_SLASH_COMMANDS.has(name))
-      return;
+    if (!canWriteSession() && !LOCAL_SLASH_COMMANDS.has(name)) return;
     updateDraft("");
     setError("");
     try {
@@ -3991,6 +4060,7 @@ export default function App() {
     const scope = uploadScope.current;
     if (
       !batch.length ||
+      visiblePreview ||
       !projectId ||
       !sessionId ||
       !scope ||
@@ -4074,22 +4144,12 @@ export default function App() {
         return;
       }
     }
-    if (!forceContinue && !sessionHydrated) return;
-    if (composerContinue) {
-      if (
-        loadingSession ||
-        connectionFailed ||
-        status === "closed" ||
-        !sessionId ||
-        sendingRef.current
-      )
-        return;
-      if (interrupted && supported.has("resume_pending")) {
-        await resumePending();
-        return;
-      }
+    if (!canWriteSession() || (!forceContinue && !sessionHydrated)) return;
+    if (composerContinue && interrupted && supported.has("resume_pending")) {
+      await resumePending();
+      return;
     }
-    if (loadingSession || connectionFailed || !supported.has("prompt")) return;
+    if (!supported.has("prompt")) return;
     const attachedText = attachments.length
       ? `\n\n${t("attachedFiles")}:\n${attachments.map((file) => `- ${file.path}`).join("\n")}`
       : "";
@@ -4135,8 +4195,10 @@ export default function App() {
     try {
       if (shouldQueue) {
         if (!supported.has("queue_message")) throw new Error(t("runBusy"));
-        if (editingQueueId)
+        if (editingQueueId) {
           await api.cancelQueued(targetSession, editingQueueId);
+          if (!canWriteSession()) return;
+        }
         const queued = await api.queueMessage(
           targetSession,
           submissionMessage,
@@ -4193,13 +4255,10 @@ export default function App() {
 
   async function resumePending() {
     if (
-      !sessionId ||
+      !canWriteSession() ||
       !supported.has("resume_pending") ||
       busy ||
-      sendingRef.current ||
-      loadingSession ||
-      connectionFailed ||
-      status === "closed"
+      sendingRef.current
     )
       return;
     const submission = ++sendingRevision.current;
@@ -4267,7 +4326,7 @@ export default function App() {
       previous.filter((item) => item.id !== notification.id),
     );
     if (notification.sessionId === activeSessionRef.current) {
-      if (loadingSession || !sessionHydrated || busy) {
+      if (!canWriteSession() || !sessionHydrated || busy) {
         pendingNotificationContinue.current = notification.sessionId;
         return;
       }
@@ -4282,13 +4341,13 @@ export default function App() {
     if (
       !pendingNotificationContinue.current ||
       pendingNotificationContinue.current !== sessionId ||
-      loadingSession ||
+      !liveReady ||
       !sessionHydrated
     )
       return;
     pendingNotificationContinue.current = null;
     void continueCurrent(true);
-  }, [sessionHydrated, sessionId, loadingSession, interrupted, failedRun]);
+  }, [sessionHydrated, sessionId, liveReady, interrupted, failedRun]);
 
   /** Page backwards through the branch, prepending entries older than the
    * current first row. The bridge forwards `get_messages` unchanged, so this is
@@ -4476,7 +4535,7 @@ export default function App() {
   }
 
   async function clearQueue() {
-    if (!sessionId || !supported.has("clear_queue")) return;
+    if (!canWriteSession() || !supported.has("clear_queue")) return;
     const navigation = navigationRevision.current;
     try {
       await api.clearQueue(sessionId);
@@ -4527,7 +4586,7 @@ export default function App() {
     const targetSession = sessionId;
     const item = pendingQueueItems.find((queued) => queued.entryId === entryId);
     if (
-      !targetSession ||
+      !canWriteSession() ||
       (busy && !runActive) ||
       queueRunning ||
       !item?.text?.trim() ||
@@ -4579,7 +4638,7 @@ export default function App() {
         text: item.text.trim(),
         queuedAt: Date.now(),
       });
-      if (!running)
+      if (!running && canWriteSession())
         await commandData(targetSession, "prompt", {
           message: item.text.trim(),
         });
@@ -4604,7 +4663,7 @@ export default function App() {
   }
 
   async function queuePrompt() {
-    if (!sessionId || !queueDraft.trim() || !supported.has("queue_message"))
+    if (!canWriteSession() || !queueDraft.trim() || !supported.has("queue_message"))
       return;
     if (queueSubmission.current.has(sessionId)) return;
     const message = queueDraft.trim();
@@ -4613,7 +4672,10 @@ export default function App() {
     queueSubmission.current.add(sessionId);
     const navigation = navigationRevision.current;
     try {
-      if (editingId) await api.cancelQueued(sessionId, editingId);
+      if (editingId) {
+        await api.cancelQueued(sessionId, editingId);
+        if (!canWriteSession()) return;
+      }
       const queued = await api.queueMessage(sessionId, message, "followUp");
       if (navigation !== navigationRevision.current) return;
       setQueueItems((previous) => [
@@ -4647,7 +4709,7 @@ export default function App() {
   }
 
   async function editQueued(item: QueueItem) {
-    if (!isEditableQueueItem(item) || !sessionId) return;
+    if (!canWriteSession() || !isEditableQueueItem(item)) return;
     // The reported kind is `QueueKind::as_str()`, which spells the next-run
     // queue `nextRun` while `queue_message` accepts only `nextTurn`. Re-sending
     // the raw value fails after `cancel_queued` removed the entry, losing the
@@ -4691,6 +4753,7 @@ export default function App() {
   }
 
   async function cancelQueued(entryId: string) {
+    if (!canWriteSession()) return;
     const navigation = navigationRevision.current;
     const previous = queueItems;
     if (queueEditId === entryId) cancelQueueEdit();
@@ -4846,7 +4909,7 @@ export default function App() {
   }
 
   async function abort() {
-    if (!sessionId) return;
+    if (!canWriteSession()) return;
     const navigation = navigationRevision.current;
     const targetSession = sessionId;
     // Use the queue-preserving stop command when the host advertises it.
@@ -4974,6 +5037,7 @@ export default function App() {
       setProjectId(nextProject);
     }
     setLoadingSession(Boolean(id));
+    setPreviewRows(null);
     // A preview restored from `?file=` belongs to the view that asked for it.
     setLinkedPreview(null);
     rowsSessionRef.current = id;
@@ -5539,6 +5603,7 @@ export default function App() {
                   <button
                     type="button"
                     className="text-button"
+                    disabled={!liveReady}
                     onClick={() => void clearQueue()}
                   >
                     {t("clear")}
@@ -5577,7 +5642,7 @@ export default function App() {
                         aria-label={`${t("sendNow")}: ${item.text}`}
                         onClick={() => void sendQueuedNow(item.entryId)}
                         disabled={
-                          queueRunning ||
+                          !liveReady || queueRunning ||
                           (sendNowPending?.entryId === item.entryId &&
                             sendNowPending?.sessionId === sessionId) ||
                           (sendNowSent?.entryId === item.entryId &&
@@ -5602,6 +5667,7 @@ export default function App() {
                     className="icon-button"
                     title={t("editQueued")}
                     aria-label={t("editQueued")}
+                    disabled={!liveReady}
                     onClick={() => editQueued(item)}
                   >
                     <SquarePen size={13} />
@@ -5611,6 +5677,7 @@ export default function App() {
                     className="icon-button"
                     title={t("cancelQueued")}
                     aria-label={t("cancelQueued")}
+                    disabled={!liveReady}
                     onClick={() => void cancelQueued(item.entryId)}
                   >
                     <X size={13} />
@@ -5624,6 +5691,7 @@ export default function App() {
               <input
                 ref={queueInputRef}
                 value={queueDraft}
+                disabled={!liveReady}
                 onChange={(event) => {
                   queueDraftRevision.current++;
                   setQueueDraft(event.target.value);
@@ -5637,7 +5705,7 @@ export default function App() {
               <button
                 type="button"
                 onClick={() => void queuePrompt()}
-                disabled={!queueDraft.trim()}
+                disabled={!liveReady || !queueDraft.trim()}
               >
                 {t("queue")}
               </button>
@@ -6883,8 +6951,8 @@ export default function App() {
                                   language={language}
                                   onSpeak={speakMessage}
                                   readingRowId={readingRowId}
-                                  onFork={(entryId) =>
-                                    void forkCurrent(entryId)
+                                  onFork={
+                                    visiblePreview ? undefined : (entryId) => void forkCurrent(entryId)
                                   }
                                   forkPending={forkPending}
                                   assistantStreamRevision={
@@ -7004,8 +7072,7 @@ export default function App() {
                       className="slash-item"
                       disabled={
                         !command.enabled ||
-                        ((loadingSession || connectionFailed) &&
-                          !LOCAL_SLASH_COMMANDS.has(command.name))
+                        (!liveReady && !LOCAL_SLASH_COMMANDS.has(command.name))
                       }
                       onClick={() => void runSlash(command.name)}
                     >
@@ -7061,7 +7128,7 @@ export default function App() {
                                     void sendQueuedNow(item.entryId)
                                   }
                                   disabled={
-                                    queueRunning ||
+                                    !liveReady || queueRunning ||
                                     (sendNowPending?.entryId === item.entryId &&
                                       sendNowPending?.sessionId ===
                                         sessionId) ||
@@ -7087,6 +7154,7 @@ export default function App() {
                               className="icon-button"
                               aria-label={t("editQueued")}
                               title={t("editQueued")}
+                              disabled={!liveReady}
                               onClick={() => editQueued(item)}
                             >
                               <SquarePen size={13} />
@@ -7096,6 +7164,7 @@ export default function App() {
                               className="icon-button"
                               aria-label={t("cancelQueued")}
                               title={t("cancelQueued")}
+                              disabled={!liveReady}
                               onClick={() => void cancelQueued(item.entryId)}
                             >
                               <X size={13} />
@@ -7155,8 +7224,9 @@ export default function App() {
                 <textarea
                   ref={composerInputRef}
                   value={draft}
+                  readOnly={Boolean(visiblePreview)}
                   onPaste={(event) => {
-                    if (!sessionId || !projectId) return;
+                    if (visiblePreview || !sessionId || !projectId) return;
                     const clipboard = event.clipboardData;
                     const files = Array.from(clipboard.files);
                     // Some browsers expose clipboard files only through items.
@@ -7243,7 +7313,7 @@ export default function App() {
                       className="composer-attach"
                       aria-label={t("attachFiles")}
                       title={t("attachFiles")}
-                      disabled={!sessionId || !projectId || uploading}
+                      disabled={Boolean(visiblePreview) || !sessionId || !projectId || uploading}
                       onClick={() => fileInputRef.current?.click()}
                     >
                       {uploading ? (
@@ -7320,7 +7390,7 @@ export default function App() {
                               : t("send")
                       }
                       disabled={
-                        (!localSlash && (loadingSession || connectionFailed)) ||
+                        (!localSlash && !liveReady) ||
                         (!composerAbort &&
                           ((!composerContinue &&
                             !composerRunningSend &&
