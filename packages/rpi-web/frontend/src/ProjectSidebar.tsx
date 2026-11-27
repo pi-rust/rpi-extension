@@ -837,11 +837,13 @@ function shortTime(time: number, language: Language) {
 }
 
 /**
- * A chat is "active" while the host still owns a turn: running, starting up or
- * blocked on an answer. The recent list pins those above finished chats.
+ * A chat is "active" while the host still owns a turn: running, compacting,
+ * starting up or blocked on an answer. The recent list pins those above finished chats.
  */
 function recentActive(session: SessionSummary) {
-  return ["running", "starting", "awaiting_input"].includes(session.status);
+  return ["running", "compacting", "starting", "awaiting_input"].includes(
+    session.status,
+  );
 }
 
 function useAutoHideScrollbar() {
@@ -1123,7 +1125,9 @@ export function ProjectSidebar({
     const relationKind =
       session.relation === "clone" ? "clone" : session.relation ? "fork" : null;
     const awaitingAnswer = session.status === "awaiting_input";
-    const running = ["running", "starting"].includes(session.status);
+    const running = ["running", "compacting", "starting"].includes(
+      session.status,
+    );
     const selectable = !recent && !session.archived && !session.deleting;
     const isSelected = selected.has(session.sessionId);
     return (
