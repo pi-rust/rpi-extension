@@ -25,6 +25,9 @@ supported-targets = [
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-rpi-plugin-sdk = { workspace = true }
+rpi-plugin-sdk = { workspace = true, features = ["quickjs-allocator"] }
 serde_json = { workspace = true }
 rquickjs = { version = "=0.8.1", default-features = false, features = ["allocator"] }
+
+[lints]
+workspace = true

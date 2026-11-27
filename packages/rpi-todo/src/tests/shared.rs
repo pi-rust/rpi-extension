@@ -2,16 +2,7 @@ use super::*;
 use rpi_plugin_sdk::{
     CommandHandlerFn, StablePluginEvent, ToolDestroyFn, ToolExecuteFn, ToolPollFn,
 };
-use std::{cell::RefCell, collections::HashMap, mem::size_of};
-
-// The published preview appends these slots to the SDK 0.3.20 prefix.
-#[repr(C)]
-struct PreviewApi {
-    prefix: PluginApi,
-    streaming_provider: usize,
-    tool_with_wake: usize,
-    lifecycle: Option<lifecycle::Register>,
-}
+use std::{cell::RefCell, collections::HashMap};
 
 #[derive(Default)]
 struct Callbacks {
@@ -115,19 +106,13 @@ fn register_preview(owner: usize, reject_cleanup: bool, reject_tool: bool) -> (i
         callbacks.reject_cleanup = reject_cleanup;
         callbacks.reject_tool = reject_tool;
     });
-    let mut prefix = mock_api(runtime);
-    prefix.struct_size = size_of::<PreviewApi>() as u32;
-    prefix.user_data = owner as *mut c_void;
-    prefix.register_event_handler = Some(capture_event);
-    prefix.register_command = Some(capture_command);
-    prefix.register_tool = Some(capture_tool);
-    let api = PreviewApi {
-        prefix,
-        streaming_provider: 0,
-        tool_with_wake: 0,
-        lifecycle: Some(capture_cleanup),
-    };
-    let status = rpi_plugin_register((&api as *const PreviewApi).cast());
+    let mut api = mock_api(runtime);
+    api.user_data = owner as *mut c_void;
+    api.register_event_handler = Some(capture_event);
+    api.register_command = Some(capture_command);
+    api.register_tool = Some(capture_tool);
+    api.register_plugin_lifecycle = Some(capture_cleanup);
+    let status = rpi_plugin_register(&api);
     (status, CALLBACKS.with_borrow_mut(std::mem::take))
 }
 
@@ -153,8 +138,7 @@ impl Callbacks {
             (self.command.unwrap())(StbStringRef::from_str(""), &mut out, owner),
             0
         );
-        let text = out.to_string_lossy();
-        free_string(out);
+        let text = rpi_plugin_sdk::stb_take!(out, Some(free_string));
         serde_json::from_str(&text).unwrap()
     }
 
@@ -171,7 +155,7 @@ impl Callbacks {
         let (_, poll, destroy) = self.tool.unwrap();
         let result = poll(handle, None, std::ptr::null_mut());
         destroy(handle);
-        match rpi_plugin_sdk::take_step_result!(result) {
+        match rpi_plugin_sdk::take_step!(result) {
             rpi_plugin_sdk::callbacks::Step::Done(text) => {
                 Ok(serde_json::from_str::<Value>(&text).unwrap()["details"].clone())
             }

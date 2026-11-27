@@ -20,8 +20,8 @@
 //! server's exit code through the generic StdioLifecycle action; SessionShutdown
 //! stops and joins the server thread before the plugin is unloaded.
 
-#![deny(unsafe_code)]
-// The SDK's `export_plugin!` macro expands to the `pub extern "C" fn
+#![forbid(unsafe_code)]
+// The SDK's `export_shared_plugin!` macro expands to the `pub extern "C" fn
 // rpi_plugin_register(*const PluginApi)` entrypoint and validates/dereferences
 // the pointer via `register_entrypoint`; clippy attributes that generated deref
 // here. The ABI signature is fixed, so the lint is not actionable.
@@ -40,10 +40,7 @@ pub mod session;
 mod session_list;
 pub mod zed;
 
-use rpi_plugin_sdk::callbacks::OwnedString;
-use rpi_plugin_sdk::{
-    EventTag, PluginApi, RuntimeActionId, StablePluginEvent, StbString, StbStringRef,
-};
+use rpi_plugin_sdk::{EventTag, PluginApi, RuntimeActionId, StablePluginEvent, StbStringRef};
 use serde_json::{json, Value};
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -91,17 +88,12 @@ enum Mode {
 struct Host(PluginApi);
 
 impl Host {
-    #[allow(unsafe_code)] // Adopt the string returned by the host ABI.
     fn lifecycle(self, op: &str, code: i32) -> bool {
-        let mut out = StbString::empty();
-        let rc = (self.0.runtime_action)(
-            RuntimeActionId::StdioLifecycle as u32,
-            StbStringRef::from_str(&json!({"op": op, "exitCode": code}).to_string()),
-            &mut out,
-            self.0.user_data,
+        let (rc, _) = rpi_plugin_sdk::call_action!(
+            self.0,
+            RuntimeActionId::StdioLifecycle,
+            &json!({"op": op, "exitCode": code}).to_string()
         );
-        // SAFETY: the host transfers the output with its own deallocator.
-        let _out = unsafe { OwnedString::from_raw(out, Some(self.0.free_string)) };
         rc == 0
     }
 
@@ -112,26 +104,22 @@ impl Host {
         0
     }
 
-    #[allow(unsafe_code)] // Adopt the string returned by the host ABI.
     fn flag(self, name: &str) -> Option<Value> {
         if self.0.user_data.is_null() {
             return None;
         }
-        let mut out = StbString::empty();
-        let rc = (self.0.runtime_action)(
-            RuntimeActionId::GetCliFlag as u32,
-            StbStringRef::from_str(&json!({"name": name}).to_string()),
-            &mut out,
-            self.0.user_data,
+        let (rc, body) = rpi_plugin_sdk::call_action!(
+            self.0,
+            RuntimeActionId::GetCliFlag,
+            &json!({"name": name}).to_string()
         );
-        // SAFETY: the host transfers the output with its own deallocator.
-        let out = unsafe { OwnedString::from_raw(out, Some(self.0.free_string)) };
-        let result = if rc == 0 {
-            serde_json::from_str::<Value>(&out.to_string_lossy()).ok()
-        } else {
-            None
-        };
-        result?.get("value").cloned()
+        if rc != 0 {
+            return None;
+        }
+        serde_json::from_str::<Value>(&body)
+            .ok()?
+            .get("value")
+            .cloned()
     }
 }
 
@@ -460,11 +448,7 @@ fn register_plugin(api: &PluginApi) -> i32 {
 
 // Passive registrations share the image. The active stdio owner retains its
 // own callbacks and worker until the host finishes that registration.
-#[allow(unsafe_code)] // Export the shared-session marker symbol.
-#[no_mangle]
-pub extern "C" fn rpi_plugin_shared_sessions_v1() {}
-
-rpi_plugin_sdk::export_plugin!(register_plugin);
+rpi_plugin_sdk::export_shared_plugin!(register_plugin);
 
 #[cfg(test)]
 mod tests {

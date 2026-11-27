@@ -1259,9 +1259,19 @@ fn recorded_reference(result: Value, error: bool) -> (Arc<Action>, Arc<Mutex<Vec
         events,
     )
 }
+// The fake host serializes multi-megabyte fixtures in debug builds. Tests of
+// deadline behavior pass their own short timeout directly to execute.
+const FIXTURE_TIMEOUT_MS: u64 = 20_000;
+
 fn direct(code: &str, action: Arc<Action>) -> Value {
-    super::execute(code, 5000, action, Arc::new(AtomicBool::new(false)))
+    super::execute(
+        code,
+        FIXTURE_TIMEOUT_MS,
+        action,
+        Arc::new(AtomicBool::new(false)),
+    )
 }
+
 fn count(events: &Arc<Mutex<Vec<Value>>>, op: &str) -> usize {
     events
         .lock()
@@ -2565,7 +2575,7 @@ fn cancellation_never_recovers_emitted_receipts_even_during_liveness_probe() {
             }
             reply
         });
-        let r = super::execute(EMIT_THEN_OVERFLOW, 5000, action, cancel);
+        let r = super::execute(EMIT_THEN_OVERFLOW, FIXTURE_TIMEOUT_MS, action, cancel);
         assert_ne!(r["status"], "completed", "{r}");
         assert!(r.get("nativeContentParts").is_none());
         assert_eq!(probes.load(Ordering::Acquire), usize::from(cancel_on_probe));

@@ -28,4 +28,10 @@ crate-type = ["cdylib", "rlib"]
 rpi-plugin-sdk = { workspace = true, features = ["process"] }
 serde_json = { workspace = true }
 [target.'cfg(unix)'.dependencies]
-libc = "0.2"
+rustix = { version = "1", features = ["fs"] }
+
+[dev-dependencies]
+rpi-abi-test-support = { path = "../../tools/rpi-abi-test-support" }
+
+[lints]
+workspace = true

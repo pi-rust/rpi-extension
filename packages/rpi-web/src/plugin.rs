@@ -1,9 +1,6 @@
 //! Optional host entry point: `rpi --webserver`, sharing the standalone server.
 use crate::config::{self, Launch};
-use rpi_plugin_sdk::callbacks::OwnedString;
-use rpi_plugin_sdk::{
-    EventTag, PluginApi, RuntimeActionId, StablePluginEvent, StbString, StbStringRef,
-};
+use rpi_plugin_sdk::{EventTag, PluginApi, RuntimeActionId, StablePluginEvent, StbStringRef};
 use serde_json::{json, Value};
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -31,19 +28,10 @@ struct Worker {
 struct Host(PluginApi);
 
 impl Host {
-    #[allow(unsafe_code)] // Adopt the string returned by the host ABI.
     fn action(self, id: RuntimeActionId, args: Value) -> Option<Value> {
-        let mut out = StbString::empty();
-        let code = (self.0.runtime_action)(
-            id as u32,
-            StbStringRef::from_str(&args.to_string()),
-            &mut out,
-            self.0.user_data,
-        );
-        // SAFETY: the host transfers the output with its own deallocator.
-        let out = unsafe { OwnedString::from_raw(out, Some(self.0.free_string)) };
+        let (code, body) = rpi_plugin_sdk::call_action!(self.0, id, &args.to_string());
         if code == 0 {
-            serde_json::from_str(&out.to_string_lossy()).ok()
+            serde_json::from_str(&body).ok()
         } else {
             None
         }
@@ -408,11 +396,7 @@ fn register(api: &PluginApi) -> i32 {
 
 // Passive registrations share the image. The active stdio owner retains its
 // own callbacks and worker until the host finishes that registration.
-#[allow(unsafe_code)] // Export the shared-session marker symbol.
-#[no_mangle]
-pub extern "C" fn rpi_plugin_shared_sessions_v1() {}
-
-rpi_plugin_sdk::export_plugin!(register);
+rpi_plugin_sdk::export_shared_plugin!(register);
 
 #[cfg(test)]
 mod tests {

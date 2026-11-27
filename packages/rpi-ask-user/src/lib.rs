@@ -13,7 +13,7 @@
 //! fails with the explicit `ask_user requires an interactive UI` error instead
 //! of returning a selector payload that the model could mistake for an answer.
 
-#![deny(unsafe_code)]
+#![forbid(unsafe_code)]
 
 use rpi_plugin_sdk::handles::ToolHandles;
 use std::ffi::c_void;
@@ -341,8 +341,7 @@ fn invoke_ui_dialog(runtime: &HostRuntime, args: &Value) -> Result<Value, String
         &mut output,
         runtime.invocation as *mut c_void,
     );
-    let text = output.to_string_lossy();
-    (runtime.fns.free)(output);
+    let text = rpi_plugin_sdk::stb_take!(output, Some(runtime.fns.free));
     if rc != 0 {
         if let Ok(value) = serde_json::from_str::<Value>(&text) {
             if let Some(error) = value.get("error").and_then(Value::as_str) {
@@ -638,8 +637,7 @@ fn start_drive(drive: &mut Drive, runtime: &HostRuntime) -> Result<Value, String
 rpi_plugin_sdk::execute_handler! {
 fn execute(tool_call_id, params, free) {
     let tool_call_id = tool_call_id.to_owned();
-    let text = params.to_string_lossy();
-    params.free_with(free);
+    let text = rpi_plugin_sdk::stb_take!(params, free);
     let params = serde_json::from_str(&text).unwrap_or(Value::Null);
     HANDLES.insert(Drive {
         runtime: HostRuntime::for_invocation(&params),
@@ -886,11 +884,8 @@ fn register_plugin(api: &PluginApi) -> i32 {
 }
 
 // Opt in to sharing the library image across native Host registrations.
-#[allow(unsafe_code)] // The marker only exports a symbol.
-#[no_mangle]
-pub extern "C" fn rpi_plugin_shared_sessions_v1() {}
 
-rpi_plugin_sdk::export_plugin!(register_plugin);
+rpi_plugin_sdk::export_shared_plugin!(register_plugin);
 
 #[cfg(test)]
 mod tests {
@@ -934,18 +929,16 @@ mod tests {
     fn registered_schema_has_real_nested_shapes_and_preserves_optional_fields() {
         // Exercise the constructor passed to register_tool, not a copied schema.
         let schema = tool_schema();
-        assert_eq!(schema.name.to_string_lossy(), "ask_user");
-        assert!(schema
-            .description
-            .to_string_lossy()
-            .contains("interactive UI"));
+        assert_eq!(rpi_plugin_sdk::stb_text!(schema.name), "ask_user");
+        assert!(rpi_plugin_sdk::stb_text!(schema.description).contains("interactive UI"));
         // A too-short deadline on an open-ended question loses the answer, so
         // both the model-facing description and the schema must steer callers
         // away from it. Keep the guidance in sync with README.md.
-        let description = schema.description.to_string_lossy();
+        let description = rpi_plugin_sdk::stb_text!(schema.description);
         assert!(description.contains("Omit timeout for open-ended questions"));
         assert!(description.contains("300 seconds"));
-        let params: Value = serde_json::from_str(&schema.parameters.to_string_lossy()).unwrap();
+        let params: Value =
+            serde_json::from_str(&rpi_plugin_sdk::stb_text!(schema.parameters)).unwrap();
         assert_eq!(params["type"], "object");
         assert!(params.get("required").is_none());
         assert_eq!(params["additionalProperties"], true); // Host __rpi is accepted.
@@ -1006,18 +999,19 @@ mod tests {
             assert_eq!(option["properties"]["description"]["type"], "string");
         }
         assert_inline_schema(&params);
-        schema.name.free_with(Some(free_string));
-        schema.description.free_with(Some(free_string));
-        schema.parameters.free_with(Some(free_string));
+        let _ = rpi_plugin_sdk::stb_take!(schema.name, Some(free_string));
+        let _ = rpi_plugin_sdk::stb_take!(schema.description, Some(free_string));
+        let _ = rpi_plugin_sdk::stb_take!(schema.parameters, Some(free_string));
     }
 
     #[test]
     fn registered_schema_accepts_option_aliases_before_parsing() {
         let schema = tool_schema();
-        let params: Value = serde_json::from_str(&schema.parameters.to_string_lossy()).unwrap();
-        schema.name.free_with(Some(free_string));
-        schema.description.free_with(Some(free_string));
-        schema.parameters.free_with(Some(free_string));
+        let params: Value =
+            serde_json::from_str(&rpi_plugin_sdk::stb_text!(schema.parameters)).unwrap();
+        let _ = rpi_plugin_sdk::stb_take!(schema.name, Some(free_string));
+        let _ = rpi_plugin_sdk::stb_take!(schema.description, Some(free_string));
+        let _ = rpi_plugin_sdk::stb_take!(schema.parameters, Some(free_string));
         let validator = jsonschema::JSONSchema::compile(&params).unwrap();
 
         for field in ["title", "label", "text", "value", "name"] {

@@ -57,8 +57,7 @@ impl Binding {
             &mut output,
             runtime.user_data,
         );
-        let text = output.to_string_lossy();
-        (runtime.free_string)(output);
+        let text = rpi_plugin_sdk::stb_take!(output, Some(runtime.free_string));
         if rc != 0 {
             return Err(if text.is_empty() {
                 format!("runtime action {id:?} failed")

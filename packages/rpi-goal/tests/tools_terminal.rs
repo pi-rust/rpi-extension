@@ -1,4 +1,7 @@
 //! Explicit stopping reasons: `goal_complete`, `goal_blocked`, `goal_wait`.
+
+#![forbid(unsafe_code)]
+
 mod support;
 
 use rpi_plugin_sdk::EventTag;

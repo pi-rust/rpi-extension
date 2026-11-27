@@ -113,7 +113,7 @@
 //! - `RPI_VOICE_INPUT_GAIN`    Software input gain for a very quiet mic
 //!   (default 1.0 = off, capped at 100)
 
-#![deny(unsafe_code)]
+#![forbid(unsafe_code)]
 
 mod audio_lease;
 #[cfg(feature = "local-stt")]
@@ -125,7 +125,9 @@ mod registration;
 mod spoken_style;
 mod whisper;
 
-use rpi_plugin_sdk::{EventTag, PluginApi, RuntimeActionId, StbString, StbStringRef};
+#[cfg(test)]
+use rpi_plugin_sdk::StbString;
+use rpi_plugin_sdk::{EventTag, PluginApi, RuntimeActionId, StbStringRef};
 use serde_json::{json, Value};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
@@ -335,24 +337,12 @@ impl RuntimeContext {
     }
 
     /// Invoke a host runtime action, always reclaiming the host-owned output.
-    #[allow(unsafe_code)]
     fn action(&self, id: RuntimeActionId, args: Value) -> Result<String, String> {
         if self.is_stopping() {
             return Err("voice registration is shutting down".into());
         }
         let args_json = args.to_string();
-        let mut output = StbString::empty();
-        let rc = (self.api.runtime_action)(
-            id as u32,
-            StbStringRef::from_str(&args_json),
-            &mut output,
-            self.api.user_data,
-        );
-        // SAFETY: the host transfers its output and supplies the matching free function.
-        let out_text = unsafe {
-            rpi_plugin_sdk::callbacks::OwnedString::from_raw(output, Some(self.api.free_string))
-        }
-        .to_string_lossy();
+        let (rc, out_text) = rpi_plugin_sdk::call_action!(&self.api, id, &args_json);
         if rc != 0 {
             return Err(out_text);
         }
@@ -2902,7 +2892,10 @@ fn set_output(out: &mut rpi_plugin_sdk::callbacks::Output<'_>, value: Value) {
 // ---------------------------------------------------------------------------
 // Plugin registration
 // ---------------------------------------------------------------------------
-rpi_plugin_sdk::export_plugin!(|api| { registration::register(api) });
+#[cfg(all(target_os = "linux", target_env = "gnu", not(feature = "local-stt")))]
+rpi_plugin_sdk::export_shared_plugin!(registration::register);
+#[cfg(not(all(target_os = "linux", target_env = "gnu", not(feature = "local-stt"))))]
+rpi_plugin_sdk::export_plugin!(registration::register);
 
 fn register_callbacks(api: &PluginApi) -> i32 {
     let rc = pet::register(api);
@@ -3790,7 +3783,6 @@ mod tests {
     }
 
     /// Drive `/voice` the way the host does: args in, output out.
-    #[allow(unsafe_code)]
     fn run_voice_command(voice: &Arc<RuntimeContext>, args: &str) -> (i32, String) {
         let args_json = serde_json::json!({"args": args}).to_string();
         let mut out = StbString::empty();
@@ -3800,14 +3792,7 @@ mod tests {
                 &mut out,
                 voice.api.user_data,
             );
-            // SAFETY: the fixture takes ownership of the plugin output.
-            let text = unsafe {
-                rpi_plugin_sdk::callbacks::OwnedString::from_raw(
-                    out,
-                    Some(rpi_plugin_sdk::callbacks::free_string),
-                )
-            }
-            .to_string_lossy();
+            let text = rpi_plugin_sdk::stb_take!(out, Some(rpi_plugin_sdk::callbacks::free_string));
             (rc, text)
         })
     }

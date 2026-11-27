@@ -157,8 +157,7 @@ fn execute(
     free: Option<FreeStringFn>,
     builder: Builder,
 ) -> StepHandle {
-    let text = params.to_string_lossy();
-    params.free_with(free);
+    let text = rpi_plugin_sdk::stb_take!(params, free);
     let Some(registration) = runtime::get(slot) else {
         return std::ptr::null_mut();
     };

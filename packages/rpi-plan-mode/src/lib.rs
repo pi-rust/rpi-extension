@@ -1,4 +1,4 @@
-#![deny(unsafe_code)]
+#![forbid(unsafe_code)]
 
 mod lifecycle;
 mod runtime;
@@ -370,8 +370,7 @@ extern "C" fn execute<const SLOT: usize>(
     params: StbString,
     free: Option<FreeStringFn>,
 ) -> StepHandle {
-    let text = params.to_string_lossy();
-    params.free_with(free);
+    let text = rpi_plugin_sdk::stb_take!(params, free);
     let params = serde_json::from_str(&text).unwrap_or(Value::Null);
     HANDLES.insert(Drive {
         binding: runtime::tool::<SLOT>(&params),
@@ -541,8 +540,9 @@ mod tests {
     fn registered_schemas_are_json_objects_with_runtime_parameter_rules() {
         for (tool, name) in [(start_schema(), START_TOOL), (complete_schema(), PLAN_TOOL)] {
             // Exercise the constructors used for actual registration.
-            assert_eq!(tool.name.to_string_lossy(), name);
-            let schema: Value = serde_json::from_str(&tool.parameters.to_string_lossy()).unwrap();
+            assert_eq!(rpi_plugin_sdk::stb_text!(tool.name), name);
+            let schema: Value =
+                serde_json::from_str(&rpi_plugin_sdk::stb_text!(tool.parameters)).unwrap();
             assert_eq!(schema["type"], "object");
             assert_eq!(schema["additionalProperties"], true);
             let props = schema["properties"].as_object().unwrap();
@@ -563,7 +563,7 @@ mod tests {
                     .unwrap()
                     .contains(&MAX_PLAN_CHARS.to_string()));
             }
-            assert!(tool.description.to_string_lossy().contains("DAG"));
+            assert!(rpi_plugin_sdk::stb_text!(tool.description).contains("DAG"));
         }
     }
 
@@ -692,6 +692,15 @@ mod tests {
             declare: None,
             register_before_agent_start: None,
             register_oauth_provider: None,
+            register_streaming_provider: None,
+            register_tool_with_wake: None,
+            register_plugin_lifecycle: None,
+            register_tool_prompt: None,
+            register_oauth_provider_cancellable: None,
+            register_tool_result: None,
+            register_autocomplete_provider: None,
+            register_command_completions: None,
+            register_argument_suggester: None,
         }))
         .binding();
         *BRANCH.lock().unwrap() = json!({"filtered":true,"entries":[

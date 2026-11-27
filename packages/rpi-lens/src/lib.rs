@@ -1,4 +1,4 @@
-#![deny(unsafe_code)]
+#![forbid(unsafe_code)]
 
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::time::Duration;
@@ -124,9 +124,6 @@ const PARAMETERS: &str = r#"{
 
 // The tool owns its child and waits inside poll. Its ABI helper stores only
 // per-call inputs and no host callback context.
-#[allow(unsafe_code)] // Export the optional Host ABI marker.
-#[no_mangle]
-pub extern "C" fn rpi_plugin_shared_sessions_v1() {}
 
 export_single_tool_plugin!(code_lens, "code_lens", DESCRIPTION, PARAMETERS);
 
@@ -137,8 +134,8 @@ mod tests {
     #[test]
     fn registered_schema_preserves_optional_inputs_and_runtime_limits() {
         let registered = registered_tool_schema();
-        assert_eq!(registered.name.to_string_lossy(), "code_lens");
-        let description = registered.description.to_string_lossy();
+        assert_eq!(rpi_plugin_sdk::stb_text!(registered.name), "code_lens");
+        let description = rpi_plugin_sdk::stb_text!(registered.description);
         for constraint in [
             "not arbitrary",
             "nonzero exit",
@@ -148,7 +145,7 @@ mod tests {
         ] {
             assert!(description.contains(constraint), "missing {constraint}");
         }
-        let schema: Value = serde_json::from_str(&registered.parameters.to_string_lossy())
+        let schema: Value = serde_json::from_str(&rpi_plugin_sdk::stb_text!(registered.parameters))
             .expect("registered parameters must be JSON");
         assert_eq!(schema["type"], "object");
         assert_eq!(schema["additionalProperties"], true); // Host may inject __rpi.

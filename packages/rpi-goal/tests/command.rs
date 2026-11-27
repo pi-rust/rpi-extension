@@ -1,5 +1,8 @@
 //! `/goal` commands persist state and return immediately; work starts from the
 //! continuation worker, never from the TUI thread.
+
+#![forbid(unsafe_code)]
+
 mod support;
 
 use rpi_plugin_sdk::EventTag;

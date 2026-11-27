@@ -16,10 +16,8 @@ mod entry {
 
     // The shared-image Host provides registration lifecycle hooks. Legacy Hosts
     // still call the standard SDK entrypoint and can use isolated images.
-    #[no_mangle]
-    pub extern "C" fn rpi_plugin_shared_sessions_v1() {}
 
-    rpi_plugin_sdk::export_plugin!(|api| {
+    rpi_plugin_sdk::export_shared_plugin!(|api| {
         for register in [
             deepseek::register,
             openrouter::register,

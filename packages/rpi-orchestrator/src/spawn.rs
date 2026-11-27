@@ -90,17 +90,11 @@ impl Drop for PipeWorker {
 }
 
 #[cfg(unix)]
-#[allow(unsafe_code)]
 fn set_nonblocking(fd: std::os::fd::BorrowedFd<'_>) -> std::io::Result<()> {
-    use std::os::fd::AsRawFd;
-    // SAFETY: the BorrowedFd keeps the descriptor live for both operations.
-    let flags = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GETFL) };
-    if flags < 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-    if unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
-        return Err(std::io::Error::last_os_error());
-    }
+    use rustix::fs::{fcntl_getfl, fcntl_setfl, OFlags};
+
+    let flags = fcntl_getfl(fd)?;
+    fcntl_setfl(fd, flags | OFlags::NONBLOCK)?;
     Ok(())
 }
 

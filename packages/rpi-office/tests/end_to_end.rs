@@ -6,7 +6,7 @@
 
 // The harness plays the host here; `take_step!` keeps the union-arm read and the
 // reclaim inside the SDK, so this file needs no `unsafe` of its own.
-#![deny(unsafe_code)]
+#![forbid(unsafe_code)]
 
 mod support;
 

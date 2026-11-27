@@ -6,7 +6,7 @@ use std::{
     sync::{Arc, Mutex, OnceLock},
 };
 
-/// SDK 0.8.3 passes only `&ProviderContext` to a provider factory. Index the
+/// The SDK passes only `&ProviderContext` to a provider factory. Index the
 /// vendor state by that context's address so OAuth and streaming can use the
 /// same registration without reaching into the SDK's private layout.
 pub(crate) struct Registrations<S> {
@@ -129,58 +129,9 @@ pub(crate) fn register_scoped_stream(
     }
 }
 
-macro_rules! provider_callbacks {
-    ($factory:ident) => {
-        extern "C" fn request(
-            req: rpi_plugin_sdk::StbStringRef,
-            out: *mut rpi_plugin_sdk::StbString,
-            context: *mut std::ffi::c_void,
-        ) -> i32 {
-            unsafe {
-                rpi_plugin_sdk::provider::drive_with_context(
-                    $factory(context),
-                    context,
-                    req,
-                    None,
-                    std::ptr::null_mut(),
-                    std::ptr::null(),
-                    out,
-                )
-            }
-        }
-
-        extern "C" fn stream(
-            req: rpi_plugin_sdk::StbStringRef,
-            emit: Option<rpi_plugin_sdk::ProviderStreamEmitFn>,
-            data: *mut std::ffi::c_void,
-            control: *const rpi_plugin_sdk::ProviderStreamControl,
-            _: Option<rpi_plugin_sdk::ProviderStreamCompletionFn>,
-            _: *mut std::ffi::c_void,
-            out: *mut rpi_plugin_sdk::StbString,
-            context: *mut std::ffi::c_void,
-        ) -> i32 {
-            unsafe {
-                rpi_plugin_sdk::provider::drive_with_context(
-                    $factory(context),
-                    context,
-                    req,
-                    emit,
-                    data,
-                    control,
-                    out,
-                )
-            }
-        }
-    };
-}
-pub(crate) use provider_callbacks;
-
 macro_rules! register_provider {
     ($id:expr, $base:expr, $api:expr, $manifest:expr, $factory:path) => {
-        fn select_factory(_: *mut std::ffi::c_void) -> rpi_plugin_sdk::provider::ContextFactory {
-            $factory
-        }
-        $crate::registration::provider_callbacks!(select_factory);
+        rpi_plugin_sdk::provider_callbacks!($factory);
 
         pub(crate) fn register(api: &rpi_plugin_sdk::PluginApi) -> i32 {
             rpi_plugin_sdk::provider::register_with_context(
@@ -226,7 +177,7 @@ macro_rules! register_scoped_provider {
                 create_scoped
             }
         }
-        $crate::registration::provider_callbacks!(select_factory);
+        rpi_plugin_sdk::provider_callbacks!(select_factory = select_factory);
 
         extern "C" fn begin(data: *mut c_void) {
             rpi_plugin_sdk::guard_or((), || REGISTRATIONS.begin_shutdown(data));

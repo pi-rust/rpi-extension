@@ -1,8 +1,5 @@
 use crate::protocol::{run, ServerOptions};
-use rpi_plugin_sdk::callbacks::OwnedString;
-use rpi_plugin_sdk::{
-    EventTag, PluginApi, RuntimeActionId, StablePluginEvent, StbString, StbStringRef,
-};
+use rpi_plugin_sdk::{EventTag, PluginApi, RuntimeActionId, StablePluginEvent, StbStringRef};
 use serde_json::{json, Value};
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -15,20 +12,10 @@ const MCP_FLAG: &str = "mcp";
 struct Host(PluginApi);
 
 impl Host {
-    #[allow(unsafe_code)] // Adopt the string returned by the host ABI.
     fn action(self, id: RuntimeActionId, args: Value) -> Option<Value> {
-        let encoded = args.to_string();
-        let mut out = StbString::empty();
-        let rc = (self.0.runtime_action)(
-            id as u32,
-            StbStringRef::from_str(&encoded),
-            &mut out,
-            self.0.user_data,
-        );
-        // SAFETY: the host transfers the output with its own deallocator.
-        let out = unsafe { OwnedString::from_raw(out, Some(self.0.free_string)) };
-        if rc == 0 {
-            serde_json::from_str(&out.to_string_lossy()).ok()
+        let (code, body) = rpi_plugin_sdk::call_action!(self.0, id, &args.to_string());
+        if code == 0 {
+            serde_json::from_str(&body).ok()
         } else {
             None
         }

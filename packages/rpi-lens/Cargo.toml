@@ -30,3 +30,6 @@ serde_json = { workspace = true }
 
 [target.'cfg(windows)'.dependencies]
 wait-timeout = { workspace = true }
+
+[lints]
+workspace = true

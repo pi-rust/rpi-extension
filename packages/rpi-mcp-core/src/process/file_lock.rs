@@ -17,79 +17,27 @@ impl SharedFileLock {
                 "shared lease requires a regular existing file",
             ));
         }
-        platform_lock(&file, false)?;
+        try_lock_shared(&file)?;
         Ok(Self { _file: file })
     }
 }
-#[cfg(unix)]
-fn platform_lock(file: &File, exclusive: bool) -> io::Result<()> {
-    use std::os::fd::AsRawFd;
-    extern "C" {
-        fn flock(fd: std::os::raw::c_int, operation: std::os::raw::c_int) -> std::os::raw::c_int;
-    }
-    // SAFETY: valid borrowed descriptor, no pointer parameters; LOCK_SH/EX|NB.
-    let result = unsafe { flock(file.as_raw_fd(), (if exclusive { 2 } else { 1 }) | 4) };
-    if result == 0 {
-        Ok(())
-    } else {
-        Err(io::Error::last_os_error())
-    }
+#[cfg(any(unix, windows))]
+fn try_lock_shared(file: &File) -> io::Result<()> {
+    fs2::FileExt::try_lock_shared(file).map_err(lock_error)
 }
-#[cfg(windows)]
-fn platform_lock(file: &File, exclusive: bool) -> io::Result<()> {
-    use std::{ffi::c_void, os::windows::io::AsRawHandle};
-    #[repr(C)]
-    struct Overlapped {
-        internal: usize,
-        internal_high: usize,
-        offset: u32,
-        offset_high: u32,
-        event: *mut c_void,
+
+#[cfg(any(unix, windows))]
+fn lock_error(error: io::Error) -> io::Error {
+    // Windows reports a lock violation as a different error kind from flock.
+    #[cfg(windows)]
+    if error.raw_os_error() == fs2::lock_contended_error().raw_os_error() {
+        return io::Error::new(io::ErrorKind::WouldBlock, error);
     }
-    #[link(name = "kernel32")]
-    extern "system" {
-        fn LockFileEx(
-            file: *mut c_void,
-            flags: u32,
-            reserved: u32,
-            low: u32,
-            high: u32,
-            overlapped: *mut Overlapped,
-        ) -> i32;
-    }
-    let mut overlapped = Overlapped {
-        internal: 0,
-        internal_high: 0,
-        offset: 0,
-        offset_high: 0,
-        event: std::ptr::null_mut(),
-    };
-    // SAFETY: valid borrowed File handle, native OVERLAPPED layout. No
-    // FILE_FLAG_OVERLAPPED on std's synchronous file, so the API cannot retain
-    // the stack pointer. Same fs2 byte range; shared + FAIL_IMMEDIATELY (1).
-    let result = unsafe {
-        LockFileEx(
-            file.as_raw_handle(),
-            1 | if exclusive { 2 } else { 0 },
-            0,
-            u32::MAX,
-            u32::MAX,
-            &mut overlapped,
-        )
-    };
-    if result != 0 {
-        Ok(())
-    } else {
-        let e = io::Error::last_os_error();
-        if e.raw_os_error() == Some(33) {
-            Err(io::Error::new(io::ErrorKind::WouldBlock, e))
-        } else {
-            Err(e)
-        }
-    }
+    error
 }
+
 #[cfg(not(any(unix, windows)))]
-fn platform_lock(_file: &File, _exclusive: bool) -> io::Result<()> {
+fn try_lock_shared(_file: &File) -> io::Result<()> {
     Err(io::Error::new(
         io::ErrorKind::Unsupported,
         "native observation lock unsupported on this platform",

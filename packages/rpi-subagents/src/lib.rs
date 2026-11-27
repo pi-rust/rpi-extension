@@ -1,4 +1,4 @@
-#![deny(unsafe_code)]
+#![forbid(unsafe_code)]
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
 mod kit;
@@ -25,7 +25,7 @@ static JOBS: ToolHandles<Job> = ToolHandles::new();
 #[derive(Clone, Copy)]
 struct RuntimeFns {
     action: extern "C" fn(u32, StbStringRef, *mut StbString, *mut std::ffi::c_void) -> i32,
-    free: extern "C" fn(StbString),
+    free: rpi_plugin_sdk::FreeStringFn,
 }
 // The native host uses a process-lifetime trampoline and allocator for all
 // registrations of this image. A different table must never replace them.
@@ -169,8 +169,7 @@ fn host_action(
         &mut out,
         runtime_handle as *mut std::ffi::c_void,
     );
-    let text = out.to_string_lossy();
-    (host.free)(out);
+    let text = rpi_plugin_sdk::stb_take!(out, Some(host.free));
     let value: Value = serde_json::from_str(&text)
         .map_err(|e| ActionError::Failed(format!("invalid runtime response (status {rc}): {e}")))?;
     if rc != 0 {
@@ -368,8 +367,7 @@ fn tool_result(text: &str) -> String {
 
 rpi_plugin_sdk::execute_handler!(fn execute(tool_call_id, params, free_params) {
     rpi_plugin_sdk::guard(|| {
-        let text = params.to_string_lossy();
-        params.free_with(free_params);
+        let text = rpi_plugin_sdk::stb_take!(params, free_params);
         let id = tool_call_id.to_owned();
         let value = serde_json::from_str::<Value>(&text).unwrap_or(Value::Null);
         let expected_context = value.get("__rpi").cloned().unwrap_or(Value::Null);
@@ -519,8 +517,9 @@ fn delegate_schema_with_budget_policy(policy: BudgetPolicy) -> rpi_plugin_sdk::S
             "additionalProperties": true
         }"#,
     );
-    let mut parameters: Value = serde_json::from_str(&registered.parameters.to_string_lossy())
-        .expect("static delegate schema");
+    let mut parameters: Value =
+        serde_json::from_str(&rpi_plugin_sdk::stb_text!(registered.parameters))
+            .expect("static delegate schema");
     if let Some(turns) = policy.max_turns {
         parameters["properties"]["maxTurns"] = json!({"type":"integer", "enum":[turns], "default":turns,
             "description":if turns == 0 { "Operator policy disables the turn limit. Timeout and cancellation still apply; omit maxTurns or use 0.".to_string() } else { format!("Operator policy fixes the per-child turn budget at {turns}.") }});
@@ -553,11 +552,8 @@ fn register_plugin(api: &rpi_plugin_sdk::PluginApi) -> i32 {
 }
 
 // Opt in to sharing the library image across native Host registrations.
-#[allow(unsafe_code)] // The marker only exports a symbol.
-#[no_mangle]
-pub extern "C" fn rpi_plugin_shared_sessions_v1() {}
 
-rpi_plugin_sdk::export_plugin!(register_plugin);
+rpi_plugin_sdk::export_shared_plugin!(register_plugin);
 
 #[cfg(test)]
 mod tests;

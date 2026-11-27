@@ -592,22 +592,19 @@ mod tests {
         assert_eq!(mood_from_status("unrelated"), None);
     }
     #[test]
-    #[allow(unsafe_code)]
     fn mascot_commands_and_animation_stay_with_the_registration() {
         fn call(owner: &Arc<RuntimeContext>, args: &str) {
             registration::with_test_callback(owner, || {
                 let input = json!({"args": args}).to_string();
                 let mut out = StbString::empty();
-                assert_eq!(
-                    command(
-                        StbStringRef::from_str(&input),
-                        &mut out,
-                        owner.api.user_data
-                    ),
-                    0
+                let rc = command(
+                    StbStringRef::from_str(&input),
+                    &mut out,
+                    owner.api.user_data,
                 );
-                // SAFETY: the fixture takes ownership of the command output.
-                unsafe { rpi_plugin_sdk::callbacks::free_string(out) };
+                let _ =
+                    rpi_plugin_sdk::stb_take!(out, Some(rpi_plugin_sdk::callbacks::free_string));
+                assert_eq!(rc, 0);
             });
         }
 

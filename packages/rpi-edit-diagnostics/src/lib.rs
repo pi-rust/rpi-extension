@@ -38,7 +38,7 @@
 //! is renamed over the target, so an interrupted write cannot truncate a file.
 //! Calls serialize by canonical target path and check the original bytes again
 //! immediately before committing, rejecting stale snapshots.
-#![deny(unsafe_code)]
+#![forbid(unsafe_code)]
 // The SDK's `export_plugin!` macro expands to a `pub extern "C"` entry point that
 // dereferences the host's `*const PluginApi`. That is the ABI contract of
 // `rpi-plugin-sdk` 0.3.x (the host guarantees validity for the call), and the
@@ -464,8 +464,7 @@ extern "C" fn execute(
     params: StbString,
     free: Option<FreeStringFn>,
 ) -> StepHandle {
-    let text = params.to_string_lossy();
-    params.free_with(free);
+    let text = rpi_plugin_sdk::stb_take!(params, free);
     HANDLES.insert(Drive {
         params: serde_json::from_str(&text).unwrap_or(Value::Null),
         done: false,
@@ -518,11 +517,8 @@ fn registered_tool_schema() -> StableToolSchema {
 
 // Tool drives own their inputs. The shared lock table only serializes edits
 // to the same canonical file and holds no host callback context.
-#[allow(unsafe_code)] // Export the optional Host ABI marker.
-#[no_mangle]
-pub extern "C" fn rpi_plugin_shared_sessions_v1() {}
 
-rpi_plugin_sdk::export_plugin!(|api| {
+rpi_plugin_sdk::export_shared_plugin!(|api| {
     let Some(register) = api.register_tool else {
         return 1;
     };

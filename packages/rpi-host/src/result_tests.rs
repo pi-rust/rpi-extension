@@ -96,7 +96,7 @@ fn actual_abi_local_failure_uses_structured_error_envelope() {
         r#"{"command":{"op":"status"}}"#,
         &Err("operator configuration required"),
     ));
-    let step = rpi_plugin_sdk::take_step_result!(poll(handle, None, std::ptr::null_mut()));
+    let step = rpi_plugin_sdk::take_step!(poll(handle, None, std::ptr::null_mut()));
     destroy(handle);
     let rpi_plugin_sdk::callbacks::Step::Done(text) = step else {
         panic!("business error must retain the opt-in structured result")

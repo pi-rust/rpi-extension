@@ -177,8 +177,7 @@ fn call_host(host: &Runtime, handle: usize, action: u32, args: &Value) -> Result
         &mut out as *mut StbString,
         handle as *mut c_void,
     );
-    let text = out.to_string_lossy();
-    (host.free)(out);
+    let text = rpi_plugin_sdk::stb_take!(out, Some(host.free));
     let value: Value = serde_json::from_str(&text)
         .map_err(|error| format!("invalid execution-context reply (status {rc}): {error}"))?;
     if rc != 0 {

@@ -1,4 +1,4 @@
-#![deny(unsafe_code)]
+#![forbid(unsafe_code)]
 // The `export_plugin!`/`execute_handler!` macros generate `extern "C"` entry
 // points that dereference the caller-supplied API pointer; the SDK's `guard`
 // wrapper owns the safety contract (same allow as the other extension crates).
@@ -266,8 +266,7 @@ extern "C" fn execute(
     params: StbString,
     free: Option<FreeStringFn>,
 ) -> StepHandle {
-    let text = params.to_string_lossy();
-    params.free_with(free);
+    let text = rpi_plugin_sdk::stb_take!(params, free);
     HANDLES.insert(Drive {
         params: serde_json::from_str(&text).unwrap_or(Value::Null),
         done: false,
@@ -333,11 +332,8 @@ fn tool_schema() -> StableToolSchema {
 use rpi_plugin_sdk::callbacks::free_string;
 // Tool handles carry no host callback context. Mutations serialize the full
 // read-modify-write across sessions sharing the image.
-#[allow(unsafe_code)] // Export the optional Host ABI marker.
-#[no_mangle]
-pub extern "C" fn rpi_plugin_shared_sessions_v1() {}
 
-rpi_plugin_sdk::export_plugin!(|api| {
+rpi_plugin_sdk::export_shared_plugin!(|api| {
     let Some(register) = api.register_tool else {
         return 1;
     };
@@ -354,12 +350,13 @@ mod tests {
     fn registered_schema_documents_policy_without_requiring_optional_fields() {
         // The registration uses this same constructor, not a test-only schema copy.
         let schema = tool_schema();
-        assert_eq!(schema.name.to_string_lossy(), "permissions");
-        let description = schema.description.to_string_lossy();
+        assert_eq!(rpi_plugin_sdk::stb_text!(schema.name), "permissions");
+        let description = rpi_plugin_sdk::stb_text!(schema.description);
         assert!(description.contains("grant effect=deny ADDS"));
         assert!(description.contains("revoke DELETES"));
         assert!(description.contains("Never self-authorize"));
-        let params: Value = serde_json::from_str(&schema.parameters.to_string_lossy()).unwrap();
+        let params: Value =
+            serde_json::from_str(&rpi_plugin_sdk::stb_text!(schema.parameters)).unwrap();
         assert_eq!(params["type"], "object");
         assert_eq!(params["required"], json!(["action"]));
         assert_eq!(params["additionalProperties"], true); // Includes host __rpi.
@@ -382,9 +379,9 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("UTF-8 bytes"));
-        schema.name.free_with(Some(free_string));
-        schema.description.free_with(Some(free_string));
-        schema.parameters.free_with(Some(free_string));
+        let _ = rpi_plugin_sdk::stb_take!(schema.name, Some(free_string));
+        let _ = rpi_plugin_sdk::stb_take!(schema.description, Some(free_string));
+        let _ = rpi_plugin_sdk::stb_take!(schema.parameters, Some(free_string));
     }
 
     #[test]

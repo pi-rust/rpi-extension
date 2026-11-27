@@ -14,7 +14,7 @@ pub struct Emitter {
 impl EventSink for Emitter {
     async fn emit(&mut self, event: Value) -> Result<(), String> {
         let mapped = to_event(&event)?;
-        if self.producer.push(mapped) {
+        if self.producer.push(mapped).await {
             Ok(())
         } else {
             Err("assistant message stream was closed".into())
