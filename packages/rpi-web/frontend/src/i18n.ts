@@ -104,6 +104,8 @@ const messages = {
     sessionWork: "Session work",
     sessionWorkTotal:
       "Total agent work time in this session (sum of all recorded rounds)",
+    sessionWorkLive: "Recorded work time plus the current run",
+    sessionWorkObserved: "Recorded work time plus time since this page detected the current run",
     inputTokens: "Input tokens",
     outputTokens: "Output tokens",
     cachedTokens: "Cached tokens",
@@ -514,6 +516,8 @@ const messages = {
     cacheHit: "缓存命中率",
     sessionWork: "会话工作时长",
     sessionWorkTotal: "本会话 agent 各轮工作时长之和",
+    sessionWorkLive: "已记录的工作时长加上当前轮次用时",
+    sessionWorkObserved: "已记录的工作时长加上本页面检测到当前轮次后的用时",
     inputTokens: "输入 Token",
     outputTokens: "输出 Token",
     cachedTokens: "缓存 Token",

@@ -47,7 +47,6 @@ import {
   Sparkles,
   SquarePen,
   Sun,
-  Timer,
   Volume2,
   VolumeX,
   X,
@@ -135,6 +134,7 @@ import {
 } from "./useRunTimings";
 import { groupTodoUpdates, isTodoTool } from "./todoGroups";
 import { RunElapsed } from "./RunElapsed";
+import { SessionWork } from "./SessionWork";
 import { ExecutionTrace } from "./ExecutionTracePanel";
 import {
   ToolProgramChildren,
@@ -499,18 +499,6 @@ function formatTokens(value: number) {
   if (value >= 1_000)
     return `${(value / 1_000).toFixed(value >= 10_000 ? 0 : 1)}k`;
   return String(Math.round(value));
-}
-
-/** Compact tabular duration for the footer, e.g. 2m 18s or 1h 01m. */
-function formatRunDuration(value: number) {
-  if (!Number.isFinite(value) || value <= 0) return "0s";
-  const seconds = Math.floor(value / 1000);
-  const hours = Math.floor(seconds / 3600);
-  const minutes = Math.floor(seconds / 60) % 60;
-  if (hours > 0) return `${hours}h ${String(minutes).padStart(2, "0")}m`;
-  if (minutes > 0)
-    return `${minutes}m ${String(seconds % 60).padStart(2, "0")}s`;
-  return `${seconds}s`;
 }
 
 function statNumber(
@@ -1339,6 +1327,10 @@ export default function App() {
         : null,
     [sessionTimings],
   );
+  const activeRunStartedAt = historyData?.openOperations?.find((record) => {
+    const intent = record.intent as { kind?: unknown } | null | undefined;
+    return record.lane === "main" && intent?.kind === "run";
+  })?.timestamp;
   const runFooters = useMemo(
     () => timingByRow(displayedRows, displayedTimings),
     [displayedRows, displayedTimings],
@@ -7502,18 +7494,19 @@ export default function App() {
                         : "—"}
                     </strong>
                   </span>
-                  <span
-                    className="composer-metric"
-                    title={t("sessionWorkTotal")}
-                    aria-label={`${t("sessionWork")}: ${sessionWorkMs == null ? "—" : formatRunDuration(sessionWorkMs)}`}
-                  >
-                    <Timer size={12} aria-hidden="true" />
-                    <strong>
-                      {sessionWorkMs == null
-                        ? "—"
-                        : formatRunDuration(sessionWorkMs)}
-                    </strong>
-                  </span>
+                  <SessionWork
+                    key={`${sessionId}:${settleTick}`}
+                    completedMs={sessionWorkMs}
+                    running={runActive && !loadingSession && !connectionFailed}
+                    startedAt={
+                      typeof activeRunStartedAt === "number" &&
+                      Number.isSafeInteger(activeRunStartedAt) &&
+                      activeRunStartedAt > 0
+                        ? activeRunStartedAt
+                        : undefined
+                    }
+                    language={language}
+                  />
                   <button
                     type="button"
                     className="slim-metrics-more"
