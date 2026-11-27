@@ -2707,7 +2707,7 @@ dependencies = [
 
 [[package]]
 name = "rpi-im-message"
-version = "0.1.16"
+version = "0.1.17"
 dependencies = [
  "feishu-sdk",
  "futures-util",

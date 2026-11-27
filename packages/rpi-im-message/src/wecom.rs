@@ -1119,7 +1119,13 @@ fn handle_incoming(
     reply_contexts: &mut HashMap<String, String>,
     incoming: Incoming,
 ) {
+    // Direct (single) chats are accepted by default regardless of the
+    // allowChats whitelist, mirroring the Feishu p2p behavior; see the
+    // Profile::from_value allowDirectChats documentation.
+    let direct_chat_allowed =
+        incoming.chat_type != "group" && profile.allow_direct_chats;
     if !profile.allow_chats.is_empty()
+        && !direct_chat_allowed
         && !profile
             .allow_chats
             .iter()
@@ -2254,6 +2260,81 @@ mod tests {
         }
         assert!(state.remember_message("after-eviction"));
         assert!(!state.remember_message("after-eviction"));
+    }
+
+    #[test]
+    fn wecom_direct_chats_bypass_allow_chats_by_default() {
+        let profile = profile(json!({
+            "provider":"wecom", "botId":"bot", "botSecret":"s",
+            "allowChats":["wr_group"]
+        }));
+        let state = Arc::new(RuntimeState::new(profile.clone()));
+        state.set_status("running", None);
+        let (commands, _receiver) = tokio::sync::mpsc::unbounded_channel();
+        let mut reply_contexts = HashMap::new();
+        let incoming = Incoming {
+            message_id: "msg-direct-1".into(),
+            chat_id: "zhangsan".into(),
+            sender_id: "zhangsan".into(),
+            chat_type: "single".into(),
+            message_type: "text".into(),
+            text: Some("hi".into()),
+            content: "{\"text\":\"hi\"}".into(),
+            create_time: json!(1700000000),
+            req_id: String::new(),
+        };
+        handle_incoming(&state, &profile, &commands, &mut reply_contexts, incoming);
+        assert_eq!(
+            state.receive(Duration::ZERO).unwrap()["messageId"],
+            "msg-direct-1"
+        );
+    }
+
+    #[test]
+    fn wecom_allow_direct_chats_false_gates_single_chats_behind_whitelist() {
+        let profile = profile(json!({
+            "provider":"wecom", "botId":"bot", "botSecret":"s",
+            "allowChats":["wr_group"], "allowDirectChats":false
+        }));
+        let state = Arc::new(RuntimeState::new(profile.clone()));
+        state.set_status("running", None);
+        let (commands, _receiver) = tokio::sync::mpsc::unbounded_channel();
+        let mut reply_contexts = HashMap::new();
+        let incoming = |id: &str, chat: &str| Incoming {
+            message_id: id.into(),
+            chat_id: chat.into(),
+            sender_id: chat.into(),
+            chat_type: "single".into(),
+            message_type: "text".into(),
+            text: Some("hi".into()),
+            content: "{\"text\":\"hi\"}".into(),
+            create_time: json!(1700000000),
+            req_id: String::new(),
+        };
+        // A single chat outside the whitelist is gated when disabled.
+        handle_incoming(
+            &state,
+            &profile,
+            &commands,
+            &mut reply_contexts,
+            incoming("msg-direct-1", "lisi"),
+        );
+        assert_eq!(
+            state.receive(Duration::ZERO).unwrap(),
+            json!({"type":"timeout","state":"running"})
+        );
+        // A whitelisted single chat still passes.
+        handle_incoming(
+            &state,
+            &profile,
+            &commands,
+            &mut reply_contexts,
+            incoming("msg-direct-2", "wr_group"),
+        );
+        assert_eq!(
+            state.receive(Duration::ZERO).unwrap()["messageId"],
+            "msg-direct-2"
+        );
     }
 
     #[test]
