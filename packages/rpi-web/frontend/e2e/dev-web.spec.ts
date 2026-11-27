@@ -6866,6 +6866,11 @@ test("read images show outside tool details on live completion and reload", asyn
     await expect(card).not.toHaveAttribute("open", "");
     await expect(preview).toBeVisible();
     await expect(preview).toHaveJSProperty("naturalWidth", 960);
+    const figure = preview.locator("..");
+    const label = card.locator(".tool-summary-text");
+    expect((await figure.boundingBox())!.x).toBeCloseTo(
+      (await label.boundingBox())!.x,
+    );
     const thumbnail = await preview.boundingBox();
     expect(thumbnail!.width).toBeLessThanOrEqual(320);
     expect(thumbnail!.height).toBeLessThanOrEqual(200);
@@ -6885,10 +6890,14 @@ test("read images show outside tool details on live completion and reload", asyn
     await expect(preview).toHaveCount(1);
 
     finished = true;
+    await page.setViewportSize({ width: 390, height: 844 });
     await page.reload();
     await expect(card).not.toHaveAttribute("open", "");
     await expect(preview).toBeVisible();
     await expect(preview).toHaveCount(1);
+    expect((await figure.boundingBox())!.x).toBeCloseTo(
+      (await label.boundingBox())!.x,
+    );
   } finally {
     release();
   }
