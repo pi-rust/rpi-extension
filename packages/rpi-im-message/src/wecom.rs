@@ -185,7 +185,7 @@ struct Incoming {
     message_id: String,
     chat_id: String,
     sender_id: String,
-    chat_type: String,
+    chat_type: Option<String>,
     message_type: String,
     text: Option<String>,
     content: String,
@@ -1030,10 +1030,8 @@ fn parse_callback(frame: &Value) -> Option<Incoming> {
         .get("chattype")
         .and_then(Value::as_str)
         .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .unwrap_or("single")
-        .to_owned();
-    let chat_id = if chat_type == "group" {
+        .filter(|value| !value.is_empty());
+    let chat_id = if chat_type == Some("group") {
         body.get("chatid")
             .and_then(Value::as_str)
             .map(str::trim)
@@ -1056,7 +1054,7 @@ fn parse_callback(frame: &Value) -> Option<Incoming> {
         message_id,
         chat_id,
         sender_id,
-        chat_type,
+        chat_type: chat_type.map(str::to_owned),
         message_type: message_type.clone(),
         text: extract_text(&message_type, body),
         content: body.to_string(),
@@ -1119,11 +1117,8 @@ fn handle_incoming(
     reply_contexts: &mut HashMap<String, String>,
     incoming: Incoming,
 ) {
-    // Direct (single) chats are accepted by default regardless of the
-    // allowChats whitelist, mirroring the Feishu p2p behavior; see the
-    // Profile::from_value allowDirectChats documentation.
-    let direct_chat_allowed =
-        incoming.chat_type != "group" && profile.allow_direct_chats;
+    let chat_type = incoming.chat_type.as_deref();
+    let direct_chat_allowed = chat_type == Some("single") && profile.allow_direct_chats;
     if !profile.allow_chats.is_empty()
         && !direct_chat_allowed
         && !profile
@@ -1153,7 +1148,7 @@ fn handle_incoming(
     // Local slash commands are handled before enqueueing, matching Feishu.
     let command = if profile.auto_reply {
         incoming.text.as_deref().and_then(|text| {
-            let command_text = command_text(text, incoming.chat_type == "group");
+            let command_text = command_text(text, chat_type == Some("group"));
             if command_text.is_empty() {
                 return None;
             }
@@ -1184,7 +1179,7 @@ fn handle_incoming(
         "provider": "wecom",
         "messageId": incoming.message_id,
         "conversationId": incoming.chat_id,
-        "conversationType": incoming.chat_type,
+        "conversationType": chat_type.unwrap_or("single"),
         "senderId": incoming.sender_id,
         "messageType": incoming.message_type,
         "text": incoming.text.clone().unwrap_or_default(),
@@ -1200,7 +1195,7 @@ fn handle_incoming(
     let Some(text) = incoming.text.as_deref() else {
         return;
     };
-    if command_text(text, incoming.chat_type == "group").is_empty() {
+    if command_text(text, chat_type == Some("group")).is_empty() {
         // A bare group mention has no user question to answer.
         return;
     }
@@ -2257,38 +2252,49 @@ mod tests {
     }
 
     #[test]
-    fn wecom_direct_chats_bypass_allow_chats_by_default() {
+    fn wecom_allow_direct_chats_exempts_only_explicit_single_callbacks() {
         let profile = profile(json!({
             "provider":"wecom", "botId":"bot", "botSecret":"s",
-            "allowChats":["wr_group"]
+            "allowChats":["wr_allowed"], "allowDirectChats":true
         }));
         let state = Arc::new(RuntimeState::new(profile.clone()));
         state.set_status("running", None);
         let (commands, _receiver) = tokio::sync::mpsc::unbounded_channel();
         let mut reply_contexts = HashMap::new();
-        let incoming = Incoming {
-            message_id: "msg-direct-1".into(),
-            chat_id: "zhangsan".into(),
-            sender_id: "zhangsan".into(),
-            chat_type: "single".into(),
-            message_type: "text".into(),
-            text: Some("hi".into()),
-            content: "{\"text\":\"hi\"}".into(),
-            create_time: json!(1700000000),
-            req_id: String::new(),
-        };
-        handle_incoming(&state, &profile, &commands, &mut reply_contexts, incoming);
-        assert_eq!(
-            state.receive(Duration::ZERO).unwrap()["messageId"],
-            "msg-direct-1"
-        );
+        for (index, chat_type) in [
+            None,
+            Some(""),
+            Some("unknown"),
+            Some("group"),
+            Some("single"),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let id = format!("msg-{index}");
+            let mut body = json!({
+                "msgid":id, "chatid":"wr_unlisted", "from":{"userid":"zhangsan"},
+                "msgtype":"text", "text":{"content":"hi"}
+            });
+            if let Some(chat_type) = chat_type {
+                body["chattype"] = json!(chat_type);
+            }
+            let incoming = parse_callback(&json!({"body":body})).unwrap();
+            handle_incoming(&state, &profile, &commands, &mut reply_contexts, incoming);
+            let message = state.receive(Duration::ZERO).unwrap();
+            if chat_type == Some("single") {
+                assert_eq!(message["messageId"], id);
+            } else {
+                assert_eq!(message["type"], "timeout", "chat type: {chat_type:?}");
+            }
+        }
     }
 
     #[test]
-    fn wecom_allow_direct_chats_false_gates_single_chats_behind_whitelist() {
+    fn wecom_direct_chats_respect_allow_chats_by_default() {
         let profile = profile(json!({
             "provider":"wecom", "botId":"bot", "botSecret":"s",
-            "allowChats":["wr_group"], "allowDirectChats":false
+            "allowChats":["wr_group"]
         }));
         let state = Arc::new(RuntimeState::new(profile.clone()));
         state.set_status("running", None);
@@ -2298,7 +2304,7 @@ mod tests {
             message_id: id.into(),
             chat_id: chat.into(),
             sender_id: chat.into(),
-            chat_type: "single".into(),
+            chat_type: Some("single".into()),
             message_type: "text".into(),
             text: Some("hi".into()),
             content: "{\"text\":\"hi\"}".into(),

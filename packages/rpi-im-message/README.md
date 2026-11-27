@@ -108,8 +108,9 @@ also does not stop its server.
 
 Receiving is not what triggers acknowledgements or automatic replies: accepted
 incoming events do so independently. Bot/app messages and disallowed chats are
-filtered; `mentionRequired` checks for a non-empty mentions list. With
-`ackReaction` (default true), accepted events can send a reaction even if no
+filtered. In Feishu, `mentionRequired` checks for a non-empty mentions list on
+callbacks other than confirmed direct chats. With `ackReaction` (default true),
+accepted events can send a reaction even if no
 `receive` call is made. With `autoReply`, ordinary messages remain queued **and**
 non-empty text can schedule agent work and external replies. Feishu auto-replies
 only process `text` messages; other types retain raw content in the receive
@@ -171,12 +172,11 @@ process-local window before reactions, local commands and queueing. Bot/app
 messages, disallowed chats, invalid/missing IDs and oversized content are
 ignored. A malformed callback does not mark a healthy connection as failed.
 
-`allowChats` gates group conversations by `chat_id`. Direct (p2p) chats are
-accepted by default regardless of the whitelist: a fresh installation cannot
-know its own chat id before the first message, and a 1:1 conversation is only
-reachable by the user initiating it. Set `allowDirectChats: false` to gate p2p
-chats behind the whitelist as well. `mentionRequired` applies to group
-conversations only; p2p chats never carry mentions.
+A non-empty `allowChats` list filters both group and direct conversations by
+`chat_id`. To receive confirmed direct (p2p) chats before you know their IDs,
+set `allowDirectChats: true`. The default is `false`. Confirmed p2p chats
+pass the `mentionRequired` check without a mention. Missing or unrecognized
+chat types still require a mention when `mentionRequired` is enabled.
 
 Feishu REST operations (messages, reactions and progress updates) have a
 3-second total local request budget, including token acquisition. The SDK
@@ -230,8 +230,8 @@ delivered as Markdown.
 | `botSecret` / `botSecretEnv` | Required | Bot secret, or the name of the environment variable holding it. Configure only one; the environment variable is recommended. |
 | `wsUrl` | Official endpoint | Absolute `ws://` or `wss://` URL for private deployments. |
 | `heartbeatIntervalSeconds` | `30` | Integer `5..300`. Two consecutive missed `ping` acknowledgements close the connection and trigger reconnect. |
-| `allowChats` | All chats | Incoming group conversation IDs to accept (the `chatid`). Direct (single) chats are accepted by default regardless of the whitelist — a fresh installation cannot know the chat id upfront; set `allowDirectChats: false` to gate them behind this list too. Depending on how the bot was created, WeCom may return an encrypted `userid`; use the value actually observed in callbacks. |
-| `allowDirectChats` | `true` | When `true`, direct (single) chats bypass `allowChats`; set `false` to require them in the whitelist. Groups are always gated by `allowChats`. |
+| `allowChats` | All chats | Incoming conversation IDs to accept. Use the sender `userid` for direct chats and the `chatid` for groups. WeCom may return an encrypted `userid`; use the value observed in callbacks. |
+| `allowDirectChats` | `false` | Set to `true` to exempt callbacks explicitly marked `single` from `allowChats`. Other callbacks continue to use the list. |
 | `autoReconnect` / `reconnectIntervalSeconds` | `true` / `5` | Reconnects after network loss, heartbeat timeout or server close, doubling the delay up to 60 seconds after repeated failures. A `disconnected_event` (another connection took over) stops instead of reconnecting. |
 | `autoReply`, `autoReplyModel`, `autoReplyTimeoutSeconds` | Same as Feishu | Agent replies use the `im-wecom-` session prefix. |
 | `maxQueueSize` | `256` | Same bounded, process-local queue as Feishu. |

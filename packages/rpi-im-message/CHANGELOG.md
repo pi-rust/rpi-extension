@@ -7,16 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [0.1.17](https://github.com/pi-rust/rpi-extension/compare/rpi-im-message-v0.1.16...rpi-im-message-v0.1.17) - 2026-11-27
-
 ### Added
 
-- Accept direct (p2p/single) chats by default through the new
-  `allowDirectChats` profile option. `allowChats` now gates group
-  conversations only; setting `allowDirectChats: false` restores whitelist
-  enforcement for direct chats.
-- Exempt Feishu direct (p2p) chats from `mentionRequired`, which applies to
-  group conversations only (p2p chats never carry mentions).
+- Add `allowDirectChats` as an opt-in exemption from `allowChats` for confirmed
+  Feishu `p2p` and WeCom `single` conversations.
+
+### Fixed
+
+- Exempt confirmed Feishu `p2p` conversations from `mentionRequired` so direct
+  messages can arrive without a mention.
 
 ## [0.1.16](https://github.com/pi-rust/rpi-extension/compare/rpi-im-message-v0.1.15...rpi-im-message-v0.1.16) - 2026-11-25
 
