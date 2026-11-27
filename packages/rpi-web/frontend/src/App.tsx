@@ -47,7 +47,6 @@ import {
   Sparkles,
   SquarePen,
   Sun,
-  Timer,
   Volume2,
   VolumeX,
   X,
@@ -105,6 +104,7 @@ import {
   reopenHost,
   roleOf,
   type AbortResult,
+  type StopRunResult,
   type AuthProviderStatus,
   type Capabilities,
   type HistoryResponse,
@@ -133,9 +133,14 @@ import { ZoomableImage } from "./ZoomableImage";
 import { ProjectImageContext, projectImageSource } from "./projectImages";
 import { useTranscriptViewport } from "./useTranscriptViewport";
 import { restoreRowsWithNotes } from "./localNotes";
-import { useRunTimings, timingByRow } from "./useRunTimings";
+import {
+  useRunTimings,
+  useSessionRunTimings,
+  timingByRow,
+} from "./useRunTimings";
 import { groupTodoUpdates, isTodoTool } from "./todoGroups";
 import { RunElapsed } from "./RunElapsed";
+import { SessionWork } from "./SessionWork";
 import { ExecutionTrace } from "./ExecutionTracePanel";
 import {
   ToolProgramChildren,
@@ -504,18 +509,6 @@ function formatTokens(value: number) {
   return String(Math.round(value));
 }
 
-/** Compact tabular duration for the footer, e.g. 2m 18s or 1h 01m. */
-function formatRunDuration(value: number) {
-  if (!Number.isFinite(value) || value <= 0) return "0s";
-  const seconds = Math.floor(value / 1000);
-  const hours = Math.floor(seconds / 3600);
-  const minutes = Math.floor(seconds / 60) % 60;
-  if (hours > 0) return `${hours}h ${String(minutes).padStart(2, "0")}m`;
-  if (minutes > 0)
-    return `${minutes}m ${String(seconds % 60).padStart(2, "0")}s`;
-  return `${seconds}s`;
-}
-
 function statNumber(
   stats: RuntimeState["stats"],
   keys: string[],
@@ -781,6 +774,12 @@ export default function App() {
   }
   const [capabilities, setCapabilities] = useState<Capabilities | null>(null);
   const [nativeMessageQueries, setNativeMessageQueries] = useState(false);
+  // `/capabilities` describes the Web service's static command surface, not the
+  // native host that happens to be running under it. A session snapshot carries
+  // the child's own `supportedCommands`, which is the only authoritative answer
+  // for a command the adapter merely forwards (`stop_run`). `null` means the
+  // live host has not reported yet, so callers fall back to the static list.
+  const [hostCommands, setHostCommands] = useState<Set<string> | null>(null);
   const [authRequired, setAuthRequired] = useState(false);
   const [authenticated, setAuthenticated] = useState(false);
   const [authChecked, setAuthChecked] = useState(false);
@@ -1008,12 +1007,24 @@ export default function App() {
   const [sending, setSending] = useState(false);
   const sendingRef = useRef(false);
   const sendingRevision = useRef(0);
+  // Which composer action is awaiting acknowledgement: "send" / "continue"
+  // use the same submit path, "stop" uses abort(). Drives the progress ring
+  // so a click is visibly accepted until the host answers.
+  const [composerActionPending, setComposerActionPending] = useState<
+    "send" | "continue" | "stop" | null
+  >(null);
   const localMessageSeq = useRef(0);
   const activeSessionRef = useRef(sessionId);
   activeSessionRef.current = sessionId;
   const diagnosticsRevision = useRef(0);
   const diagnosticsAbort = useRef<AbortController | null>(null);
   const sessionReadsAbort = useRef<AbortController | null>(null);
+  const liveConnection = useRef<{
+    sessionId: string;
+    navigation: number;
+    revision: number;
+    requests: AbortController;
+  } | null>(null);
   const navigationRevision = useRef(0);
   const sessionListRevision = useRef(0);
   const sessionListRequest = useRef<Promise<SessionSummary[] | null> | null>(
@@ -1040,6 +1051,8 @@ export default function App() {
       settlement: SettlementIdentity | null | undefined,
       fallbackSeq?: number,
     ) => {
+      // A skipped settlement releases an execution without finishing a run.
+      if (settlement?.outcome === "skipped") return;
       const identity =
         settlementKey(settlement, fallbackSeq) ??
         (fallbackSeq != null ? `seq:${fallbackSeq}` : null);
@@ -1146,7 +1159,18 @@ export default function App() {
   const transcriptRef = useRef<HTMLDivElement>(null);
   const followingRef = useRef(true);
   const [following, setFollowing] = useState(true);
-  const [rows, setRows] = useState<Row[]>([]);
+  const [liveRows, setRows] = useState<Row[]>([]);
+  const [previewRows, setPreviewRows] = useState<{
+    sessionId: string;
+    navigation: number;
+    rows: Row[];
+  } | null>(null);
+  const visiblePreview =
+    previewRows?.sessionId === sessionId &&
+    previewRows.navigation === navigationRevision.current
+      ? previewRows.rows
+      : null;
+  const rows = visiblePreview ?? liveRows;
   const streamingAssistant = useRef<string | null>(null);
   const [assistantStreamRevision, setAssistantStreamRevision] = useState(0);
   const rowsBySession = useRef(new Map<string, Row[]>());
@@ -1404,21 +1428,37 @@ export default function App() {
   const displayedTimings = historical.active
     ? historicalRunTimings
     : runTimings;
+  // The footer totals every finished native run in the session. Per-row
+  // timing queries are limited to the visible transcript window, which can
+  // exclude all but the newest round in history views.
+  const sessionTimings = useSessionRunTimings(
+    sessionId,
+    `${connectionRevision}:${navigationRevision.current}`,
+    !loadingSession && Boolean(capabilities),
+    settleTick,
+  );
   // A missing or unsupported timing lookup is unknown, not zero work: the
   // footer shows "—" exactly like cache hit and context, and only an actually
   // recorded run can produce "0s".
   const sessionWorkMs = useMemo(
     () =>
-      displayedTimings.length
-        ? displayedTimings.reduce(
+      sessionTimings.length
+        ? sessionTimings.reduce(
             (total, timing) =>
               total +
               (Number.isFinite(timing.elapsedMs) ? timing.elapsedMs : 0),
             0,
           )
         : null,
-    [displayedTimings],
+    [sessionTimings],
   );
+  // Fast transcript refreshes omit native history. Keep the start tied to the
+  // selected session and run boundary independently of the diagnostics page.
+  const runClockBinding = `${traceBinding}:${settleTick}`;
+  const [nativeRunStart, setNativeRunStart] = useState<{
+    binding: string;
+    timestamp: number;
+  }>();
   const runFooters = useMemo(
     () => timingByRow(displayedRows, displayedTimings),
     [displayedRows, displayedTimings],
@@ -2082,6 +2122,7 @@ export default function App() {
 
   const lastSeq = useRef(0);
   const noteSeq = useRef(0);
+  const snapshotMessageIds = useRef(new Set<string>());
   const currentAssistant = useRef<string | null>(null);
   const currentUser = useRef<string | null>(null);
   const credentialRevision = useRef(0);
@@ -2097,6 +2138,17 @@ export default function App() {
     () => new Set(capabilities?.supportedCommands ?? []),
     [capabilities],
   );
+  // Whether the *live native child* accepts a command. Fall back to the static
+  // service list only while no snapshot has arrived yet; otherwise a host that
+  // predates `stop_run` would be told it supports the command and Stop would
+  // fail with "unknown command type".
+  const hostSupports = useCallback(
+    (command: string) => (hostCommands ?? supported).has(command),
+    [hostCommands, supported],
+  );
+  // Stop preserves the queue only on a host that advertises `stop_run`.
+  const stopPreservesQueue = hostSupports("stop_run");
+  const canStopRun = stopPreservesQueue || hostSupports("abort");
   const actions = useMemo(
     () => new Set(capabilities?.supportedActions ?? []),
     [capabilities],
@@ -2145,16 +2197,31 @@ export default function App() {
     },
     [],
   );
-  const composerAbort =
-    busy && supported.has("abort") && !loadingSession && !connectionFailed;
+  const readyConnection = liveConnection.current;
+  const liveReady =
+    readyConnection !== null &&
+    readyConnection.sessionId === sessionId &&
+    readyConnection.navigation === navigationRevision.current &&
+    readyConnection.revision === connectionRevision &&
+    !readyConnection.requests.signal.aborted &&
+    !loadingSession && !connectionFailed && !visiblePreview &&
+    status !== "closed" && status !== "error";
+  // Queue operations can await an acknowledgement before sending another command.
+  // Check the current connection again at that boundary.
+  function canWriteSession() {
+    return liveReady && liveConnection.current === readyConnection &&
+      readyConnection.navigation === navigationRevision.current &&
+      !readyConnection.requests.signal.aborted && !hostClosedRef.current;
+  }
+  const composerAbort = busy && canStopRun && liveReady;
   // While a run is active the main button is Stop for an empty composer and
   // Send for a draft: touch keyboards use Enter for a newline, so the icon is
   // the only way to queue a follow-up from the same field.
   const composerDraftReady = draft.trim().length > 0 || attachments.length > 0;
   const composerRunningSend = composerAbort && composerDraftReady;
   const composerContinue =
+    liveReady &&
     !busy &&
-    status !== "closed" &&
     !queueEditId &&
     !draft.trim() &&
     attachments.length === 0 &&
@@ -2167,6 +2234,16 @@ export default function App() {
     (key: MessageKey, values?: Record<string, string | number>) =>
       translate(language, key, values),
     [language],
+  );
+  // Only the newest action for the still-active navigation may own the ring.
+  // A stale finally (session switch, superseded submit) must not clear it.
+  const setActionPending = useCallback(
+    (value: "send" | "continue" | "stop" | null, navigation?: number) => {
+      if (navigation !== undefined && navigation !== navigationRevision.current)
+        return;
+      setComposerActionPending(value);
+    },
+    [],
   );
   const connectionLabel = t(
     (status === "awaiting_input" ? "waitingForAnswer" : status) as MessageKey,
@@ -2247,7 +2324,7 @@ export default function App() {
         name: "/abort",
         usage: "/abort",
         hint: t("slashAbort"),
-        enabled: supported.has("abort"),
+        enabled: canStopRun,
       },
       {
         name: "/new",
@@ -2285,6 +2362,14 @@ export default function App() {
 
   const applyEvent = useCallback(
     (event: SeqEvent, seq: number) => {
+      if (
+        typeof event.messageId === "string" &&
+        snapshotMessageIds.current.has(event.messageId) &&
+        (event.type === "message_start" ||
+          event.type === "message_update" ||
+          event.type === "message_end")
+      )
+        return;
       // Presentation only: observe the same deduplicated data, never the protocol cursor.
       traceEvent(event, seq);
       // Dialog controls may already have been shown while transcript I/O was
@@ -2644,6 +2729,7 @@ export default function App() {
     sessionReadsAbort.current?.abort();
     diagnosticsAbort.current?.abort();
     rowsBySession.current.clear();
+    setPreviewRows(null);
     clearTrace();
     setTraceOpen(false);
     source.current?.close();
@@ -2671,6 +2757,8 @@ export default function App() {
     setSettingsOpen(false);
     setDraft("");
     clearDrafts();
+    // Signing out drops every other composer field; the ring must not survive.
+    setComposerActionPending(null);
   }, [clearDrafts, clearTrace]);
 
   const refreshSessions = useCallback(
@@ -2809,22 +2897,6 @@ export default function App() {
         if (preference) {
           const { thinkingLevel, ...model } = preference;
           const hasModel = Boolean(preference.provider && preference.modelId);
-          // The saved level belongs to the saved model. Apply the model first,
-          // then its level, so a restored default is a consistent pair.
-          if (hasModel) {
-            try {
-              await commandData(created.sessionId, "set_model", { ...model });
-              rememberSessionRuntime(created.sessionId, {
-                provider: model.provider,
-                modelId: model.modelId,
-              });
-            } catch {
-              setModelPreferenceFailures((previous) => ({
-                ...previous,
-                [created.sessionId]: `${preference.provider}/${preference.modelId}`,
-              }));
-            }
-          }
           if (thinkingLevel) {
             try {
               await commandData(created.sessionId, "set_thinking_level", {
@@ -2837,6 +2909,20 @@ export default function App() {
               setThinkingPreferenceFailures((previous) => ({
                 ...previous,
                 [created.sessionId]: thinkingLevel,
+              }));
+            }
+          }
+          if (hasModel) {
+            try {
+              await commandData(created.sessionId, "set_model", { ...model });
+              rememberSessionRuntime(created.sessionId, {
+                provider: model.provider,
+                modelId: model.modelId,
+              });
+            } catch {
+              setModelPreferenceFailures((previous) => ({
+                ...previous,
+                [created.sessionId]: `${preference.provider}/${preference.modelId}`,
               }));
             }
           }
@@ -3030,9 +3116,27 @@ export default function App() {
             now: Date.now(),
             protectedIds,
           });
-          if (stale.length) {
-            // Sequential on purpose: the native host serves one session at a
-            // time, and a startup burst of parallel writes buys nothing.
+          if (
+            stale.length &&
+            caps.supportedActions?.includes("session_bulk_metadata")
+          ) {
+            try {
+              const result = await api.bulkSessionMetadata(stale, {
+                archived: true,
+              });
+              if (cancelled) return;
+              if (result.updated.length) {
+                const refreshed = await refreshSessions();
+                if (cancelled || !refreshed) return;
+                activeList = refreshed;
+              }
+            } catch {
+              // A single failure must not abort bootstrap; the next page
+              // load retries the whole stale set.
+            }
+          } else if (stale.length) {
+            // Legacy fallback: older services only expose a single-session
+            // metadata endpoint. Keep writes serial there.
             const archivedIds = new Set<string>();
             for (const id of stale) {
               if (cancelled) return;
@@ -3165,16 +3269,23 @@ export default function App() {
     setConnectionFailed(false);
     hostClosedRef.current = false;
     setStatus("connecting");
+    setRunActive(false);
     setLoadingSession(Boolean(sessionId));
     setNativeMessageQueries(false);
+    setHostCommands(null);
     setInterrupted(false);
     setFailedRun(false);
+    // The progress ring belongs to the session that started the action. A
+    // switch increments the navigation revision, so the in-flight action's
+    // own finalizer is ignored; clearing here is what stops the spinner.
+    setComposerActionPending(null);
     setRecoveryNoticeDismissed(false);
     setDialog(null);
     setDialogAnswer("");
     setFirstId("");
     setHasMore(false);
     lastSeq.current = 0;
+    snapshotMessageIds.current.clear();
     currentAssistant.current = null;
     currentUser.current = null;
     streamingAssistant.current = null;
@@ -3188,12 +3299,15 @@ export default function App() {
       return;
     }
 
+    const navigation = navigationRevision.current;
     let cancelled = false;
     const requests = new AbortController();
+    const previewRequest = new AbortController();
     sessionReadsAbort.current = requests;
     const isCurrent = () =>
       !cancelled &&
       !requests.signal.aborted &&
+      navigation === navigationRevision.current &&
       activeSessionRef.current === sessionId &&
       sessionReadsAbort.current === requests;
     let stream: EventSource | null = null;
@@ -3201,6 +3315,7 @@ export default function App() {
     let bufferedEvents: MessageEvent[] = [];
     const failConnection = (cause: unknown) => {
       if (!isCurrent()) return;
+      liveConnection.current = null;
       if (cause instanceof ApiError && cause.status === 401) {
         cancelled = true;
         requests.abort();
@@ -3220,6 +3335,9 @@ export default function App() {
         ["get_message_summaries", "get_message_window"].every((command) =>
           snapshot.supportedCommands?.includes(command),
         ),
+      );
+      setHostCommands(
+        snapshot.supportedCommands ? new Set(snapshot.supportedCommands) : null,
       );
       setMessageStats({
         sessionId,
@@ -3244,6 +3362,20 @@ export default function App() {
       if (dialogRequests.current.size) {
         setStatus("awaiting_input");
       }
+    };
+
+    const replaySnapshot = (snapshot: Awaited<ReturnType<typeof snapshotOf>>) => {
+      // History can see a committed entry before its final event reaches SSE.
+      // Use native entry IDs across replay and the subsequent live stream.
+      const committed = new Set<string>();
+      for (const message of snapshot.messages) {
+        const entryId = (message as { entryId?: unknown } | null)?.entryId;
+        if (typeof entryId === "string" && entryId) committed.add(entryId);
+      }
+      snapshotMessageIds.current = committed;
+      for (const entry of eventsAfterSnapshot(snapshot.messages, snapshot.events))
+        applyEvent(entry.event, entry.seq);
+      lastSeq.current = snapshot.lastSeq;
     };
 
     // Direct prompts are persisted by the native harness without user message
@@ -3285,12 +3417,7 @@ export default function App() {
         setRecoveryNoticeDismissed(false);
         setFirstId(earlierPage.current?.firstId ?? snapshot.firstId ?? "");
         setHasMore(earlierPage.current?.hasMore ?? Boolean(snapshot.hasMore));
-        for (const entry of eventsAfterSnapshot(
-          snapshot.messages,
-          snapshot.events,
-        ))
-          applyEvent(entry.event, entry.seq);
-        lastSeq.current = snapshot.lastSeq;
+        replaySnapshot(snapshot);
       } catch (cause) {
         if (!isCurrent()) return;
         if (cause instanceof ApiError && cause.status === 401) {
@@ -3406,6 +3533,30 @@ export default function App() {
       };
     };
 
+    // Only remembered offline sessions can supply a saved preview. The list
+    // can lag a newly-created session, which already has a live host.
+    const knownStatus = sessionListValue.current?.find(
+      (session) => session.sessionId === sessionId,
+    )?.status;
+    if (
+      !rowsBySession.current.get(sessionId)?.length &&
+      (knownStatus === "offline" || knownStatus === "closed")
+    ) {
+      void api.sessionPreview(sessionId, previewRequest.signal)
+        .then((preview) => {
+          if (
+            !isCurrent() || previewRequest.signal.aborted ||
+            preview?.sessionId !== sessionId || !Array.isArray(preview.messages)
+          ) return;
+          const restored = rowsFromMessages(preview.messages);
+          if (restored.length)
+            setPreviewRows({ sessionId, navigation, rows: restored });
+        })
+        .catch(() => {
+          // This read is optional, including on services without the preview route.
+        });
+    }
+
     void (async () => {
       // Open is idempotent for a live host. Prioritize the bounded transcript:
       // native reads can share a queue, so even a parallel get_state can delay it.
@@ -3441,6 +3592,8 @@ export default function App() {
         if (!isCurrent()) return;
 
         if (snapshot) {
+          previewRequest.abort();
+          setPreviewRows(null);
           traceSnapshot(snapshot, "initial");
           setRows((previous) => {
             const restored = rowsFromMessages(snapshot.messages);
@@ -3471,13 +3624,7 @@ export default function App() {
         }
         if (snapshot) {
           restoreSnapshotStatus(snapshot);
-          for (const entry of eventsAfterSnapshot(
-            snapshot.messages,
-            snapshot.events,
-          )) {
-            applyEvent(entry.event, entry.seq);
-          }
-          lastSeq.current = snapshot.lastSeq;
+          replaySnapshot(snapshot);
           after = snapshot.lastSeq;
           setSeen(snapshot.events.length);
         }
@@ -3486,7 +3633,10 @@ export default function App() {
         return;
       }
       if (!isCurrent()) return;
+      previewRequest.abort();
+      setPreviewRows(null);
       connect(after);
+      liveConnection.current = { sessionId, navigation, revision: connectionRevision, requests };
       setLoadingSession(false);
 
       // Snapshot + replay own lifecycle status. Metadata never delays first
@@ -3546,6 +3696,9 @@ export default function App() {
     return () => {
       cancelled = true;
       requests.abort();
+      previewRequest.abort();
+      if (liveConnection.current?.requests === requests)
+        liveConnection.current = null;
       if (sessionReadsAbort.current === requests)
         sessionReadsAbort.current = null;
       diagnosticsAbort.current?.abort();
@@ -3569,12 +3722,12 @@ export default function App() {
       return;
     }
     if (!sessionId) return;
-    rowsBySession.current.set(sessionId, rows);
+    rowsBySession.current.set(sessionId, liveRows);
     if (rowsBySession.current.size > 24) {
       const oldest = rowsBySession.current.keys().next().value;
       if (oldest && oldest !== sessionId) rowsBySession.current.delete(oldest);
     }
-  }, [rows, sessionId]);
+  }, [liveRows, sessionId]);
 
   const queueAbort = useRef<AbortController | null>(null);
   /** Server truth for the waiting queue; the host owns delivery. */
@@ -3662,6 +3815,21 @@ export default function App() {
         jobs.push(async () => {
           const value = await api.history(id, {}, controller.signal);
           if (!current()) return;
+          if (runActive) {
+            const timestamp = value.openOperations?.find((record) => {
+              const intent = record.intent as
+                | { kind?: unknown }
+                | null
+                | undefined;
+              return record.lane === "main" && intent?.kind === "run";
+            })?.timestamp;
+            if (
+              typeof timestamp === "number" &&
+              Number.isSafeInteger(timestamp) &&
+              timestamp > 0
+            )
+              setNativeRunStart({ binding: runClockBinding, timestamp });
+          }
           setHistory(value);
           setHistoryHasMore(value.hasMore);
         });
@@ -3705,6 +3873,7 @@ export default function App() {
       showQueueHistory,
       clearAccess,
       runActive,
+      runClockBinding,
       refreshQueue,
     ],
   );
@@ -3909,8 +4078,7 @@ export default function App() {
     const [name = "", ...rest] = raw.trim().split(/\s+/);
     const arg = rest.join(" ").trim();
     if (!slashCommands.some((command) => command.name === name)) return;
-    if ((loadingSession || connectionFailed) && !LOCAL_SLASH_COMMANDS.has(name))
-      return;
+    if (!canWriteSession() && !LOCAL_SLASH_COMMANDS.has(name)) return;
     updateDraft("");
     setError("");
     try {
@@ -3946,7 +4114,7 @@ export default function App() {
         return;
       }
       if (name === "/abort") {
-        if (!supported.has("abort")) {
+        if (!canStopRun) {
           note("/abort is not advertised by this host.");
           return;
         }
@@ -4063,6 +4231,7 @@ export default function App() {
     const scope = uploadScope.current;
     if (
       !batch.length ||
+      visiblePreview ||
       !projectId ||
       !sessionId ||
       !scope ||
@@ -4146,22 +4315,12 @@ export default function App() {
         return;
       }
     }
-    if (!forceContinue && !sessionHydrated) return;
-    if (composerContinue) {
-      if (
-        loadingSession ||
-        connectionFailed ||
-        status === "closed" ||
-        !sessionId ||
-        sendingRef.current
-      )
-        return;
-      if (interrupted && supported.has("resume_pending")) {
-        await resumePending();
-        return;
-      }
+    if (!canWriteSession() || (!forceContinue && !sessionHydrated)) return;
+    if (composerContinue && interrupted && supported.has("resume_pending")) {
+      await resumePending();
+      return;
     }
-    if (loadingSession || connectionFailed || !supported.has("prompt")) return;
+    if (!supported.has("prompt")) return;
     const attachedText = attachments.length
       ? `\n\n${t("attachedFiles")}:\n${attachments.map((file) => `- ${file.path}`).join("\n")}`
       : "";
@@ -4190,6 +4349,7 @@ export default function App() {
     };
     sendingRef.current = true;
     setSending(true);
+    setActionPending(continuing ? "continue" : "send");
     updateDraft("");
     setError("");
     setInterrupted(false);
@@ -4207,8 +4367,10 @@ export default function App() {
     try {
       if (shouldQueue) {
         if (!supported.has("queue_message")) throw new Error(t("runBusy"));
-        if (editingQueueId)
+        if (editingQueueId) {
           await api.cancelQueued(targetSession, editingQueueId);
+          if (!canWriteSession()) return;
+        }
         const queued = await api.queueMessage(
           targetSession,
           submissionMessage,
@@ -4259,25 +4421,24 @@ export default function App() {
       if (submission === sendingRevision.current) {
         sendingRef.current = false;
         setSending(false);
+        setActionPending(null, navigation);
       }
     }
   }
 
   async function resumePending() {
     if (
-      !sessionId ||
+      !canWriteSession() ||
       !supported.has("resume_pending") ||
       busy ||
-      sendingRef.current ||
-      loadingSession ||
-      connectionFailed ||
-      status === "closed"
+      sendingRef.current
     )
       return;
     const submission = ++sendingRevision.current;
+    const navigation = navigationRevision.current;
     sendingRef.current = true;
     setSending(true);
-    const navigation = navigationRevision.current;
+    setActionPending("continue", navigation);
     const cursor = lastSeq.current;
     const priorStatus = status;
     const priorActive = runActive;
@@ -4319,6 +4480,7 @@ export default function App() {
       if (submission === sendingRevision.current) {
         sendingRef.current = false;
         setSending(false);
+        setActionPending(null, navigation);
       }
     }
   }
@@ -4339,7 +4501,7 @@ export default function App() {
       previous.filter((item) => item.id !== notification.id),
     );
     if (notification.sessionId === activeSessionRef.current) {
-      if (loadingSession || !sessionHydrated || busy) {
+      if (!canWriteSession() || !sessionHydrated || busy) {
         pendingNotificationContinue.current = notification.sessionId;
         return;
       }
@@ -4354,13 +4516,13 @@ export default function App() {
     if (
       !pendingNotificationContinue.current ||
       pendingNotificationContinue.current !== sessionId ||
-      loadingSession ||
+      !liveReady ||
       !sessionHydrated
     )
       return;
     pendingNotificationContinue.current = null;
     void continueCurrent(true);
-  }, [sessionHydrated, sessionId, loadingSession, interrupted, failedRun]);
+  }, [sessionHydrated, sessionId, liveReady, interrupted, failedRun]);
 
   /** Page backwards through the branch, prepending entries older than the
    * current first row. The bridge forwards `get_messages` unchanged, so this is
@@ -4548,7 +4710,7 @@ export default function App() {
   }
 
   async function clearQueue() {
-    if (!sessionId || !supported.has("clear_queue")) return;
+    if (!canWriteSession() || !supported.has("clear_queue")) return;
     const navigation = navigationRevision.current;
     try {
       await api.clearQueue(sessionId);
@@ -4599,7 +4761,7 @@ export default function App() {
     const targetSession = sessionId;
     const item = pendingQueueItems.find((queued) => queued.entryId === entryId);
     if (
-      !targetSession ||
+      !canWriteSession() ||
       (busy && !runActive) ||
       queueRunning ||
       !item?.text?.trim() ||
@@ -4651,7 +4813,7 @@ export default function App() {
         text: item.text.trim(),
         queuedAt: Date.now(),
       });
-      if (!running)
+      if (!running && canWriteSession())
         await commandData(targetSession, "prompt", {
           message: item.text.trim(),
         });
@@ -4676,7 +4838,7 @@ export default function App() {
   }
 
   async function queuePrompt() {
-    if (!sessionId || !queueDraft.trim() || !supported.has("queue_message"))
+    if (!canWriteSession() || !queueDraft.trim() || !supported.has("queue_message"))
       return;
     if (queueSubmission.current.has(sessionId)) return;
     const message = queueDraft.trim();
@@ -4685,7 +4847,10 @@ export default function App() {
     queueSubmission.current.add(sessionId);
     const navigation = navigationRevision.current;
     try {
-      if (editingId) await api.cancelQueued(sessionId, editingId);
+      if (editingId) {
+        await api.cancelQueued(sessionId, editingId);
+        if (!canWriteSession()) return;
+      }
       const queued = await api.queueMessage(sessionId, message, "followUp");
       if (navigation !== navigationRevision.current) return;
       setQueueItems((previous) => [
@@ -4719,7 +4884,7 @@ export default function App() {
   }
 
   async function editQueued(item: QueueItem) {
-    if (!isEditableQueueItem(item) || !sessionId) return;
+    if (!canWriteSession() || !isEditableQueueItem(item)) return;
     // The reported kind is `QueueKind::as_str()`, which spells the next-run
     // queue `nextRun` while `queue_message` accepts only `nextTurn`. Re-sending
     // the raw value fails after `cancel_queued` removed the entry, losing the
@@ -4763,6 +4928,7 @@ export default function App() {
   }
 
   async function cancelQueued(entryId: string) {
+    if (!canWriteSession()) return;
     const navigation = navigationRevision.current;
     const previous = queueItems;
     if (queueEditId === entryId) cancelQueueEdit();
@@ -4918,10 +5084,28 @@ export default function App() {
   }
 
   async function abort() {
-    if (!sessionId || !supported.has("abort")) return;
+    if (!canWriteSession()) return;
     const navigation = navigationRevision.current;
     const targetSession = sessionId;
+    // Use the queue-preserving stop command when the host advertises it.
+    // `abort` is the fallback for older hosts: it drains steering/follow-up
+    // queues and hands them back, which is useful for recovery but is the old
+    // Stop behaviour being fixed here.
+    const preserveQueue = stopPreservesQueue;
+    if (!preserveQueue && !hostSupports("abort")) return;
+    // Spin until the host acknowledges the stop, so the click is visibly
+    // accepted even though the run is still winding down.
+    setActionPending("stop", navigation);
     try {
+      if (preserveQueue) {
+        await commandData<StopRunResult>(targetSession, "stop_run");
+        if (navigation !== navigationRevision.current) return;
+        // The host left the queue alone: keep the table rows and do not restore
+        // the staged text into the composer. The queue read is authoritative
+        // after the command acknowledgement, even if the poll won this race.
+        await refreshQueue(targetSession);
+        return;
+      }
       const result = await commandData<AbortResult>(targetSession, "abort");
       if (navigation !== navigationRevision.current) return;
       // The native host drains both queues as part of the cancel and hands the
@@ -4960,6 +5144,8 @@ export default function App() {
       setSendNowSent(null);
       if (targetSession === activeSessionRef.current)
         void refreshQueue(targetSession);
+    } finally {
+      setActionPending(null, navigation);
     }
   }
 
@@ -5031,6 +5217,7 @@ export default function App() {
       setProjectId(nextProject);
     }
     setLoadingSession(Boolean(id));
+    setPreviewRows(null);
     // A preview restored from `?file=` belongs to the view that asked for it.
     setLinkedPreview(null);
     rowsSessionRef.current = id;
@@ -5180,14 +5367,56 @@ export default function App() {
   ) {
     const entries = targets.filter((session) => !retirementBusy(session));
     if (!entries.length) return;
-    // One metadata write at a time: the native host is a single child process,
-    // and a burst of parallel writes neither helps nor reports better. Each
-    // failure still surfaces through updateSessionMetadata's own banner.
+    const metadata = {
+      ...patch,
+      ...(patch.archived ? { pinned: undefined } : {}),
+    };
+    const navigation = navigationRevision.current;
+    if (actions.has("session_bulk_metadata")) {
+      try {
+        const result = await api.bulkSessionMetadata(
+          entries.map((session) => session.sessionId),
+          metadata,
+        );
+        const list = await refreshSessions();
+        if (
+          !list ||
+          navigation !== navigationRevision.current ||
+          !result.updated.length
+        )
+          return;
+        if (
+          patch.archived &&
+          result.updated.includes(activeSessionRef.current)
+        ) {
+          const active = entries.find(
+            (session) => session.sessionId === activeSessionRef.current,
+          );
+          const next = list.find(
+            (entry) =>
+              entry.projectId === active?.projectId &&
+              !entry.archived &&
+              !entry.deleting,
+          );
+          // Archiving from the sidebar should leave the menu open so
+          // repeated session management does not need a reopen each time.
+          select(next?.sessionId ?? "", next?.projectId ?? active?.projectId, {
+            keepSidebarOpen: true,
+          });
+        }
+        for (const skipped of result.skipped) {
+          if (navigation !== navigationRevision.current) return;
+          setError(errorText(new ApiError(skipped.error, 409, skipped.code)));
+        }
+      } catch (cause) {
+        if (navigation === navigationRevision.current)
+          setError(errorText(cause));
+      }
+      return;
+    }
+    // Legacy fallback: older services only expose a single-session endpoint.
     for (const session of entries) {
-      await updateSessionMetadata(session, {
-        ...patch,
-        ...(patch.archived ? { pinned: undefined } : {}),
-      });
+      await updateSessionMetadata(session, metadata);
     }
   }
 
@@ -5554,6 +5783,7 @@ export default function App() {
                   <button
                     type="button"
                     className="text-button"
+                    disabled={!liveReady}
                     onClick={() => void clearQueue()}
                   >
                     {t("clear")}
@@ -5592,7 +5822,7 @@ export default function App() {
                         aria-label={`${t("sendNow")}: ${item.text}`}
                         onClick={() => void sendQueuedNow(item.entryId)}
                         disabled={
-                          queueRunning ||
+                          !liveReady || queueRunning ||
                           (sendNowPending?.entryId === item.entryId &&
                             sendNowPending?.sessionId === sessionId) ||
                           (sendNowSent?.entryId === item.entryId &&
@@ -5617,6 +5847,7 @@ export default function App() {
                     className="icon-button"
                     title={t("editQueued")}
                     aria-label={t("editQueued")}
+                    disabled={!liveReady}
                     onClick={() => editQueued(item)}
                   >
                     <SquarePen size={13} />
@@ -5626,6 +5857,7 @@ export default function App() {
                     className="icon-button"
                     title={t("cancelQueued")}
                     aria-label={t("cancelQueued")}
+                    disabled={!liveReady}
                     onClick={() => void cancelQueued(item.entryId)}
                   >
                     <X size={13} />
@@ -5639,6 +5871,7 @@ export default function App() {
               <input
                 ref={queueInputRef}
                 value={queueDraft}
+                disabled={!liveReady}
                 onChange={(event) => {
                   queueDraftRevision.current++;
                   setQueueDraft(event.target.value);
@@ -5652,7 +5885,7 @@ export default function App() {
               <button
                 type="button"
                 onClick={() => void queuePrompt()}
-                disabled={!queueDraft.trim()}
+                disabled={!liveReady || !queueDraft.trim()}
               >
                 {t("queue")}
               </button>
@@ -6379,7 +6612,6 @@ export default function App() {
               language={language}
               creating={creatingSession}
               canManage={actions.has("session_organization")}
-              canFork={actions.has("fork")}
               canClone={actions.has("clone")}
               canCreate={actions.has("create_project")}
               onSelectProject={selectProject}
@@ -6387,7 +6619,6 @@ export default function App() {
               onNewSession={(id) => void createSession(id)}
               onNewProject={() => setProjectDialog(true)}
               onRename={setRenameTarget}
-              onFork={(session) => void forkSession(session)}
               onClone={(session) => void cloneSession(session)}
               onBulkMetadata={(entries, patch) =>
                 bulkSessionMetadata(entries, patch)
@@ -7097,8 +7328,8 @@ export default function App() {
                                   language={language}
                                   onSpeak={speakMessage}
                                   readingRowId={readingRowId}
-                                  onFork={(entryId) =>
-                                    void forkCurrent(entryId)
+                                  onFork={
+                                    visiblePreview ? undefined : (entryId) => void forkCurrent(entryId)
                                   }
                                   forkPending={forkPending}
                                   assistantStreamRevision={
@@ -7218,8 +7449,7 @@ export default function App() {
                       className="slash-item"
                       disabled={
                         !command.enabled ||
-                        ((loadingSession || connectionFailed) &&
-                          !LOCAL_SLASH_COMMANDS.has(command.name))
+                        (!liveReady && !LOCAL_SLASH_COMMANDS.has(command.name))
                       }
                       onClick={() => void runSlash(command.name)}
                     >
@@ -7275,7 +7505,7 @@ export default function App() {
                                     void sendQueuedNow(item.entryId)
                                   }
                                   disabled={
-                                    queueRunning ||
+                                    !liveReady || queueRunning ||
                                     (sendNowPending?.entryId === item.entryId &&
                                       sendNowPending?.sessionId ===
                                         sessionId) ||
@@ -7301,6 +7531,7 @@ export default function App() {
                               className="icon-button"
                               aria-label={t("editQueued")}
                               title={t("editQueued")}
+                              disabled={!liveReady}
                               onClick={() => editQueued(item)}
                             >
                               <SquarePen size={13} />
@@ -7310,6 +7541,7 @@ export default function App() {
                               className="icon-button"
                               aria-label={t("cancelQueued")}
                               title={t("cancelQueued")}
+                              disabled={!liveReady}
                               onClick={() => void cancelQueued(item.entryId)}
                             >
                               <X size={13} />
@@ -7369,8 +7601,9 @@ export default function App() {
                 <textarea
                   ref={composerInputRef}
                   value={draft}
+                  readOnly={Boolean(visiblePreview)}
                   onPaste={(event) => {
-                    if (!sessionId || !projectId) return;
+                    if (visiblePreview || !sessionId || !projectId) return;
                     const clipboard = event.clipboardData;
                     const files = Array.from(clipboard.files);
                     // Some browsers expose clipboard files only through items.
@@ -7457,7 +7690,7 @@ export default function App() {
                       className="composer-attach"
                       aria-label={t("attachFiles")}
                       title={t("attachFiles")}
-                      disabled={!sessionId || !projectId || uploading}
+                      disabled={Boolean(visiblePreview) || !sessionId || !projectId || uploading}
                       onClick={() => fileInputRef.current?.click()}
                     >
                       {uploading ? (
@@ -7514,7 +7747,7 @@ export default function App() {
                       // makes long-press-for-newline impossible. The button and
                       // the desktop Enter handler both call `submit()` instead.
                       type="button"
-                      className={`send-button${composerAbort && !composerRunningSend ? " composer-action-stop" : composerContinue ? " composer-action-continue" : ""}`}
+                      className={`send-button${composerActionPending === "stop" || (!composerActionPending && composerAbort && !composerRunningSend) ? " composer-action-stop" : composerActionPending === "continue" || (!composerActionPending && composerContinue) ? " composer-action-continue" : ""}${composerActionPending ? " composer-action-pending" : ""}`}
                       aria-label={
                         composerRunningSend
                           ? t("send")
@@ -7534,7 +7767,7 @@ export default function App() {
                               : t("send")
                       }
                       disabled={
-                        (!localSlash && (loadingSession || connectionFailed)) ||
+                        (!localSlash && !liveReady) ||
                         (!composerAbort &&
                           ((!composerContinue &&
                             !composerRunningSend &&
@@ -7549,8 +7782,22 @@ export default function App() {
                           ? () => void abort()
                           : () => void submit()
                       }
+                      aria-busy={composerActionPending !== null}
                     >
-                      {composerAbort && !composerRunningSend ? (
+                      {composerActionPending ? (
+                        <span
+                          className="composer-action-progress"
+                          aria-hidden="true"
+                        >
+                          {composerActionPending === "stop" ? (
+                            <span className="stop-indicator" />
+                          ) : composerActionPending === "continue" ? (
+                            <Play size={15} aria-hidden="true" />
+                          ) : (
+                            <ArrowUp size={15} />
+                          )}
+                        </span>
+                      ) : composerAbort && !composerRunningSend ? (
                         <span className="stop-indicator" aria-hidden="true" />
                       ) : composerContinue ? (
                         <Play size={17} aria-hidden="true" />
@@ -7588,18 +7835,17 @@ export default function App() {
                         : "—"}
                     </strong>
                   </span>
-                  <span
-                    className="composer-metric"
-                    title={t("sessionWorkTotal")}
-                    aria-label={`${t("sessionWork")}: ${sessionWorkMs == null ? "—" : formatRunDuration(sessionWorkMs)}`}
-                  >
-                    <Timer size={12} aria-hidden="true" />
-                    <strong>
-                      {sessionWorkMs == null
-                        ? "—"
-                        : formatRunDuration(sessionWorkMs)}
-                    </strong>
-                  </span>
+                  <SessionWork
+                    key={runClockBinding}
+                    completedMs={sessionWorkMs}
+                    running={runActive && !loadingSession && !connectionFailed}
+                    startedAt={
+                      nativeRunStart?.binding === runClockBinding
+                        ? nativeRunStart.timestamp
+                        : undefined
+                    }
+                    language={language}
+                  />
                   <button
                     type="button"
                     className="slim-metrics-more"
@@ -7655,19 +7901,6 @@ export default function App() {
                 )
               }
               preference={readModelPreference(projectId)}
-              onSaveDefault={(selected, thinkingLevel) => {
-                writeModelPreference(projectId, {
-                  provider: selected.provider,
-                  modelId: selected.id,
-                  thinkingLevel,
-                });
-                setModelPreferenceRevision((value) => value + 1);
-                note(
-                  language === "zh"
-                    ? `默认模型和思考深度 → ${selected.name} (${selected.provider}) / ${thinkingLevel}`
-                    : `Default model and thinking level → ${selected.name} (${selected.provider}) / ${thinkingLevel}`,
-                );
-              }}
               onClearModelPreference={() => {
                 const previous = readModelPreference(projectRef.current);
                 writeModelPreference(
@@ -8416,53 +8649,61 @@ function ToolRowView({
     isRead && row.status !== "error" ? readOutput(row.result) : null;
   const readResult = readResultText !== null;
   const readPath = isRead ? pathOfArgs(row.args) : "";
-  const summary = toolSummary(row.name, row.args, row.status, language);
-  return (
-    <ToolDisclosure
-      expansion={expansion}
-      toolName={row.name}
-      {...summary}
-      status={row.status}
+  const showReadImages =
+    isRead && row.status !== "error" && !!row.images?.length;
+  const filename = readPath.split(/[\\/]/).pop();
+  const images = row.images?.map((image, index) => (
+    <ImagePreview
+      key={`${row.id}-image-${index}`}
+      image={showReadImages && !image.alt ? { ...image, alt: filename } : image}
       language={language}
-      timing={
-        row.timing && <ToolElapsed timing={row.timing} language={language} />
-      }
-    >
-      <div className="tool-detail">
-        {row.images?.map((image, index) => (
-          <ImagePreview
-            key={`${row.id}-image-${index}`}
-            image={image}
-            language={language}
-          />
-        ))}
-        {row.args !== undefined && (
-          <>
-            <h4>{t("input")}</h4>
-            <pre className="tool-arguments">{safeJson(row.args)}</pre>
-          </>
-        )}
-        <h4>{t("output")}</h4>
-        {readResult ? (
-          <ReadCode
-            path={readPath}
-            text={readResultText ?? ""}
-            language={language}
-          />
-        ) : resultText !== null ? (
-          isMarkdownText(resultText) ? (
-            <MarkdownBody text={resultText} language={language} />
-          ) : (
-            <pre className="tool-result-pre">{resultText}</pre>
-          )
-        ) : row.result !== undefined ? (
-          <pre>{safeJson(row.result)}</pre>
-        ) : (
-          <pre className="muted">{t("noOutput")}</pre>
-        )}
-        {history}
-      </div>
-    </ToolDisclosure>
+    />
+  ));
+  const summary = toolSummary(row.name, row.args, row.status, language);
+  const output = readResult ? (
+    <ReadCode path={readPath} text={readResultText} language={language} />
+  ) : showReadImages ? null : resultText !== null ? (
+    isMarkdownText(resultText) ? (
+      <MarkdownBody text={resultText} language={language} />
+    ) : (
+      <pre className="tool-result-pre">{resultText}</pre>
+    )
+  ) : row.result !== undefined ? (
+    <pre>{safeJson(row.result)}</pre>
+  ) : (
+    <pre className="muted">{t("noOutput")}</pre>
+  );
+  return (
+    <>
+      <ToolDisclosure
+        expansion={expansion}
+        toolName={row.name}
+        {...summary}
+        status={row.status}
+        language={language}
+        timing={
+          row.timing && <ToolElapsed timing={row.timing} language={language} />
+        }
+      >
+        <div className="tool-detail">
+          {!showReadImages && images}
+          {row.args !== undefined && (
+            <>
+              <h4>{t("input")}</h4>
+              <pre className="tool-arguments">{safeJson(row.args)}</pre>
+            </>
+          )}
+          {output && (
+            <>
+              <h4>{t("output")}</h4>
+              {output}
+            </>
+          )}
+          {history}
+        </div>
+      </ToolDisclosure>
+      {showReadImages && <div className="read-image-previews">{images}</div>}
+    </>
   );
 }
 
@@ -8917,7 +9158,6 @@ function RuntimePanel({
   onModelSelected,
   onThinkingSelected,
   preference,
-  onSaveDefault,
   onClearModelPreference,
   onClearThinkingPreference,
   details,
@@ -8935,7 +9175,6 @@ function RuntimePanel({
   onModelSelected: ModelSelected;
   onThinkingSelected: (level: string) => void;
   preference: ModelPreference | null;
-  onSaveDefault: (model: ModelDescriptor, thinkingLevel: string) => void;
   onClearModelPreference: () => void;
   onClearThinkingPreference: () => void;
   details?: ReactNode;
@@ -8946,11 +9185,6 @@ function RuntimePanel({
     translate(language, key, values);
   const [models, setModels] = useState<ModelDescriptor[]>([]);
   const [levels, setLevels] = useState<string[]>([]);
-  const [defaultModelId, setDefaultModelId] = useState("");
-  const [defaultThinkingLevel, setDefaultThinkingLevel] = useState("");
-  // The pickers seed from the saved pair, but a choice the user has started
-  // must survive catalog refreshes (runtime model changes, thinking changes).
-  const defaultTouched = useRef(false);
   const context = runtime?.context ?? null;
   const [catalog, setCatalog] = useState<ToolCatalog | null>(null);
   const [providersOpen, setProvidersOpen] = useState(false);
@@ -8965,9 +9199,6 @@ function RuntimePanel({
     setPending("");
     setModels([]);
     setLevels([]);
-    setDefaultModelId("");
-    setDefaultThinkingLevel("");
-    defaultTouched.current = false;
     setCatalog(null);
     return () => {
       mounted.current = false;
@@ -9010,30 +9241,6 @@ function RuntimePanel({
     };
   }, [onError, sessionId, supported, runtime?.modelId, runtime?.provider]);
 
-  // Seed the default pair from what this browser remembers, once per session
-  // and after an explicit save. A catalog refresh must not overwrite a choice
-  // the user has already made but not yet saved.
-  useEffect(() => {
-    if (defaultTouched.current) return;
-    const remembered = models.find(
-      (entry) =>
-        entry.id === preference?.modelId &&
-        entry.provider === preference?.provider,
-    );
-    setDefaultModelId(remembered ? modelKey(remembered) : "");
-    setDefaultThinkingLevel(
-      preference?.thinkingLevel && levels.includes(preference.thinkingLevel)
-        ? preference.thinkingLevel
-        : "",
-    );
-  }, [
-    models,
-    levels,
-    preference?.provider,
-    preference?.modelId,
-    preference?.thinkingLevel,
-  ]);
-
   async function run(
     label: string,
     action: () => Promise<RuntimeState | void>,
@@ -9063,11 +9270,6 @@ function RuntimePanel({
       entry.id === runtime?.modelId && entry.provider === runtime?.provider,
   );
   const level = normalizeLevel(runtime?.thinkingLevel);
-  const defaultModel = models.find(
-    (entry) => modelKey(entry) === defaultModelId,
-  );
-  const canSaveDefault =
-    Boolean(defaultModel && defaultThinkingLevel) && pending === "";
   const active = new Set(catalog?.activeTools ?? runtime?.activeTools ?? []);
   const heading = (
     <div className="panel-heading">
@@ -9122,76 +9324,8 @@ function RuntimePanel({
       </button>
       <p className="muted">
         {zh
-          ? "默认模型与思考档位会一起保存，仅用于此浏览器的未来新会话；已有会话不变。请确认两项都可选后再保存。"
-          : "Save a default model and thinking level together for future new sessions only in this browser; existing sessions are unchanged. Confirm both choices are available before saving."}
-        {defaultModel && defaultThinkingLevel && (
-          <>
-            {" "}
-            {defaultModel.provider}/{defaultModel.id}:{defaultThinkingLevel}
-          </>
-        )}
-      </p>
-      <label htmlFor="default-model">{zh ? "默认模型" : "Default model"}</label>
-      <MenuSelect
-        label={zh ? "默认模型" : "Default model"}
-        value={defaultModelId}
-        disabled={
-          !supported.has("set_model") || pending !== "" || models.length === 0
-        }
-        onChange={(value) => {
-          defaultTouched.current = true;
-          setDefaultModelId(value);
-        }}
-        options={[
-          { value: "", label: "—" },
-          ...models.map((entry) => ({
-            value: modelKey(entry),
-            label: `${entry.name} (${entry.provider})`,
-          })),
-        ]}
-      />
-      <label htmlFor="default-thinking">
-        {zh ? "默认思考深度" : "Default thinking level"}
-      </label>
-      <MenuSelect
-        label={zh ? "默认思考深度" : "Default thinking level"}
-        value={defaultThinkingLevel}
-        disabled={
-          !supported.has("set_thinking_level") ||
-          pending !== "" ||
-          levels.length === 0
-        }
-        onChange={(value) => {
-          defaultTouched.current = true;
-          setDefaultThinkingLevel(value);
-        }}
-        options={[
-          { value: "", label: "—" },
-          ...levels.map((entry) => ({
-            value: entry,
-            label: valueLabel(language, entry),
-          })),
-        ]}
-      />
-      <button
-        type="button"
-        disabled={!canSaveDefault}
-        onClick={() => {
-          if (!defaultModel || !defaultThinkingLevel) return;
-          onSaveDefault(defaultModel, defaultThinkingLevel);
-          // The saved pair is now the source of truth again, so a later
-          // catalog refresh may re-seed the pickers from it.
-          defaultTouched.current = false;
-        }}
-      >
-        {zh
-          ? "保存默认模型和思考深度"
-          : "Save default model and thinking level"}
-      </button>
-      <p className="muted">
-        {zh
-          ? "当前会话显式选择的模型会单独记住，仅用于未来新会话；已有会话不变。"
-          : "Explicit model choices are remembered individually for future new sessions only; existing sessions are unchanged."}
+          ? "成功选择的模型会在此浏览器中按项目记住，仅用于未来新会话；已有会话不变。"
+          : "Successful model choices are remembered in this browser per project for future new sessions only; existing sessions are unchanged."}
         {preference?.provider && preference.modelId && (
           <>
             {" "}
@@ -9272,8 +9406,8 @@ function RuntimePanel({
       />
       <p className="muted">
         {zh
-          ? "当前会话显式选择的思考深度会单独记住，仅用于未来新会话；已有会话不变。"
-          : "Explicit thinking level choices are remembered individually for future new sessions only; existing sessions are unchanged."}
+          ? "成功选择的思考深度会在此浏览器中按项目记住，仅用于未来新会话；已有会话不变。"
+          : "Successful thinking level choices are remembered in this browser per project for future new sessions only; existing sessions are unchanged."}
         {preference?.thinkingLevel ? (
           <> {valueLabel(language, preference.thinkingLevel)}</>
         ) : null}

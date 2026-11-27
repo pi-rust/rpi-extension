@@ -410,3 +410,5 @@ python3 .github/scripts/github-release.py plan --repository pi-rust/rpi-extensio
 The `plan` command prints the selection and source commit without creating tags
 or releases. `task publish-dry-run` remains available for a local preflight.
 `task pack` also creates a directly installable platform bundle under `dist/`.
+
+Delegated child observation and cancellation are exposed through native-capability-gated [core services](packages/rpi-extcore/README.md#native-delegated-child-observation--原生子-agent-观察) and [HTTP routes](packages/rpi-httpcore/README.md#delegated-children--委派子-agent). Observations are bounded and volatile; this does not add independent child sessions.

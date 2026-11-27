@@ -1,5 +1,5 @@
 //! Invocation-local engine. Host identities exist only in Rust-owned guards.
-use crate::heap::Heap;
+use rpi_plugin_sdk::quickjs::Heap;
 use rquickjs::{
     context::intrinsic, Context, Ctx, Exception, Function, Persistent, Promise, Runtime,
 };

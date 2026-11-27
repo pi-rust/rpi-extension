@@ -12,10 +12,12 @@ use crate::graph::{
 use crate::kit::{
     content_only, optional_string, optional_trimmed, progress, string_param, Progress,
 };
+use crate::runtime::Registration;
 use crate::spawn;
 use serde_json::Value;
 
 pub fn subagent(
+    registration: &Registration,
     params: &Value,
     control: &Control,
     progress_tx: &Progress,
@@ -45,7 +47,7 @@ pub fn subagent(
     // session's agent dir but *not* its binding, so a call that names neither
     // would silently resolve the default provider from settings. Default to the
     // binding the host reports for this session and pass it down explicitly.
-    let selection = crate::host::parent_selection(params).effective(
+    let selection = crate::host::parent_selection(registration.host.as_ref(), params).effective(
         optional_trimmed(params, "provider").as_deref(),
         optional_trimmed(params, "model").as_deref(),
     );
@@ -58,6 +60,7 @@ pub fn subagent(
         selection.provider(),
         selection.model(),
         control,
+        crate::host::tool_cwd(params),
     )?;
     Ok(content_only(&format!(
         "[subagent role={role} turns<={max_turns} timeout={timeout_secs}s provider={} model={}]\n{output}",
@@ -73,7 +76,7 @@ mod tests {
     fn run(params: &Value) -> Result<String, String> {
         let control = Control::default();
         let (tx, _rx) = std::sync::mpsc::channel();
-        subagent(params, &control, &tx)
+        subagent(&Registration::default(), params, &control, &tx)
     }
 
     #[test]

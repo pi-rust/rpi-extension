@@ -15,6 +15,7 @@ use crate::bridge::Pane;
 use crate::catalog::{self, CatalogEntry, Host};
 use crate::protocol::now_ms;
 use crate::server::{Server, ToolOutput};
+use crate::Registration;
 use rpi_plugin_sdk::handles::ToolHandles;
 use rpi_plugin_sdk::{
     PluginApi, StableToolSchema, StbString, StbStringRef, StepHandle, StepResult, ToolCancelFn,
@@ -22,6 +23,7 @@ use rpi_plugin_sdk::{
 };
 use serde_json::{json, Value};
 use std::sync::mpsc::{Receiver, TryRecvError};
+use std::sync::{Arc, Weak};
 use std::time::Duration;
 
 /// How long one proxied Office.js call may take before the bridge gives up.
@@ -42,24 +44,40 @@ panel), then try again.";
 /// enforces that.
 macro_rules! office_tools {
     ($($fn_name:ident => $tool:literal),* $(,)?) => {
-        $(
-            // `execute_handler!` owns the raw-pointer half of the ABI: it turns
-            // the call id into `&str` and adopts `params` as an `OwnedString`
-            // that reclaims itself through the host's deallocator, so this crate
-            // needs no `unsafe` for any of the 33 trampolines.
-            rpi_plugin_sdk::execute_handler! {
-                fn $fn_name(id, params) {
-                    execute_named($tool, id, params)
+        impl<const SLOT: usize> Executors<SLOT> {
+            $(
+                rpi_plugin_sdk::execute_handler! {
+                    fn $fn_name(_id, params) {
+                        execute_named(SLOT, $tool, params)
+                    }
                 }
-            }
-        )*
+            )*
 
-        /// `(tool name, trampoline)` pairs in registration order.
-        const EXECUTORS: &[(&str, ToolExecuteFn)] = &[
-            $(($tool, $fn_name as ToolExecuteFn)),*
-        ];
+            const CALLBACKS: &[(&str, ToolExecuteFn)] = &[
+                $(($tool, Self::$fn_name as ToolExecuteFn)),*
+            ];
+        }
     };
 }
+
+struct Executors<const SLOT: usize>;
+
+// Tool execute has no owner parameter. Each slot has a set of SDK trampolines
+// that bind both the registration and the tool name into the function pointer.
+macro_rules! executor_slots {
+    ($($slot:literal),+ $(,)?) => {
+        &[$(Executors::<$slot>::CALLBACKS),+]
+    };
+}
+
+pub(super) const EXECUTOR_SLOTS: &[&[(&str, ToolExecuteFn)]] = executor_slots![
+    0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25,
+    26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49,
+    50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64, 65, 66, 67, 68, 69, 70, 71, 72, 73,
+    74, 75, 76, 77, 78, 79, 80, 81, 82, 83, 84, 85, 86, 87, 88, 89, 90, 91, 92, 93, 94, 95, 96, 97,
+    98, 99, 100, 101, 102, 103, 104, 105, 106, 107, 108, 109, 110, 111, 112, 113, 114, 115, 116,
+    117, 118, 119, 120, 121, 122, 123, 124, 125, 126, 127,
+];
 
 office_tools! {
     tool_office_excel_get_overview => "office_excel_get_overview",
@@ -100,6 +118,7 @@ office_tools! {
 /// One in-flight (or immediately finished) tool call.
 struct CallDrive {
     id: String,
+    server: Weak<Server>,
     /// `None` when the call never started; `immediate` then holds the reason.
     receiver: Option<Receiver<Result<ToolOutput, String>>>,
     immediate: Option<String>,
@@ -108,29 +127,6 @@ struct CallDrive {
 }
 
 static HANDLES: ToolHandles<CallDrive> = ToolHandles::new();
-
-/// Server accessor installed by the plugin root (keeps this module host-free).
-pub type ServerLookup = fn() -> Option<std::sync::Arc<Server>>;
-
-/// Provider of the attached panes, for the discovery tool.
-pub type PaneLookup = fn() -> Vec<Pane>;
-
-static SERVER_LOOKUP: std::sync::OnceLock<ServerLookup> = std::sync::OnceLock::new();
-static PANE_LOOKUP: std::sync::OnceLock<PaneLookup> = std::sync::OnceLock::new();
-
-/// Wire the tool drive to the plugin's bridge state. Idempotent per process.
-pub fn install(server: ServerLookup, panes: PaneLookup) {
-    let _ = SERVER_LOOKUP.set(server);
-    let _ = PANE_LOOKUP.set(panes);
-}
-
-fn server() -> Option<std::sync::Arc<Server>> {
-    SERVER_LOOKUP.get().and_then(|lookup| lookup())
-}
-
-fn panes() -> Vec<Pane> {
-    PANE_LOOKUP.get().map(|lookup| lookup()).unwrap_or_default()
-}
 
 /// Strip the host-injected `__rpi` metadata from tool arguments.
 pub fn strip_host_context(params: &mut Value) {
@@ -186,8 +182,7 @@ target for the office_* tools."
 }
 
 /// Render the discovery-tool table for `office_list_documents`.
-pub fn list_documents_text(host: Option<Host>) -> String {
-    let all = panes();
+fn list_documents_text(all: &[Pane], host: Option<Host>) -> String {
     let selected: Vec<&Pane> = all
         .iter()
         .filter(|pane| host.map(|host| pane.host == host).unwrap_or(true))
@@ -228,8 +223,8 @@ pub fn list_documents_text(host: Option<Host>) -> String {
 /* ── ABI drive ─────────────────────────────────────────────────────── */
 
 fn execute_named(
+    slot: usize,
     tool: &str,
-    _tool_call_id: &str,
     params: rpi_plugin_sdk::callbacks::OwnedString,
 ) -> StepHandle {
     let mut args: Value = serde_json::from_str(&params.to_string_lossy()).unwrap_or(Value::Null);
@@ -237,25 +232,28 @@ fn execute_named(
     if !args.is_object() {
         args = json!({});
     }
+    let Some(registration) = Registration::for_tool(slot) else {
+        return HANDLES.insert(CallDrive::failing(OFFLINE_ERROR));
+    };
     let drive = if tool == OFFICE_LIST_TOOL {
         let host = args
             .get("host")
             .and_then(Value::as_str)
             .and_then(Host::parse);
-        CallDrive::ready(list_documents_text(host))
+        CallDrive::ready(list_documents_text(&registration.panes(), host))
     } else {
         match catalog::catalog().entry_by_name(tool) {
-            Some(entry) => start_call(entry.host, &entry.op, args),
+            Some(entry) => start_call(registration.server(), entry.host, &entry.op, args),
             None => CallDrive::failing("office-bridge: unknown office tool"),
         }
     };
     HANDLES.insert(drive)
 }
 
-fn start_call(host: Host, op: &str, args: Value) -> CallDrive {
+fn start_call(server: Option<Arc<Server>>, host: Host, op: &str, args: Value) -> CallDrive {
     let id = crate::protocol::next_call_id("tool");
     let deadline = now_ms() + TOOL_CALL_TIMEOUT.as_millis() as u64;
-    let Some(server) = server() else {
+    let Some(server) = server else {
         return CallDrive::failing(OFFLINE_ERROR);
     };
     let (tx, rx) = std::sync::mpsc::channel();
@@ -264,6 +262,7 @@ fn start_call(host: Host, op: &str, args: Value) -> CallDrive {
         .err();
     CallDrive {
         id,
+        server: Arc::downgrade(&server),
         receiver: Some(rx),
         immediate,
         deadline,
@@ -272,6 +271,15 @@ fn start_call(host: Host, op: &str, args: Value) -> CallDrive {
 }
 
 impl CallDrive {
+    fn cancel(&mut self) {
+        if !self.cancel_sent {
+            self.cancel_sent = true;
+            if let Some(server) = self.server.upgrade() {
+                let _ = server.cancel_call(&self.id);
+            }
+        }
+    }
+
     /// A drive that already has its answer (or its error).
     fn ready(text: String) -> Self {
         Self::with_result(Ok(ToolOutput {
@@ -283,6 +291,7 @@ impl CallDrive {
     fn failing(reason: &str) -> Self {
         Self {
             id: crate::protocol::next_call_id("tool"),
+            server: Weak::new(),
             receiver: None,
             immediate: Some(reason.to_string()),
             deadline: now_ms(),
@@ -295,6 +304,7 @@ impl CallDrive {
         let _ = tx.send(result);
         Self {
             id: crate::protocol::next_call_id("tool"),
+            server: Weak::new(),
             receiver: Some(rx),
             immediate: None,
             deadline: now_ms() + TOOL_CALL_TIMEOUT.as_millis() as u64,
@@ -321,12 +331,7 @@ extern "C" fn poll(
     let cancelled = entry.cancelled.load(std::sync::atomic::Ordering::SeqCst);
     let mut drive = entry.lock();
     if cancelled {
-        if !drive.cancel_sent {
-            drive.cancel_sent = true;
-            if let Some(server) = server() {
-                let _ = server.cancel_call(&drive.id);
-            }
-        }
+        drive.cancel();
         return StepResult::err(StbString::from_string(
             "office-bridge: tool call aborted by the agent".into(),
         ));
@@ -350,9 +355,7 @@ extern "C" fn poll(
         )),
         Err(TryRecvError::Empty) => {
             if now_ms() > drive.deadline {
-                if let Some(server) = server() {
-                    let _ = server.cancel_call(&drive.id);
-                }
+                drive.cancel();
                 return StepResult::err(StbString::from_string(format!(
                     "office-bridge: tool call timed out after {}s",
                     TOOL_CALL_TIMEOUT.as_secs()
@@ -374,7 +377,7 @@ extern "C" fn destroy(handle: StepHandle) {
 /// Register every catalog tool plus the discovery tool.
 ///
 /// Returns 0 on success, otherwise the host's nonzero registration status.
-pub fn register(api: &PluginApi) -> i32 {
+pub(super) fn register(api: &PluginApi, slot: usize) -> i32 {
     let Some(register_tool) = api.register_tool else {
         return 1;
     };
@@ -382,7 +385,7 @@ pub fn register(api: &PluginApi) -> i32 {
     // `plugin_free_string` below. Freeing them here as well is a double free
     // (observed as a libmalloc abort on macOS), so the `StableToolSchema` is
     // only dropped: it is `Copy` and owns nothing.
-    for (name, execute) in EXECUTORS {
+    for (name, execute) in EXECUTOR_SLOTS[slot] {
         let schema = match catalog::catalog().entry_by_name(name) {
             Some(entry) if *name != OFFICE_LIST_TOOL => catalog_schema(entry),
             _ => list_schema(),
@@ -466,9 +469,9 @@ mod tests {
             .map(|entry| entry.name.as_str())
             .collect();
         expected.push(OFFICE_LIST_TOOL);
-        let actual: Vec<&str> = EXECUTORS.iter().map(|(name, _)| *name).collect();
+        let actual: Vec<&str> = EXECUTOR_SLOTS[0].iter().map(|(name, _)| *name).collect();
         assert_eq!(actual, expected, "tool trampolines must follow the catalog");
-        assert_eq!(EXECUTORS.len(), 33);
+        assert_eq!(EXECUTOR_SLOTS[0].len(), 33);
     }
 
     #[test]
@@ -524,18 +527,18 @@ mod tests {
     fn list_documents_text_reports_absence_and_host_filter() {
         // No panes are installed in unit tests.
         assert_eq!(
-            list_documents_text(None),
+            list_documents_text(&[], None),
             "No Office documents are attached to the bridge."
         );
         assert_eq!(
-            list_documents_text(Some(Host::Excel)),
+            list_documents_text(&[], Some(Host::Excel)),
             "No excel documents are attached to the bridge."
         );
     }
 
     #[test]
     fn offline_execute_reports_the_connect_hint() {
-        let drive = start_call(Host::Excel, "read_range", json!({"range": "A1"}));
+        let drive = start_call(None, Host::Excel, "read_range", json!({"range": "A1"}));
         assert!(drive.receiver.is_none());
         let reason = drive.immediate.expect("offline reason");
         assert!(reason.contains("/office connect"));

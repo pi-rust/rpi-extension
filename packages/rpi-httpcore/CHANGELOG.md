@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- *(web)* add a bounded batch session metadata endpoint for multi-session archive
+
 ## [0.1.25](https://github.com/pi-rust/rpi-extension/compare/rpi-httpcore-v0.1.24...rpi-httpcore-v0.1.25) - 2026-11-23
 
 ### Fixed

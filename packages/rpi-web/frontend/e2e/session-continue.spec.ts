@@ -74,7 +74,7 @@ const reads = [
 
 class MockHost {
   warmupAfter: Record<string, number> = {};
-  commands = [...reads, "prompt", "resume_pending", "abort"];
+  commands = [...reads, "prompt", "resume_pending", "abort", "stop_run"];
   snapshots: Record<string, Json> = { [A]: snapshot(A), [B]: snapshot(B) };
   snapshotFailure: Reply | undefined;
   unexpected: string[] = [];
@@ -101,7 +101,7 @@ class MockHost {
   }
   mutationsSent() {
     return this.calls.filter((call) =>
-      ["prompt", "resume_pending", "abort"].includes(call.kind),
+      ["prompt", "resume_pending", "abort", "stop_run"].includes(call.kind),
     );
   }
   // Explicitly plan a MOCK command, optionally keeping its HTTP response gated.
@@ -237,6 +237,9 @@ class MockHost {
           json: { name: "notes.txt", path: ".rpi/uploads/notes.txt", size: 5 },
         });
       }
+      const preview = path.match(/^\/api\/v1\/sessions\/([^/]+)\/preview$/);
+      if (preview && method === "GET" && [A, B].includes(preview[1]))
+        return route.fulfill({ status: 204 });
       const match = path.match(
         /^\/api\/v1\/sessions\/([^/]+)\/(open|snapshot|commands|events|run-timings\/query)$/,
       );
@@ -575,7 +578,7 @@ test("capabilities distinguish unsupported pending work from a failed run with p
   page,
   host,
 }) => {
-  host.commands = [...reads, "prompt", "abort"];
+  host.commands = [...reads, "prompt", "abort", "stop_run"];
   host.snapshots[A] = snapshot(A, { pendingResume: true });
   host.snapshots[B] = failed(B, "failed", true);
   await open(page, host);
@@ -593,7 +596,7 @@ test("capabilities distinguish unsupported pending work from a failed run with p
   ]);
   expect(commandBodies(host, "resume_pending")).toEqual([]);
   // Nor may a failed settlement advertise an unsupported prompt fallback.
-  host.commands = [...reads, "abort"];
+  host.commands = [...reads, "abort", "stop_run"];
   host.snapshots[A] = failed(A);
   await open(page, host);
   await ready(page, host);
@@ -644,6 +647,29 @@ for (const settlement of [
   });
 }
 
+test("Stop falls back to abort when the live host predates stop_run", async ({
+  page,
+  host,
+}) => {
+  // `/capabilities` advertises the Web service's static command list, which
+  // includes `stop_run`. Only the native child's own snapshot says whether this
+  // installed host actually implements it. An older host must still stop: using
+  // `stop_run` there fails with "unknown command type" and leaves the run alive.
+  host.snapshots[A] = snapshot(A, {
+    status: "running",
+    supportedCommands: [...reads, "prompt", "abort"],
+  });
+  await open(page, host);
+  await ready(page, host);
+  await expect(stopButton(page)).toBeEnabled();
+  host.expectCommand(A, "abort", {
+    json: envelope("abort", { aborted: true, steer: [], followUp: [] }),
+  });
+  await stopButton(page).click();
+  await received(host, A, "abort");
+  expect(commandBodies(host, "stop_run")).toEqual([]);
+});
+
 test("manual Stop waits for native settlement, then empty Enter continues while a draft still sends normally", async ({
   page,
   host,
@@ -651,16 +677,16 @@ test("manual Stop waits for native settlement, then empty Enter continues while 
   host.snapshots[A] = snapshot(A, { status: "running" });
   await open(page, host);
   await ready(page, host);
-  host.expectCommand(A, "abort", { json: envelope("abort", {}) });
+  host.expectCommand(A, "stop_run", { json: envelope("stop_run", {}) });
   await stopButton(page).click();
-  await received(host, A, "abort");
+  await received(host, A, "stop_run");
   await expect(stopButton(page)).toBeEnabled();
   await noContinue(page);
   expect(commandBodies(host, "prompt")).toEqual([]);
   await received(host, A, "events");
   host.snapshots[A] = snapshot(A, {
     lastSeq: 11,
-    latestSettlement: { outcome: "aborted", aborted: true },
+    latestSettlement: { outcome: "stopped", aborted: true },
   });
   host.emit(A, 11, {
     type: "agent_settled",
@@ -707,11 +733,9 @@ test("rejected Stop does not invent a settled continuation action", async ({
   host.snapshots[A] = snapshot(A, { status: "running" });
   await open(page, host);
   await ready(page, host);
-  host.expectCommand(A, "abort", rejected("abort", "Mock abort denied"));
+  host.expectCommand(A, "stop_run", rejected("stop_run", "Mock stop denied"));
   await stopButton(page).click();
-  await expect(page.locator(".error-banner")).toContainText(
-    "Mock abort denied",
-  );
+  await expect(page.locator(".error-banner")).toContainText("Mock stop denied");
   await expect(stopButton(page)).toBeEnabled();
   await noContinue(page);
   expect(commandBodies(host, "prompt")).toEqual([]);
@@ -1322,4 +1346,122 @@ test("a rejected fallback continuation cannot clear a newer authoritative runnin
   expect(commandBodies(host, "prompt")).toEqual([
     { type: "prompt", message: instruction },
   ]);
+});
+
+// --- Composer action progress ring ----------------------------------------
+// The three-in-one Send / Stop / Continue button must show a spinning ring
+// from the moment it is clicked until the host acknowledges the action.
+
+const progress = (page: Page) =>
+  controls(page).locator(".composer-action-progress");
+const pendingButton = (page: Page) =>
+  controls(page).locator(".send-button.composer-action-pending");
+
+test("Send shows a spinning progress ring until the prompt command settles", async ({
+  page,
+  host,
+}) => {
+  await open(page, host);
+  await ready(page, host);
+  await input(page).fill("Watch the ring while sending");
+  const ticket = host.expectCommand(
+    A,
+    "prompt",
+    { json: envelope("prompt", {}) },
+    true,
+  );
+  await sendButton(page).click();
+  await ticket.arrived;
+  // Ring is visible while the command is still in flight. The optimistic
+  // running state switches the button to Stop, but the ring stays on the
+  // same control until the prompt command is acknowledged.
+  await expect(progress(page)).toHaveCount(1);
+  await expect(pendingButton(page)).toHaveAttribute("aria-busy", "true");
+  // The ring keeps the original Send icon while the prompt settles.
+  await expect(progress(page).locator("svg.lucide-arrow-up")).toBeVisible();
+  ticket.release();
+  await ticket.finished;
+  // Ring clears once the host acknowledges.
+  await expect(progress(page)).toHaveCount(0);
+  await expect(pendingButton(page)).toHaveCount(0);
+});
+
+test("Stop shows a spinning progress ring until the stop command settles", async ({
+  page,
+  host,
+}) => {
+  host.snapshots[A] = snapshot(A, { status: "running" });
+  await open(page, host);
+  await ready(page, host);
+  const ticket = host.expectCommand(
+    A,
+    "stop_run",
+    { json: envelope("stop_run", {}) },
+    true,
+  );
+  await stopButton(page).click();
+  await ticket.arrived;
+  await expect(progress(page)).toHaveCount(1);
+  await expect(stopButton(page)).toHaveAttribute("aria-busy", "true");
+  await expect(progress(page).locator(".stop-indicator")).toBeVisible();
+  ticket.release();
+  await ticket.finished;
+  await expect(progress(page)).toHaveCount(0);
+  await expect(stopButton(page)).toHaveAttribute("aria-busy", "false");
+});
+
+test("Continue shows a spinning progress ring until resume settles", async ({
+  page,
+  host,
+}) => {
+  host.snapshots[A] = snapshot(A, { pendingResume: true });
+  await open(page, host);
+  await ready(page, host);
+  const ticket = host.expectCommand(
+    A,
+    "resume_pending",
+    { json: envelope("resume_pending", { resumed: true }) },
+    true,
+  );
+  await continueButton(page).click();
+  await ticket.arrived;
+  await expect(progress(page)).toHaveCount(1);
+  await expect(
+    controls(page).getByRole("button", { name: "Abort", exact: true }),
+  ).toHaveAttribute("aria-busy", "true");
+  ticket.release();
+  await ticket.finished;
+  await expect(progress(page)).toHaveCount(0);
+});
+
+test("a session switch during a gated prompt does not strand the progress ring", async ({
+  page,
+  host,
+}) => {
+  await open(page, host);
+  await ready(page, host);
+  await input(page).fill("Navigate away while this is in flight");
+  const ticket = host.expectCommand(
+    A,
+    "prompt",
+    { json: envelope("prompt", {}) },
+    true,
+  );
+  await sendButton(page).click();
+  await ticket.arrived;
+  await expect(progress(page)).toHaveCount(1);
+
+  // Leaving the session invalidates the in-flight action's finalizer, so the
+  // ring must be cleared by the session reset instead of the abandoned call.
+  await select(page, B);
+  ticket.release();
+  await ticket.finished;
+  await rendered(page);
+
+  await expect(progress(page)).toHaveCount(0);
+  await expect(pendingButton(page)).toHaveCount(0);
+  await expect(controls(page).locator(".send-button")).toHaveAttribute(
+    "aria-busy",
+    "false",
+  );
 });

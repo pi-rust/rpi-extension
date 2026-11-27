@@ -11,8 +11,8 @@ use rpi_extcore::{
     protocol::ApiCommand,
     reply::{IntoReply, ReplyKind, ServiceReply},
     service::{
-        self, CreateSessionRequest, ForkRequest, MetadataRequest, RenameRequest, RunTimingsQuery,
-        SessionListQuery,
+        self, BulkMetadataRequest, CreateSessionRequest, ForkRequest, MetadataRequest,
+        RenameRequest, RunTimingsQuery, SessionListQuery,
     },
 };
 use serde_json::json;
@@ -65,6 +65,26 @@ pub(super) async fn session_metadata(
     };
     HttpReply(
         service::session_metadata(&state.backend, id, request)
+            .await
+            .into_reply(),
+    )
+    .into_response()
+}
+
+pub(super) async fn bulk_session_metadata(
+    State(state): State<AppState>,
+    Extension(authorization): Extension<RequestAuthorization>,
+    body: axum::body::Bytes,
+) -> axum::response::Response {
+    let Some(_commit_fence) = security::commit_fence(&state.security, &authorization).await else {
+        return security::unauthorized_response();
+    };
+    let request: BulkMetadataRequest = match optional_json(&body) {
+        Ok(request) => request,
+        Err(error) => return error.into_response(),
+    };
+    HttpReply(
+        service::bulk_session_metadata(&state.backend, request)
             .await
             .into_reply(),
     )
@@ -205,6 +225,16 @@ pub(super) async fn message_window(
     HttpReply(service::message_window(&state.backend, id, query).await)
 }
 
+pub(super) async fn session_preview(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    (
+        [(axum::http::header::CACHE_CONTROL, "no-store")],
+        HttpReply(service::session_preview(&state.backend, id).await),
+    )
+}
+
 pub(super) async fn snapshot(
     State(state): State<AppState>,
     Path(id): Path<String>,
@@ -248,12 +278,20 @@ pub(super) fn routes() -> axum::Router<AppState> {
             axum::routing::post(rename_session),
         )
         .route(
+            "/api/v1/sessions/metadata/batch",
+            axum::routing::post(bulk_session_metadata),
+        )
+        .route(
             "/api/v1/sessions/{id}/metadata",
             axum::routing::post(session_metadata),
         )
         .route(
             "/api/v1/sessions/{id}/commands",
             axum::routing::post(command),
+        )
+        .route(
+            "/api/v1/sessions/{id}/preview",
+            axum::routing::get(session_preview),
         )
         .route(
             "/api/v1/sessions/{id}/snapshot",

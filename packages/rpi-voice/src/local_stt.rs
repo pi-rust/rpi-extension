@@ -85,7 +85,6 @@ pub fn ensure_model<F: Fn(&str)>(progress: F) -> Result<PathBuf, String> {
                 }
                 Err(e) => {
                     last_err = format!("{url}: {e}");
-                    let _ = std::fs::remove_file(&dest);
                 }
             }
         }
@@ -114,8 +113,9 @@ fn download<F: Fn(&str)>(url: &str, dest: &std::path::Path, progress: &F) -> Res
     let total = resp.content_length();
 
     // Write to a temp file, then rename into place (crash-safe).
-    let tmp = dest.with_extension("part");
-    let mut file = std::fs::File::create(&tmp).map_err(|e| e.to_string())?;
+    let mut file =
+        tempfile::NamedTempFile::new_in(dest.parent().ok_or("model path has no parent")?)
+            .map_err(|e| e.to_string())?;
     let mut buf = [0u8; 1 << 20];
     let mut done: u64 = 0;
     let mut last_report = std::time::Instant::now();
@@ -140,61 +140,14 @@ fn download<F: Fn(&str)>(url: &str, dest: &std::path::Path, progress: &F) -> Res
         }
     }
     file.flush().map_err(|e| e.to_string())?;
-    drop(file);
-    std::fs::rename(&tmp, dest).map_err(|e| e.to_string())?;
+    match file.persist_noclobber(dest) {
+        Ok(_) => (),
+        Err(error) if error.error.kind() == std::io::ErrorKind::AlreadyExists && dest.is_file() => {
+            ()
+        }
+        Err(error) => return Err(error.to_string()),
+    }
     Ok(())
-}
-
-/// A process-wide recognizer, loaded once and reused.
-///
-/// Loading is by far the expensive part — measured on the int8 model: **5.5 s
-/// to load, 0.03 s to transcribe**. Doing it at transcription time means every
-/// first utterance eats that 5.5 s *after* the user stops talking, which is
-/// exactly the wrong moment. So the load starts in the background as soon as
-/// voice is switched on, and transcription waits here for it.
-static ENGINE: std::sync::OnceLock<std::sync::Mutex<Result<SenseVoice, String>>> =
-    std::sync::OnceLock::new();
-
-/// Load the recognizer now, in this thread, and cache it.
-///
-/// Idempotent and cheap after the first call. Returns the load error (as a
-/// string) if the model is missing, so callers can fall back to the API.
-pub fn preload() -> Result<(), String> {
-    let slot = ENGINE.get_or_init(|| std::sync::Mutex::new(SenseVoice::load()));
-    match &*slot.lock().unwrap() {
-        Ok(_) => Ok(()),
-        Err(e) => Err(e.clone()),
-    }
-}
-
-/// Get the shared recognizer, loading it if `preload` has not run yet.
-pub fn engine() -> Result<std::sync::MutexGuard<'static, Result<SenseVoice, String>>, String> {
-    preload()?;
-    Ok(ENGINE.get().expect("just initialised").lock().unwrap())
-}
-
-/// Start loading the recognizer on a background thread, unless it already is
-/// (or has been) loaded. Never blocks; errors surface at [`engine`] time.
-///
-/// Call this when voice is switched on so that the ~5.5 s load overlaps with
-/// the user talking instead of following it.
-pub fn preload_in_background() {
-    if ENGINE.get().is_some() {
-        return;
-    }
-    std::thread::Builder::new()
-        .name("rpi-voice-stt-load".to_string())
-        .spawn(|| {
-            if let Err(e) = preload() {
-                eprintln!("[rpi-voice] STT preload failed: {e}");
-            }
-        })
-        .ok();
-}
-
-/// Whether a recognizer is loaded and ready to transcribe right now.
-pub fn is_ready() -> bool {
-    matches!(ENGINE.get(), Some(slot) if slot.lock().unwrap().is_ok())
 }
 
 /// Loaded SenseVoice recognizer.

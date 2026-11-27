@@ -4,11 +4,13 @@ use super::*;
 const KEY: &str = "rpi.pet";
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
-static ANIMATION: Mutex<Option<(mpsc::Sender<()>, std::thread::JoinHandle<()>)>> = Mutex::new(None);
+pub(super) type Animation = (mpsc::Sender<()>, std::thread::JoinHandle<()>);
 const HELP: &str = "宠物模式\n  /pet 或 /pet auto   宠物陪伴 + 连续语音对话\n  /pet quiet         安静陪伴，关闭监听和朗读\n  /pet off           退出宠物模式，关闭语音\n  /pet cat|bunny     切换小猫 / 小兔子\n  /pet focus|work    专注陪伴 / 工作陪伴布局\n  /pet name <名字>   修改名字（最多 24 个字符）\n  /pet status        查看宠物和语音状态\n  /pet help          查看帮助\n\n输入文字会暂停连续语音；用 /pet auto 恢复。";
 
 #[derive(Clone)]
-struct Pet {
+pub(super) struct Pet {
+    registered: bool,
+    published_layout: Option<String>,
     enabled: bool,
     animal: String,
     layout: String,
@@ -24,6 +26,8 @@ struct Pet {
 impl Default for Pet {
     fn default() -> Self {
         Self {
+            registered: false,
+            published_layout: None,
             enabled: false,
             animal: "cat".into(),
             layout: "focus".into(),
@@ -39,34 +43,28 @@ impl Default for Pet {
 }
 
 impl Pet {
-    fn snapshot(&self) -> Value {
+    fn snapshot(&self, auto: bool) -> Value {
         json!({"version":1,"enabled":self.enabled,"name":self.name,"animal":self.animal,
             "mood":self.mood,"caption":self.caption,"speaker":self.speaker,
-            "hint":self.hint,"layout":self.layout,"auto":AUTO_TALK_ENABLED.load(Ordering::Relaxed),
+            "hint":self.hint,"layout":self.layout,"auto":auto,
             "meter":self.meter})
     }
 }
 
-static PET: Mutex<Option<Pet>> = Mutex::new(None);
-
 // Writes use the same mutex as state changes: an old worker cannot publish an
 // enabled snapshot after /pet off cleared it. SetStatus is bridge-local and
 // never dispatches extension events, so the callback cannot re-enter this lock.
-fn update(f: impl FnOnce(&mut Pet)) {
-    let mut guard = PET.lock().unwrap_or_else(|e| e.into_inner());
-    let pet = guard.get_or_insert_with(Pet::default);
-    f(pet);
-    if let Some(runtime) = RUNTIME_CTX.get() {
-        static REGISTERED: AtomicBool = AtomicBool::new(false);
-        static LAYOUT: Mutex<Option<String>> = Mutex::new(None);
-        let panel = panel_spec(pet);
-        if !REGISTERED.load(Ordering::Relaxed) {
-            if runtime.action(RuntimeActionId::UiComponent,json!({"op":"register","id":KEY,"type":"text","slot":"overlay","visible":false})).is_ok() {
-                REGISTERED.store(true,Ordering::Relaxed);
+fn update(voice: &Arc<RuntimeContext>, f: impl FnOnce(&mut Pet)) {
+    let mut pet = voice.pet.lock().unwrap_or_else(|e| e.into_inner());
+    f(&mut pet);
+    if !voice.is_stopping() {
+        let panel = panel_spec(&pet, voice.auto_talk_enabled.load(Ordering::Relaxed));
+        if !pet.registered {
+            if voice.action(RuntimeActionId::UiComponent,json!({"op":"register","id":KEY,"type":"text","slot":"overlay","visible":false})).is_ok() {
+                pet.registered = true;
             }
         }
-        let mut layout = LAYOUT.lock().unwrap_or_else(|e| e.into_inner());
-        if layout.as_deref() != Some(pet.layout.as_str()) {
+        if pet.published_layout.as_deref() != Some(pet.layout.as_str()) {
             let mut config = panel.clone();
             let obj = config.as_object_mut().unwrap();
             obj.remove("version");
@@ -75,8 +73,8 @@ fn update(f: impl FnOnce(&mut Pet)) {
             obj.insert("op".into(), json!("configure"));
             obj.insert("id".into(), json!(KEY));
             obj.insert("slot".into(), json!("overlay"));
-            if runtime.action(RuntimeActionId::UiComponent, config).is_ok() {
-                *layout = Some(pet.layout.clone());
+            if voice.action(RuntimeActionId::UiComponent, config).is_ok() {
+                pet.published_layout = Some(pet.layout.clone());
             }
         }
         let lines = panel["lines"]
@@ -86,11 +84,11 @@ fn update(f: impl FnOnce(&mut Pet)) {
             .map(|v| v.as_str().unwrap())
             .collect::<Vec<_>>()
             .join("\n");
-        let _ = runtime.action(
+        let _ = voice.action(
             RuntimeActionId::UiComponent,
             json!({"op":"update","id":KEY,"text":lines,"title":panel["title"]}),
         );
-        let _ = runtime.action(
+        let _ = voice.action(
             RuntimeActionId::UiComponent,
             json!({"op":if pet.enabled {"show"} else {"hide"},"id":KEY}),
         );
@@ -125,7 +123,7 @@ fn wrap(text: &str, width: usize, limit: usize) -> Vec<String> {
     rows
 }
 
-fn panel_spec(pet: &Pet) -> Value {
+fn panel_spec(pet: &Pet, auto_talk_enabled: bool) -> Value {
     let width: usize = if pet.layout == "work" { 32 } else { 52 };
     let inner = width - 4;
     let (eyes, label) = match pet.mood {
@@ -181,24 +179,32 @@ fn panel_spec(pet: &Pet) -> Value {
     json!({"version":1,"anchor":if pet.layout == "work" {"right-center"} else {"center"},
         "offsetX":if pet.layout == "work" {-1} else {0},"offsetY":-2,
         "width":width,"maxHeight":20,"border":true,
-        "title":format!("{} · {}",pet.name,if AUTO_TALK_ENABLED.load(Ordering::Relaxed) {"连续对话"} else {"语音暂停"}),"lines":lines})
+        "title":format!("{} · {}",pet.name,if auto_talk_enabled {"连续对话"} else {"语音暂停"}),"lines":lines})
 }
 
-fn start_animation() {
-    let mut animation = ANIMATION.lock().unwrap_or_else(|e| e.into_inner());
+fn start_animation(voice: &Arc<RuntimeContext>) {
+    let mut animation = voice
+        .pet_animation
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     if animation.is_some() {
         return;
     }
+    if voice.is_stopping() {
+        return;
+    }
     let (stop, receiver) = mpsc::channel();
+    let owner = voice.clone();
     if let Ok(thread) = std::thread::Builder::new()
         .name("rpi-pet-animation".into())
         .spawn(move || {
+            let voice = &owner;
             while matches!(
                 receiver.recv_timeout(std::time::Duration::from_millis(320)),
                 Err(mpsc::RecvTimeoutError::Timeout)
             ) {
-                if enabled() {
-                    update(|p| p.frame = p.frame.wrapping_add(1));
+                if enabled(voice) {
+                    update(voice, |p| p.frame = p.frame.wrapping_add(1));
                 }
             }
         })
@@ -207,18 +213,26 @@ fn start_animation() {
     }
 }
 
-fn stop_animation() {
-    if let Some((stop, thread)) = ANIMATION.lock().unwrap_or_else(|e| e.into_inner()).take() {
+pub(super) fn signal_animation_stop(voice: &Arc<RuntimeContext>) {
+    if let Some((stop, _)) = voice.pet_animation.lock().unwrap().as_ref() {
+        let _ = stop.send(());
+    }
+}
+
+pub(super) fn stop_animation(voice: &Arc<RuntimeContext>) {
+    if let Some((stop, thread)) = voice
+        .pet_animation
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .take()
+    {
         let _ = stop.send(());
         let _ = thread.join();
     }
 }
 
-pub(super) fn enabled() -> bool {
-    PET.lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .as_ref()
-        .is_some_and(|p| p.enabled)
+pub(super) fn enabled(voice: &Arc<RuntimeContext>) -> bool {
+    voice.pet.lock().unwrap_or_else(|e| e.into_inner()).enabled
 }
 
 fn mood_from_status(value: &str) -> Option<&'static str> {
@@ -246,12 +260,12 @@ fn mood_from_status(value: &str) -> Option<&'static str> {
     }
 }
 
-pub(super) fn voice_status(value: &str) {
-    if !enabled() {
+pub(super) fn voice_status(voice: &Arc<RuntimeContext>, value: &str) {
+    if !enabled(voice) {
         return;
     }
     if let Some(mood) = mood_from_status(value) {
-        update(|p| {
+        update(voice, |p| {
             p.mood = mood;
             p.meter = value
                 .chars()
@@ -275,8 +289,8 @@ pub(super) fn voice_status(value: &str) {
     }
 }
 
-pub(super) fn caption(text: &str, speaker: &'static str) {
-    if !enabled() || text.trim().is_empty() {
+pub(super) fn caption(voice: &Arc<RuntimeContext>, text: &str, speaker: &'static str) {
+    if !enabled(voice) || text.trim().is_empty() {
         return;
     }
     let text = sanitize_for_speech(text)
@@ -284,14 +298,14 @@ pub(super) fn caption(text: &str, speaker: &'static str) {
         .filter(|c| !c.is_control() || *c == '\n')
         .take(1600)
         .collect();
-    update(|p| {
+    update(voice, |p| {
         p.caption = text;
         p.speaker = speaker;
     });
 }
 
-pub(super) fn message_end(message: &Value) {
-    if !enabled() {
+pub(super) fn message_end(voice: &Arc<RuntimeContext>, message: &Value) {
+    if !enabled(voice) {
         return;
     }
     if message
@@ -300,9 +314,9 @@ pub(super) fn message_end(message: &Value) {
         .and_then(Value::as_str)
         == Some("assistant")
     {
-        caption(&extract_message_text(message), "pet");
+        caption(voice, &extract_message_text(message), "pet");
         if message.get("stopReason").and_then(Value::as_str) == Some("error") {
-            update(|p| {
+            update(voice, |p| {
                 p.mood = "error";
                 p.hint = message
                     .get("errorMessage")
@@ -317,17 +331,24 @@ pub(super) fn message_end(message: &Value) {
 }
 
 rpi_plugin_sdk::event_handler! {
-fn on_event(event, _user_data) {
-    if !enabled() {
+fn on_event(event, user_data) {
+    let Some(owner) = registration::callback(user_data) else { return 0; };
+    let voice = &owner;
+    if event.tag() == EventTag::SessionShutdown {
+        if enabled(voice) { update(voice, |p| p.enabled = false); }
+        registration::session_shutdown(voice);
+        return 0;
+    }
+    if !enabled(voice) {
         return 0;
     }
     match event.tag() {
-        EventTag::AgentStart => update(|p| {
+        EventTag::AgentStart => update(voice, |p| {
             p.mood = "think";
             p.hint.clear();
         }),
-        EventTag::ToolExecutionStart => update(|p| {
-            if !TTS_PLAYING.load(Ordering::Relaxed) {
+        EventTag::ToolExecutionStart => update(voice, |p| {
+            if !voice.tts_playing.load(Ordering::Relaxed) {
                 p.mood = "think";
             }
             p.hint = "正在处理你的请求…".into();
@@ -335,58 +356,49 @@ fn on_event(event, _user_data) {
         EventTag::ToolExecutionEnd => {
             // The union variant is guaranteed by ToolExecutionEnd.
             if event.tool_result().is_some_and(|result| result.is_error) {
-                update(|p| {
+                update(voice, |p| {
                     p.mood = "error";
                     p.hint = "执行遇到问题；/pet off 查看详情".into();
                 });
             }
         }
-        EventTag::AgentEnd => update(|p| {
-            if !TTS_PLAYING.load(Ordering::Relaxed)
-                && !RECORDING.load(Ordering::Relaxed)
+        EventTag::AgentEnd => update(voice, |p| {
+            if !voice.tts_playing.load(Ordering::Relaxed)
+                && !voice.recording.load(Ordering::Relaxed)
                 && p.mood != "error"
             {
                 p.mood = "happy";
                 p.hint.clear();
             }
         }),
-        EventTag::SessionStart | EventTag::SessionTree => update(|p| {
+        EventTag::SessionStart | EventTag::SessionTree => update(voice, |p| {
             p.caption = "新的对话，我也在。".into();
             p.speaker = "pet";
             p.hint.clear();
         }),
-        EventTag::SessionShutdown => {
-            silence();
-            update(|p| p.enabled = false);
-            stop_animation();
-        }
         _ => {}
     }
     0
 }
 }
 
-fn silence() {
-    AUTO_MODE_ENABLED.store(false, Ordering::Relaxed);
-    AUTO_TALK_ENABLED.store(false, Ordering::Relaxed);
-    AUTO_TTS_ENABLED.store(false, Ordering::Relaxed);
-    PTT_ENABLED.store(false, Ordering::Relaxed);
-    if let Some(stop) = PTT.lock().unwrap().stop.take() {
+pub(super) fn silence(voice: &Arc<RuntimeContext>) {
+    voice.auto_mode_enabled.store(false, Ordering::Relaxed);
+    voice.auto_talk_enabled.store(false, Ordering::Relaxed);
+    voice.auto_tts_enabled.store(false, Ordering::Relaxed);
+    voice.ptt_enabled.store(false, Ordering::Relaxed);
+    if let Some(stop) = voice.ptt.lock().unwrap().stop.take() {
         stop.store(true, Ordering::Relaxed);
     }
-    ptt_reset();
-    if let Some(stop) = AUTO_TALK_STOP.lock().unwrap().take() {
+    ptt_reset(voice);
+    if let Some(stop) = voice.auto_talk_stop.lock().unwrap().take() {
         stop.store(true, Ordering::Relaxed);
     }
-    stop_playback();
+    stop_playback(voice);
 }
 
-pub(super) fn prompt(base: &str) -> Option<String> {
-    let pet = PET
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .clone()
-        .unwrap_or_default();
+pub(super) fn prompt(voice: &Arc<RuntimeContext>, base: &str) -> Option<String> {
+    let pet = voice.pet.lock().unwrap_or_else(|e| e.into_inner()).clone();
     prompt_for_pet(base, &pet.name, pet.enabled)
 }
 
@@ -405,7 +417,9 @@ fn prompt_for_pet(base: &str, name: &str, enabled: bool) -> Option<String> {
 }
 
 rpi_plugin_sdk::string_handler! {
-fn command(input, out, _user_data) {
+fn command(input, out, user_data) {
+    let Some(owner) = registration::callback(user_data) else { return 1; };
+    let voice = &owner;
     let value: Value = serde_json::from_str(input).unwrap_or(Value::Null);
     let args = value
         .get("args")
@@ -415,46 +429,39 @@ fn command(input, out, _user_data) {
     let (verb, rest) = args.split_once(char::is_whitespace).unwrap_or((args, ""));
     let text = match verb {
         "" | "on" | "auto" if rest.trim().is_empty() => {
-            if RUNTIME_CTX.get().is_none() {
-                set_output(
-                    out,
-                    json!({"kind":"message","text":"宠物语音运行环境不可用"}),
-                );
-                return 1;
-            }
-            update(|p| {
+            update(voice, |p| {
                 p.enabled = true;
                 p.mood = "listen";
                 p.hint.clear();
             });
-            start_animation();
+            start_animation(voice);
             // Delegate to the existing voice command, preserving its worker,
             // microphone ownership, model preload and hands-free turn-taking.
             let input = json!({"args":"auto on","command":"voice"}).to_string();
-            return handle_voice_command(&input, out);
+            return handle_voice_command(voice, &input, out);
         }
         "quiet" if rest.trim().is_empty() => {
-            silence();
-            update(|p| {
+            silence(voice);
+            update(voice, |p| {
                 p.enabled = true;
                 p.mood = "sleep";
                 p.hint = "安静陪伴 · /pet auto 恢复语音".into();
             });
-            start_animation();
+            start_animation(voice);
             "宠物正在安静陪伴你；监听和朗读已关闭。".into()
         }
         "off" if rest.trim().is_empty() => {
-            silence();
-            update(|p| p.enabled = false);
-            stop_animation();
+            silence(voice);
+            update(voice, |p| p.enabled = false);
+            stop_animation(voice);
             "宠物面板已关闭；语音已关闭。".into()
         }
         "cat" | "bunny" if rest.trim().is_empty() => {
-            update(|p| p.animal = verb.into());
+            update(voice, |p| p.animal = verb.into());
             format!("宠物形象：{verb}")
         }
         "focus" | "work" if rest.trim().is_empty() => {
-            update(|p| p.layout = verb.into());
+            update(voice, |p| p.layout = verb.into());
             format!("宠物布局：{verb}")
         }
         "name" => {
@@ -462,22 +469,21 @@ fn command(input, out, _user_data) {
             if name.is_empty() || name.chars().count() > 24 || name.chars().any(char::is_control) {
                 "名字需要 1–24 个字符，不能包含控制字符。".into()
             } else {
-                update(|p| p.name = name.into());
+                update(voice, |p| p.name = name.into());
                 format!("宠物名字：{name}")
             }
         }
         "status" => {
-            let pet = PET
+            let pet = voice.pet
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
-                .clone()
-                .unwrap_or_default();
+                .clone();
             format!(
                 "宠物：{} · {} · {}\n{}",
                 pet.name,
                 pet.animal,
                 if pet.enabled { "开启" } else { "关闭" },
-                status_text()
+                status_text(voice)
             )
         }
         _ => HELP.into(),
@@ -488,14 +494,13 @@ fn command(input, out, _user_data) {
             "quiet" | "off" | "cat" | "bunny" | "name" | "focus" | "work"
         )
     {
-        caption(&text, "pet");
+        caption(voice, &text, "pet");
     }
-    let state = PET
+    let state = voice.pet
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .clone()
-        .unwrap_or_default()
-        .snapshot();
+        .snapshot(voice.auto_talk_enabled.load(Ordering::Relaxed));
     set_output(
         out,
         json!({"kind":"message","text":text,"details":{"kind":"pet","state":state}}),
@@ -514,8 +519,6 @@ pub(super) fn register(api: &PluginApi) -> i32 {
         if rc != 0 {
             return rc;
         }
-    } else {
-        return 0;
     }
     if let Some(register) = api.register_event_handler {
         for tag in [
@@ -542,11 +545,9 @@ mod tests {
     #[test]
     fn generic_panels_cover_all_expressions_and_respect_content_limits() {
         let combining = format!("x{}", "\u{301}".repeat(1500));
-        assert!(
-            wrap(&combining, 48, 3)
-                .iter()
-                .all(|line| line.len() <= 2048)
-        );
+        assert!(wrap(&combining, 48, 3)
+            .iter()
+            .all(|line| line.len() <= 2048));
         for layout in ["focus", "work"] {
             for mood in ["listen", "think", "speak", "happy", "sleep", "error"] {
                 let pet = Pet {
@@ -555,15 +556,13 @@ mod tests {
                     caption: "中文长字幕".repeat(100),
                     ..Pet::default()
                 };
-                let panel = panel_spec(&pet);
+                let panel = panel_spec(&pet, false);
                 let inner = panel["width"].as_u64().unwrap() as usize - 4;
                 let lines = panel["lines"].as_array().unwrap();
                 assert!(lines.len() + 3 <= panel["maxHeight"].as_u64().unwrap() as usize);
-                assert!(
-                    lines
-                        .iter()
-                        .all(|line| UnicodeWidthStr::width(line.as_str().unwrap()) <= inner)
-                );
+                assert!(lines
+                    .iter()
+                    .all(|line| UnicodeWidthStr::width(line.as_str().unwrap()) <= inner));
                 assert_eq!(
                     panel["anchor"],
                     if layout == "work" {
@@ -572,11 +571,9 @@ mod tests {
                         "center"
                     }
                 );
-                assert!(
-                    lines
-                        .iter()
-                        .any(|line| line.as_str().unwrap().ends_with('…'))
-                );
+                assert!(lines
+                    .iter()
+                    .any(|line| line.as_str().unwrap().ends_with('…')));
             }
         }
     }
@@ -594,6 +591,39 @@ mod tests {
         }
         assert_eq!(mood_from_status("unrelated"), None);
     }
+    #[test]
+    fn mascot_commands_and_animation_stay_with_the_registration() {
+        fn call(owner: &Arc<RuntimeContext>, args: &str) {
+            registration::with_test_callback(owner, || {
+                let input = json!({"args": args}).to_string();
+                let mut out = StbString::empty();
+                let rc = command(
+                    StbStringRef::from_str(&input),
+                    &mut out,
+                    owner.api.user_data,
+                );
+                let _ =
+                    rpi_plugin_sdk::stb_take!(out, Some(rpi_plugin_sdk::callbacks::free_string));
+                assert_eq!(rc, 0);
+            });
+        }
+
+        let first = registration::test_runtime();
+        let second = registration::test_runtime();
+        call(&first, "name 小鱼");
+        call(&second, "name 小兔");
+        call(&first, "quiet");
+        assert!(enabled(&first));
+        assert!(!enabled(&second));
+        assert!(prompt(&first, "base").unwrap().contains("小鱼"));
+        assert!(prompt(&second, "base").is_none());
+        first.finish();
+        assert!(first.pet_animation.lock().unwrap().is_none());
+        call(&second, "quiet");
+        assert!(prompt(&second, "base").unwrap().contains("小兔"));
+        second.finish();
+    }
+
     #[test]
     fn pet_prompt_preserves_base_and_disappears_when_disabled() {
         assert!(prompt_for_pet("BASE", "小鱼", false).is_none());

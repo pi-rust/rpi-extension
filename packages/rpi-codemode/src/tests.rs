@@ -7,8 +7,8 @@ static ABI_HOST_TEST_LOCK: Mutex<()> = Mutex::new(());
 #[test]
 fn registration_schema_is_canonical_and_allows_host_injection() {
     let schema = schema();
-    assert_eq!(schema.name.to_string_lossy(), "codemode");
-    let v: Value = serde_json::from_str(&schema.parameters.to_string_lossy()).unwrap();
+    assert_eq!(rpi_plugin_sdk::stb_text!(schema.name), "codemode");
+    let v: Value = serde_json::from_str(&rpi_plugin_sdk::stb_text!(schema.parameters)).unwrap();
     assert_eq!(v["type"], "object");
     assert_eq!(v["x-rpi-execution-mode"], "sequential");
     assert_eq!(v["x-rpi-result-envelope"], 1);
@@ -33,15 +33,15 @@ fn registration_schema_is_canonical_and_allows_host_injection() {
         &json!({"action":"list","__rpi":{"runtimeHandle":1,"runtimeKey":"key"},"unknown":true})
     )
     .is_ok());
-    schema
-        .name
-        .free_with(Some(rpi_plugin_sdk::callbacks::free_string));
-    schema
-        .description
-        .free_with(Some(rpi_plugin_sdk::callbacks::free_string));
-    schema
-        .parameters
-        .free_with(Some(rpi_plugin_sdk::callbacks::free_string));
+    let _ = rpi_plugin_sdk::stb_take!(schema.name, Some(rpi_plugin_sdk::callbacks::free_string));
+    let _ = rpi_plugin_sdk::stb_take!(
+        schema.description,
+        Some(rpi_plugin_sdk::callbacks::free_string)
+    );
+    let _ = rpi_plugin_sdk::stb_take!(
+        schema.parameters,
+        Some(rpi_plugin_sdk::callbacks::free_string)
+    );
 }
 #[test]
 fn broker_errors_preserve_numeric_diagnostics_but_not_actual_credentials() {
@@ -170,7 +170,7 @@ fn final_encoded_output_has_its_own_budget_without_losing_termination() {
 fn await_abi(handle: StepHandle) -> rpi_plugin_sdk::callbacks::Step {
     let until = Instant::now() + Duration::from_secs(3);
     loop {
-        let result = rpi_plugin_sdk::take_step_result!(poll(handle, None, std::ptr::null_mut()));
+        let result = rpi_plugin_sdk::take_step!(poll(handle, None, std::ptr::null_mut()));
         if !matches!(result, rpi_plugin_sdk::callbacks::Step::Pending(_)) {
             return result;
         }

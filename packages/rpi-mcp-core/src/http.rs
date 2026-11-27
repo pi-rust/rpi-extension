@@ -39,7 +39,7 @@ pub fn validate_configured_http(
         || url.host_str().is_none()
         || !url.username().is_empty()
         || url.password().is_some()
-        || authority.map_or(true, |a| a.is_empty() || a.contains('@'))
+        || authority.is_none_or(|a| a.is_empty() || a.contains('@'))
     {
         return Err(
             "MCP configured HTTP URL must have an HTTP(S) host without userinfo or fragment".into(),

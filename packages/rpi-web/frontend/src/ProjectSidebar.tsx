@@ -928,7 +928,6 @@ interface SidebarProps {
   language: Language;
   creating: boolean;
   canManage: boolean;
-  canFork: boolean;
   canClone: boolean;
   canCreate: boolean;
   onSelectProject: (project: Project) => void;
@@ -936,7 +935,6 @@ interface SidebarProps {
   onNewSession: (projectId: string) => void;
   onNewProject: () => void;
   onRename: (session: SessionSummary) => void;
-  onFork: (session: SessionSummary) => void;
   onClone: (session: SessionSummary) => void;
   onBulkMetadata: (
     sessions: SessionSummary[],
@@ -962,7 +960,6 @@ export function ProjectSidebar({
   language,
   creating,
   canManage,
-  canFork,
   canClone,
   canCreate,
   onSelectProject,
@@ -970,7 +967,6 @@ export function ProjectSidebar({
   onNewSession,
   onNewProject,
   onRename,
-  onFork,
   onClone,
   onBulkMetadata,
   onBulkDelete,
@@ -1093,7 +1089,6 @@ export function ProjectSidebar({
     setBulkPending(true);
     try {
       await onBulkMetadata(selectedSessions, patch);
-      if (patch.archived && !archived) setArchivedView(true);
       exitSelectMode();
     } finally {
       setBulkPending(false);
@@ -1140,7 +1135,7 @@ export function ProjectSidebar({
         }
         key={session.sessionId}
         onContextMenu={(event) => {
-          if (recent || (!canManage && !canFork && !canClone)) return;
+          if (recent || (!canManage && !canClone)) return;
           event.preventDefault();
           setMenuPosition({
             top: Math.min(event.clientY, window.innerHeight - 150),
@@ -1261,7 +1256,7 @@ export function ProjectSidebar({
             )}
           </time>
         </button>
-        {!recent && (canManage || canFork || canClone) && !selectMode && (
+        {!recent && (canManage || canClone) && !selectMode && (
           <div className="session-menu">
             <button
               className="icon-button session-menu-trigger"
@@ -1291,18 +1286,6 @@ export function ProjectSidebar({
                   aria-label={title}
                   style={menuPosition}
                 >
-                  {canFork && (
-                    <button
-                      role="menuitem"
-                      onClick={() => {
-                        setMenu("");
-                        onFork(session);
-                      }}
-                    >
-                      <GitBranch size={14} />
-                      {translate(language, "fork")}
-                    </button>
-                  )}
                   {canClone && (
                     <button
                       role="menuitem"

@@ -57,6 +57,7 @@ struct RegistryFile {
 pub struct Registry {
     path: PathBuf,
     entries: Vec<RegistryEntry>,
+    attached: HashSet<String>,
     preferences: HashMap<String, SessionPreferences>,
     resources: HashMap<String, crate::resources::ResourceConfiguration>,
     deletions: HashMap<String, crate::deletion::DeletionPlan>,
@@ -103,6 +104,7 @@ impl Registry {
         Ok(Self {
             path,
             entries: data.sessions,
+            attached: HashSet::new(),
             preferences: data.preferences,
             resources: data.resources,
             deletions: data.deletions,
@@ -193,13 +195,13 @@ impl Registry {
         self.preferences.get(id).cloned().unwrap_or_default()
     }
 
-    pub fn update_preferences(
+    fn update_preferences_in_memory(
         &mut self,
         id: &str,
         pinned: Option<bool>,
         archived: Option<bool>,
         tags: Option<Vec<String>>,
-    ) -> Result<SessionPreferences, String> {
+    ) -> Result<(SessionPreferences, SessionPreferences), String> {
         if self.get(id).is_none() {
             return Err("session not found".into());
         }
@@ -215,7 +217,17 @@ impl Registry {
         if let Some(tags) = normalized_tags {
             value.tags = tags;
         }
-        let result = value.clone();
+        Ok((previous, value.clone()))
+    }
+
+    pub fn update_preferences(
+        &mut self,
+        id: &str,
+        pinned: Option<bool>,
+        archived: Option<bool>,
+        tags: Option<Vec<String>>,
+    ) -> Result<SessionPreferences, String> {
+        let (previous, result) = self.update_preferences_in_memory(id, pinned, archived, tags)?;
         if let Err(error) = self.save_result() {
             self.preferences.insert(id.into(), previous);
             return Err(error);
@@ -223,7 +235,62 @@ impl Registry {
         Ok(result)
     }
 
+    /// Apply one metadata patch to several known sessions and persist the
+    /// registry once. On a save failure every preference is restored, so a
+    /// bulk update is atomic from the registry's point of view.
+    pub fn update_preferences_bulk(
+        &mut self,
+        ids: &[String],
+        pinned: Option<bool>,
+        archived: Option<bool>,
+        tags: Option<Vec<String>>,
+    ) -> Result<Vec<SessionPreferences>, String> {
+        let normalized_tags = tags.map(normalize_tags).transpose()?;
+        let mut previous = Vec::with_capacity(ids.len());
+        let mut results = Vec::with_capacity(ids.len());
+        for id in ids {
+            if self.get(id).is_none() {
+                return Err("session not found".into());
+            }
+            let old = self.preferences(id);
+            let value = self.preferences.entry(id.clone()).or_default();
+            if let Some(pinned) = pinned {
+                value.pinned = pinned;
+            }
+            if let Some(archived) = archived {
+                value.archived = archived;
+            }
+            if let Some(tags) = normalized_tags.clone() {
+                value.tags = tags;
+            }
+            previous.push((id.clone(), old));
+            results.push(value.clone());
+        }
+        if let Err(error) = self.save_result() {
+            for (id, old) in previous {
+                self.preferences.insert(id, old);
+            }
+            return Err(error);
+        }
+        Ok(results)
+    }
+
+    // Host areas are rediscovered on startup. An ordinary Web server sharing
+    // this registry must never reopen an area Session as a standalone child.
+    pub(crate) fn attach(&mut self, entry: RegistryEntry) -> Result<(), String> {
+        if self.attached.contains(&entry.session_id) {
+            return Ok(());
+        }
+        if self.get(&entry.session_id).is_some() {
+            return Err("shared Host Session id conflicts with the Web registry".into());
+        }
+        self.attached.insert(entry.session_id.clone());
+        self.entries.push(entry);
+        Ok(())
+    }
+
     pub fn upsert(&mut self, entry: RegistryEntry) -> Result<(), String> {
+        let attached = self.attached.contains(&entry.session_id);
         let previous = self.entries.clone();
         match self
             .entries
@@ -250,6 +317,9 @@ impl Registry {
                 Self::merge_last_turn_ended_at(existing, entry.last_turn_ended_at);
             }
             None => self.entries.push(entry),
+        }
+        if attached {
+            return Ok(());
         }
         if let Err(error) = self.save_result() {
             self.entries = previous;
@@ -298,6 +368,9 @@ impl Registry {
             .map_or(true, |value| ended_at > value);
         if changed {
             entry.last_turn_ended_at = Some(ended_at);
+            if self.attached.contains(session_id) {
+                return Ok(true);
+            }
             if let Err(error) = self.save_result() {
                 self.entries = previous;
                 return Err(error);
@@ -340,8 +413,18 @@ impl Registry {
             std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
         }
         let file = RegistryFile {
-            sessions: self.entries.clone(),
-            preferences: self.preferences.clone(),
+            sessions: self
+                .entries
+                .iter()
+                .filter(|entry| !self.attached.contains(&entry.session_id))
+                .cloned()
+                .collect(),
+            preferences: self
+                .preferences
+                .iter()
+                .filter(|(id, _)| !self.attached.contains(*id))
+                .map(|(id, value)| (id.clone(), value.clone()))
+                .collect(),
             resources: self.resources.clone(),
             deletions: self.deletions.clone(),
         };

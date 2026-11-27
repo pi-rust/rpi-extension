@@ -867,7 +867,7 @@ fn missing_path_becomes_a_read_error_naming_the_file() {
 #[test]
 fn description_documents_exactness_and_replace_all() {
     let registered = registered_tool_schema();
-    let description = registered.description.to_string_lossy();
+    let description = rpi_plugin_sdk::stb_text!(registered.description);
     for constraint in [
         "Copy each oldText from read output, preserving whitespace",
         "NFKC",
@@ -895,8 +895,8 @@ fn description_documents_exactness_and_replace_all() {
 #[test]
 fn schema_is_the_fork_edit_input() {
     let registered = registered_tool_schema();
-    assert_eq!(registered.name.to_string_lossy(), "edit");
-    let schema: Value = serde_json::from_str(&registered.parameters.to_string_lossy())
+    assert_eq!(rpi_plugin_sdk::stb_text!(registered.name), "edit");
+    let schema: Value = serde_json::from_str(&rpi_plugin_sdk::stb_text!(registered.parameters))
         .expect("registered schema is valid JSON");
     assert_eq!(schema["type"], "object");
     assert_eq!(schema["additionalProperties"], true); // Host injects __rpi.

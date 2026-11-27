@@ -53,6 +53,11 @@ pub struct SessionStore {
     ttl_ms: i64,
     max_entries: usize,
 }
+impl Default for SessionStore {
+    fn default() -> Self {
+        Self::new(String::new())
+    }
+}
 impl SessionStore {
     pub fn new(workspace_uri: String) -> Self {
         Self::with_limits(workspace_uri, 24 * 60 * 60 * 1000, 256)

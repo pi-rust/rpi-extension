@@ -304,7 +304,13 @@ fn command_output(out: &mut rpi_plugin_sdk::callbacks::Output<'_>, value: Value)
 
 rpi_plugin_sdk::string_handler! {
 fn goal_command(args_json, out, user_data) {
-    let _scope = runtime::enter(runtime::callback(user_data));
+    let Some(binding) = runtime::callback(user_data) else {
+        return command_output(out, json!({"kind": "message", "text": "Goal runtime is unavailable"}));
+    };
+    let _scope = runtime::enter(Some(binding));
+    if crate::is_subagent() {
+        return command_output(out, json!({"kind": "message", "text": "Subagents cannot manage the parent goal"}));
+    }
     let envelope: Value = serde_json::from_str(args_json).unwrap_or(Value::Null);
     let args = envelope
         .get("args")

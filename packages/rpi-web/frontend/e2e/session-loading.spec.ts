@@ -98,6 +98,8 @@ class MockHost {
   unexpected: string[] = [];
   snapshots: Record<string, Json> = { [A]: snapshot(A), [B]: snapshot(B) };
   snapshotFailure: Reply | undefined;
+  offline = new Set<string>();
+  previews: Record<string, string> = {};
   sessionSettlements: Record<string, Json | null> = { [A]: null, [B]: null };
   sessionLastSeq: Record<string, number> = { [A]: 10, [B]: 10 };
   states: Record<string, Json> = { [A]: state(A), [B]: state(B) };
@@ -110,6 +112,8 @@ class MockHost {
     "set_thinking_level",
     "prompt",
     "abort",
+    "queue_message",
+    "cancel_queued",
   ];
   private holds = new Map<
     string,
@@ -179,7 +183,7 @@ class MockHost {
         sessionId: id,
         projectId: "loading-project",
         title: titles[id as keyof typeof titles],
-        status: "ready",
+        status: this.offline.has(id) ? "offline" : "ready",
         createdAt: 1_700_000_000_000,
         updatedAt: 1_700_000_000_100,
         lastSeq: this.sessionLastSeq[id] ?? 10,
@@ -223,6 +227,11 @@ class MockHost {
             projectsRoot: "/mock",
           },
         });
+      if (path === "/api/v1/projects/loading-project/resources" && request.method() === "GET")
+        return route.fulfill({ json: {
+          version: 1, success: true, operation: "list", scope: url.searchParams.get("scope"),
+          data: { outcome: "observed", resources: [], diagnostics: [] },
+        } });
       if (path === "/api/v1/sessions" && request.method() === "GET")
         return route.fulfill({ json: { sessions: [session(A), session(B)] } });
       // The client probes this before treating a closed event stream as a
@@ -232,7 +241,7 @@ class MockHost {
         return route.fulfill({ json: session(single[1]) });
 
       const match = path.match(
-        /^\/api\/v1\/sessions\/([^/]+)\/(open|snapshot|commands|events|run-timings\/query)$/,
+        /^\/api\/v1\/sessions\/([^/]+)\/(open|preview|snapshot|commands|events|run-timings\/query)$/,
       );
       if (!match) return this.reject(route, `${request.method()} ${path}`);
       const id = match[1];
@@ -244,8 +253,8 @@ class MockHost {
       if (body && !["get_state", ...diagnostics, ...catalogs, "prompt"].includes(kind))
         return this.reject(route, `unexpected command ${kind}`);
       if (
-        (["snapshot", "events"].includes(kind) && request.method() !== "GET") ||
-        (!["snapshot", "events"].includes(kind) && request.method() !== "POST")
+        (["preview", "snapshot", "events"].includes(kind) && request.method() !== "GET") ||
+        (!["preview", "snapshot", "events"].includes(kind) && request.method() !== "POST")
       )
         return this.reject(route, `${request.method()} ${kind}`);
       const ordinal = this.count(id, kind) + 1;
@@ -265,7 +274,17 @@ class MockHost {
         } else if (ticket?.reply) {
           await route.fulfill(ticket.reply);
         } else if (kind === "open") {
+          this.offline.delete(id);
           await route.fulfill({ json: session(id) });
+        } else if (kind === "preview") {
+          const text = this.previews[id];
+          await route.fulfill(text ? {
+            json: {
+              sessionId: id,
+              hasMore: false,
+              messages: [{ role: "user", entryId: `${id}-preview`, content: text }],
+            },
+          } : { status: 204 });
         } else if (kind === "snapshot") {
           await route.fulfill(
             this.snapshotFailure ?? { json: this.snapshots[id] },
@@ -522,6 +541,99 @@ test("mobile fullscreen hides browser chrome but keeps the composer visible", as
   }
 });
 
+async function attemptComposerWrites(page: Page) {
+  await expect(composer(page)).toHaveJSProperty("readOnly", true);
+  await expect(composer(page)).toHaveValue("Draft from an earlier visit");
+  await expect(send(page)).toBeDisabled();
+  await composer(page).press("Enter");
+  await page.locator(".composer-area").evaluate((form: HTMLFormElement) =>
+    form.requestSubmit(),
+  );
+  const queue = page.getByRole("textbox", { name: "Queue a follow-up…" });
+  await expect(queue).toBeDisabled();
+  // Exercise the handler even if a browser dispatches an event on the control.
+  await queue.dispatchEvent("keydown", { key: "Enter", bubbles: true });
+  await expect(composer(page)).toHaveValue("Draft from an earlier visit");
+}
+
+for (const fails of [false, true]) {
+  test(`saved preview stays read-only while open ${fails ? "fails" : "waits for the live snapshot"}`, async ({
+    page,
+    host,
+  }) => {
+    host.offline.add(A);
+    host.previews[A] = "Saved preview only";
+    await page.addInitScript((id) => {
+      localStorage.setItem("rpi-session-drafts", JSON.stringify({
+        [id]: "Draft from an earlier visit",
+      }));
+    }, A);
+    const opening = host.hold(A, "open", 1, fails ? {
+      status: 503,
+      json: { error: "Unable to open fixture" },
+    } : undefined);
+    const history = host.hold(A, "snapshot");
+    await start(page, host);
+    await expect(rows(page)).toHaveText("Saved preview only");
+    await page.locator(".slim-metrics-more").click();
+    await attemptComposerWrites(page);
+    expect(host.count(A, "snapshot")).toBe(0);
+    expect(host.count(A, "events")).toBe(0);
+
+    opening.release();
+    if (fails) {
+      await expect(page.locator(".error-banner")).toContainText("Unable to open fixture");
+      await expect(rows(page)).toHaveText("Saved preview only");
+      await attemptComposerWrites(page);
+      expect(host.count(A, "snapshot")).toBe(0);
+      expect(host.count(A, "events")).toBe(0);
+      await select(page, B);
+      await expect(rows(page)).toHaveText(`History ${B}`);
+    } else {
+      await received(host, A, "snapshot");
+      await expect(rows(page)).toHaveText("Saved preview only");
+      await attemptComposerWrites(page);
+      history.release();
+      await expect(rows(page)).toHaveText(`History ${A}`);
+      await expect(composer(page)).toBeEditable();
+      await expect(send(page)).toBeEnabled();
+      await received(host, A, "events");
+      expect(host.calls.find((call) => call.kind === "events")?.url.searchParams.get("after")).toBe("10");
+      host.emit(A, [{ seq: 11, event: {
+        type: "message_end",
+        message: { role: "user", content: "Replayed live message" },
+      } }]);
+      await expect(rows(page)).toHaveText([`History ${A}`, "Replayed live message"]);
+    }
+    expect(host.count(A, "prompt")).toBe(0);
+  });
+}
+
+test("late previews cannot paint after navigation or a live snapshot", async ({ page, host }) => {
+  host.offline.add(A);
+  host.offline.add(B);
+  host.previews[A] = "Abandoned preview";
+  host.previews[B] = "Obsolete preview";
+  const obsolete = host.hold(A, "preview");
+  const opening = host.hold(A, "open");
+  const late = host.hold(B, "preview");
+  await start(page, host);
+  await obsolete.arrived.promise;
+  await select(page, B);
+  await late.arrived.promise;
+  await expect(rows(page)).toHaveText(`History ${B}`);
+  for (const id of [A, B]) {
+    const request = host.calls.find((call) => call.id === id && call.kind === "preview")!.request;
+    await expect.poll(() => request.failure()?.errorText ?? "").toMatch(/abort|cancel/i);
+  }
+  obsolete.release();
+  opening.release();
+  late.release();
+  await Promise.all([obsolete.finished.promise, opening.finished.promise, late.finished.promise]);
+  await expect(rows(page)).toHaveText(`History ${B}`);
+  expect(host.count(A, "snapshot")).toBe(0);
+});
+
 test("open finishes before a bounded snapshot, and snapshot paints/connects before state", async ({
   page,
   host,
@@ -735,6 +847,48 @@ test("live and polled settlement updates create one notification without a run I
     exact: true,
   });
   await expect(notification).toHaveCount(1);
+});
+
+test("skipped settlements stay quiet during live updates and later polling", async ({
+  page,
+  host,
+}) => {
+  await page.clock.install();
+  await start(page, host);
+  await hydrated(page, host);
+  await received(host, A, "events");
+  const skipped = {
+    type: "agent_settled",
+    outcome: "skipped",
+    pendingResume: false,
+  };
+  host.sessionSettlements[A] = skipped;
+  host.sessionLastSeq[A] = 11;
+  host.emit(A, [{ seq: 11, event: skipped }]);
+  await received(host, A, "snapshot", 2);
+
+  const notification = page.getByRole("button", {
+    name: "Session completed: Loading Alpha",
+    exact: true,
+  });
+  await expect(notification).toHaveCount(0);
+
+  // Later events advance the session cursor even though the settlement is unchanged.
+  for (const seq of [12, 13]) {
+    host.sessionLastSeq[A] = seq;
+    host.sessionSettlements[B] = { outcome: "completed", runId: `beta-${seq}` };
+    await page.clock.fastForward(5_000);
+    const completed = page.getByRole("button", {
+      name: "Session completed: Loading Beta",
+      exact: true,
+    });
+    await expect(completed).toBeVisible();
+    await expect(notification).toHaveCount(0);
+    await page
+      .getByRole("button", { name: "Dismiss notification", exact: true })
+      .click();
+    await expect(completed).toHaveCount(0);
+  }
 });
 
 test("settled sessions create clickable dismissible notifications", async ({

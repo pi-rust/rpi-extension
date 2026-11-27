@@ -464,8 +464,7 @@ extern "C" fn execute(
     params: StbString,
     free: Option<FreeStringFn>,
 ) -> StepHandle {
-    let text = params.to_string_lossy();
-    params.free_with(free);
+    let text = rpi_plugin_sdk::stb_take!(params, free);
     HANDLES.insert(Drive {
         params: serde_json::from_str(&text).unwrap_or(Value::Null),
         done: false,
@@ -516,7 +515,10 @@ fn registered_tool_schema() -> StableToolSchema {
     }
 }
 
-rpi_plugin_sdk::export_plugin!(|api| {
+// Tool drives own their inputs. The shared lock table only serializes edits
+// to the same canonical file and holds no host callback context.
+
+rpi_plugin_sdk::export_shared_plugin!(|api| {
     let Some(register) = api.register_tool else {
         return 1;
     };

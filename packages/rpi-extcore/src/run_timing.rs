@@ -15,7 +15,8 @@ const RECORD_BUDGET: usize = 4096;
 const MAX_LINE: usize = 32 * 1024 * 1024;
 const RETAINED_SCRATCH: usize = 64 * 1024;
 const MAX_TIMINGS: usize = 20_000;
-const MAX_SESSIONS: usize = 16;
+/// Scans are keyed by `(session, selector)`, so the bound is per scan slot.
+const MAX_SCANS: usize = 32;
 const MAX_LANES: usize = 128;
 
 #[derive(Debug, Default, Deserialize)]
@@ -24,6 +25,9 @@ pub struct RunTimingsQuery {
     #[serde(rename = "entryIds", default)]
     pub entry_ids: Vec<String>,
     pub cursor: Option<String>,
+    /// Return every finished run in the session instead of selecting by entry IDs.
+    #[serde(default, rename = "all")]
+    pub all: bool,
 }
 impl RunTimingsQuery {
     pub fn validate(&self) -> Result<(), ServiceError> {
@@ -99,7 +103,16 @@ fn identity(m: &Metadata) -> Identity {
 }
 #[derive(Default)]
 pub(crate) struct RunTimingCache {
-    scans: VecDeque<(String, Scan)>,
+    scans: VecDeque<(ScanKey, Scan)>,
+}
+
+/// One cached scan per `(session, selector)` pair. Entry-ID filters still share
+/// a single slot per session because they are bounded batches of one logical
+/// row lookup; `all` is a different result set and needs its own scan.
+#[derive(Clone, PartialEq, Eq, Debug)]
+struct ScanKey {
+    session: String,
+    all: bool,
 }
 fn io_error(e: std::io::Error) -> ServiceError {
     failure(
@@ -128,35 +141,53 @@ impl RunTimingCache {
         query: &RunTimingsQuery,
     ) -> Result<RunTimingsPage, ServiceError> {
         query.validate()?;
-        let existing = self.scans.iter().position(|(key, _)| key == id);
-        let mut scan = if let Some(index) = existing {
-            // A stale client must not evict or promote a healthy newer generation.
-            if query
-                .cursor
-                .as_ref()
-                .is_some_and(|c| c != &self.scans[index].1.generation)
-            {
-                return Err(conflict());
-            }
-            self.scans.remove(index).unwrap().1
+        // `all` is the session-total lookup: entry selection is intentionally
+        // ignored so runs outside a bounded transcript window still count.
+        let selected: HashSet<_> = if query.all {
+            HashSet::new()
         } else {
-            if query.cursor.is_some() {
-                return Err(conflict());
+            query.entry_ids.iter().map(String::as_str).collect()
+        };
+        // The row and session-total selectors are independent readers over the
+        // same transcript. They must not own one shared scan slot: the footer
+        // polls `all` on every settlement while the transcript asks for visible
+        // entry IDs, and a single slot made each request evict the other
+        // selector's scan, so every call restarted from offset 0.
+        let mut scan = match self
+            .scans
+            .iter()
+            .position(|(key, _)| key.session == id && key.all == query.all)
+        {
+            Some(index) => {
+                // A stale client must not evict or promote a healthy newer generation.
+                if query
+                    .cursor
+                    .as_ref()
+                    .is_some_and(|c| c != &self.scans[index].1.generation)
+                {
+                    return Err(conflict());
+                }
+                self.scans.remove(index).unwrap().1
             }
-            let path = discover(root, id)?;
-            let m = fs::metadata(&path).map_err(io_error)?;
-            Scan {
-                path,
-                generation: format!("{id}:{}", uuid::Uuid::new_v4()),
-                identity: identity(&m),
-                modified: m.modified().ok(),
-                length: m.len(),
-                offset: 0,
-                pending: Vec::new(),
-                anchor: Vec::new(),
-                header: false,
-                active: HashMap::new(),
-                timings: Vec::new(),
+            None => {
+                if query.cursor.is_some() {
+                    return Err(conflict());
+                }
+                let path = discover(root, id)?;
+                let m = fs::metadata(&path).map_err(io_error)?;
+                Scan {
+                    path,
+                    generation: format!("{id}:{}", uuid::Uuid::new_v4()),
+                    identity: identity(&m),
+                    modified: m.modified().ok(),
+                    length: m.len(),
+                    offset: 0,
+                    pending: Vec::new(),
+                    anchor: Vec::new(),
+                    header: false,
+                    active: HashMap::new(),
+                    timings: Vec::new(),
+                }
             }
         };
         // Once the cursor matches, errors invalidate the affected cached scan.
@@ -245,12 +276,11 @@ impl RunTimingCache {
         }
         scan.modified = m.modified().ok();
         scan.length = total;
-        let selected: HashSet<_> = query.entry_ids.iter().map(String::as_str).collect();
         let page = RunTimingsPage {
             timings: scan
                 .timings
                 .iter()
-                .filter(|t| selected.contains(t.final_entry_id.as_str()))
+                .filter(|t| query.all || selected.contains(t.final_entry_id.as_str()))
                 .cloned()
                 .collect(),
             complete: scan.header && scan.offset == total && scan.pending.is_empty(),
@@ -258,8 +288,14 @@ impl RunTimingCache {
             scanned_bytes: scan.offset,
             total_bytes: total,
         };
-        self.scans.push_back((id.to_owned(), scan));
-        while self.scans.len() > MAX_SESSIONS {
+        self.scans.push_back((
+            ScanKey {
+                session: id.to_owned(),
+                all: query.all,
+            },
+            scan,
+        ));
+        while self.scans.len() > MAX_SCANS {
             self.scans.pop_front();
         }
         Ok(page)
@@ -548,6 +584,7 @@ mod tests {
                 &RunTimingsQuery {
                     entry_ids: ids.iter().map(|s| s.to_string()).collect(),
                     cursor,
+                    all: false,
                 },
             )
         }
@@ -557,6 +594,70 @@ mod tests {
             let _ = fs::remove_dir_all(&self.root);
         }
     }
+    #[test]
+    fn all_runs_query_is_not_limited_by_visible_entry_ids() {
+        let f = Fixture::new(false);
+        f.start("older", "main", 1, "run");
+        f.message("older-answer", "main");
+        f.finish("older", "main", 11);
+        f.start("newer", "main", 20, "run");
+        f.message("newer-answer", "main");
+        f.finish("newer", "main", 25);
+
+        let mut cache = RunTimingCache::default();
+        // The footer asks for every run, including rounds outside the
+        // transcript window that backs per-row timing footers.
+        let page = cache
+            .query(
+                &f.id,
+                &f.root,
+                &RunTimingsQuery {
+                    all: true,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert!(page.complete);
+        assert_eq!(page.timings.len(), 2);
+        assert_eq!(page.timings.iter().map(|t| t.elapsed_ms).sum::<u64>(), 15);
+
+        // The row query still selects by entry ID, and cannot inherit the
+        // broader result set from the session-total scan. It owns its own scan
+        // slot, so the row reader never stops the session-total reader (and
+        // vice versa) from continuing where it left off.
+        let row = f.query(&mut cache, None, &["newer-answer"]).unwrap();
+        assert_eq!(row.timings.len(), 1);
+        assert_eq!(row.timings[0].run_id, "newer");
+        let resumed = cache
+            .query(
+                &f.id,
+                &f.root,
+                &RunTimingsQuery {
+                    all: true,
+                    cursor: page.cursor.clone(),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(resumed.timings.len(), 2);
+        // A cursor from one selector is not valid for the other.
+        assert_eq!(
+            cache
+                .query(
+                    &f.id,
+                    &f.root,
+                    &RunTimingsQuery {
+                        entry_ids: vec!["newer-answer".into()],
+                        cursor: page.cursor,
+                        ..Default::default()
+                    },
+                )
+                .unwrap_err()
+                .0,
+            ReplyKind::Conflict
+        );
+    }
+
     #[test]
     fn native_multirun_multilane_and_exact_timestamps() {
         for nested in [false, true] {
@@ -729,7 +830,7 @@ mod tests {
         assert_ne!(g1, g2);
         let other = Fixture::new(false);
         other.query(&mut cache, None, &[]).unwrap();
-        let order: Vec<_> = cache.scans.iter().map(|(id, _)| id.clone()).collect();
+        let order: Vec<_> = cache.scans.iter().map(|(key, _)| key.clone()).collect();
         assert_eq!(
             f.query(&mut cache, g1, &[]).unwrap_err().0,
             ReplyKind::Conflict
@@ -738,7 +839,7 @@ mod tests {
             cache
                 .scans
                 .iter()
-                .map(|(id, _)| id.clone())
+                .map(|(key, _)| key.clone())
                 .collect::<Vec<_>>(),
             order
         );
@@ -885,7 +986,8 @@ mod tests {
             assert_eq!(
                 RunTimingsQuery {
                     entry_ids: ids,
-                    cursor: None
+                    cursor: None,
+                    all: false
                 }
                 .validate()
                 .unwrap_err()
@@ -918,7 +1020,7 @@ mod capacity_tests {
         fs::create_dir_all(&root).unwrap();
         let mut cache = RunTimingCache::default();
         let mut first = None;
-        for _ in 0..=MAX_SESSIONS {
+        for _ in 0..=MAX_SCANS {
             let id = uuid::Uuid::new_v4().to_string();
             fs::write(
                 root.join(format!("{id}.jsonl")),
@@ -930,7 +1032,7 @@ mod capacity_tests {
                 .unwrap();
             first.get_or_insert((id, page.cursor));
         }
-        assert_eq!(cache.scans.len(), MAX_SESSIONS);
+        assert_eq!(cache.scans.len(), MAX_SCANS);
         let (id, cursor) = first.unwrap();
         assert_eq!(
             cache

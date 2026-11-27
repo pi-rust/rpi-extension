@@ -1,7 +1,6 @@
-//! Owned process-tree lifetime; no SDK or plugin ABI dependency.
+//! Owned process-tree lifetime. The child is guarded before fallible setup.
 //!
-//! Windows job setup/thread resume and Unix process-group setup are adapted
-//! from rpi-plugin-sdk 0.3.20, src/process.rs (BigFish), MIT:
+//! Process-group cleanup is adapted from the MIT-licensed rpi-plugin-sdk.
 //! Copyright (c) 2026 BigFish.
 //! Permission is hereby granted, free of charge, to any person obtaining a copy
 //! of this software and associated documentation files (the "Software"), to deal
@@ -19,11 +18,17 @@
 //! OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 //! THE SOFTWARE.
 //!
-//! Unlike a bare Child or a fallible consuming wrapper, this owner is installed
-//! immediately after spawn, before any fallible job/pipe setup. All raw platform
-//! calls are confined to this module; every acquired Windows handle has RAII.
 use std::io;
 use std::process::{Child, Command};
+
+#[cfg(unix)]
+use nix::{
+    sys::signal::{killpg, Signal},
+    unistd::Pid,
+};
+#[cfg(windows)]
+use rpi_plugin_sdk::process::ProcessTree as WindowsProcessTree;
+
 mod file_lock;
 pub use file_lock::SharedFileLock;
 
@@ -39,9 +44,9 @@ pub use file_lock::SharedFileLock;
 pub struct ProcessTree {
     child: Child,
     #[cfg(windows)]
-    job: Option<std::os::windows::io::OwnedHandle>,
+    tree: Option<WindowsProcessTree>,
     #[cfg(unix)]
-    group: i32,
+    group: Pid,
     stopped: bool,
 }
 
@@ -49,7 +54,9 @@ impl ProcessTree {
     pub fn spawn(command: &mut Command) -> io::Result<Self> {
         #[cfg(windows)]
         {
-            Self::spawn_with(command, |_, _| Ok(()))
+            Self::spawn_with_attach(command, |child| {
+                WindowsProcessTree::attach(child).map_err(io::Error::other)
+            })
         }
         #[cfg(not(windows))]
         {
@@ -61,11 +68,26 @@ impl ProcessTree {
             let child = command.spawn()?;
             Ok(Self {
                 #[cfg(unix)]
-                group: child.id() as i32,
+                group: Pid::from_raw(child.id() as i32),
                 child,
                 stopped: false,
             })
         }
+    }
+
+    #[cfg(windows)]
+    fn spawn_with_attach(
+        command: &mut Command,
+        attach: impl FnOnce(&Child) -> io::Result<WindowsProcessTree>,
+    ) -> io::Result<Self> {
+        WindowsProcessTree::prepare(command);
+        let mut owner = Self {
+            child: command.spawn()?,
+            tree: None,
+            stopped: false,
+        };
+        owner.tree = Some(attach(&owner.child)?);
+        Ok(owner)
     }
 
     pub fn child_mut(&mut self) -> &mut Child {
@@ -81,20 +103,12 @@ impl ProcessTree {
         // prevents a later Drop from signaling a potentially recycled Unix PGID.
         self.stopped = true;
         #[cfg(windows)]
-        if let Some(job) = self.job.take() {
-            use std::os::windows::io::AsRawHandle;
-            // SAFETY: job is owned and valid throughout the call. Closing it
-            // afterwards is a second kill-on-close safeguard, even on failure.
-            unsafe {
-                windows_sys::Win32::System::JobObjects::TerminateJobObject(job.as_raw_handle(), 1);
-            }
+        if let Some(tree) = self.tree.take() {
+            tree.kill();
+            // Dropping the job also kills it before we wait for the child.
         }
         #[cfg(unix)]
-        // SAFETY: spawn created this dedicated group; kill takes only scalar
-        // IDs/signals and accesses no Rust memory. Signal even after leader exit.
-        unsafe {
-            libc::kill(-self.group, libc::SIGKILL);
-        }
+        let _ = killpg(self.group, Signal::SIGKILL);
         // Also handles Windows errors before job assignment and tree-kill
         // failures. Child::kill/::wait retain the actual process handle/PID.
         let _ = self.child.kill();
@@ -108,120 +122,7 @@ impl Drop for ProcessTree {
     }
 }
 
-#[cfg(windows)]
-const CREATION_FLAGS: u32 = windows_sys::Win32::System::Threading::CREATE_NO_WINDOW
-    | windows_sys::Win32::System::Threading::CREATE_SUSPENDED;
-
-// Local callback boundaries permit deterministic post-spawn fault injection,
-// without global/environment failure switches or changing protocol behavior.
-#[cfg(windows)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum SetupStage {
-    Spawned,
-    JobCreated,
-    Limited,
-    Assigned,
-}
-
-#[cfg(windows)]
-impl ProcessTree {
-    fn spawn_with(
-        command: &mut Command,
-        mut checkpoint: impl FnMut(SetupStage, &Child) -> io::Result<()>,
-    ) -> io::Result<Self> {
-        use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
-        use std::os::windows::process::CommandExt;
-        use windows_sys::Win32::System::JobObjects::*;
-
-        // No server code can run before containment, and GUI hosts retain the
-        // baseline headless launch behavior (pipes alone do not suppress windows).
-        command.creation_flags(CREATION_FLAGS);
-        let child = command.spawn()?;
-        let mut owner = Self {
-            child,
-            job: None,
-            stopped: false,
-        };
-        checkpoint(SetupStage::Spawned, &owner.child)?;
-        // SAFETY: null security/name pointers request an unnamed, non-inherited
-        // job. A non-null result transfers exactly one handle into OwnedHandle.
-        let job = unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) };
-        if job.is_null() {
-            return Err(io::Error::last_os_error());
-        }
-        // SAFETY: CreateJobObjectW returned a fresh valid owned job handle.
-        owner.job = Some(unsafe { OwnedHandle::from_raw_handle(job) });
-        checkpoint(SetupStage::JobCreated, &owner.child)?;
-        // SAFETY: this Windows POD structure has a valid all-zero representation.
-        let mut limits: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = unsafe { std::mem::zeroed() };
-        limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
-        // SAFETY: owner keeps job alive; limits points to an initialized struct
-        // of the exact size expected by this information class.
-        if unsafe {
-            SetInformationJobObject(
-                job,
-                JobObjectExtendedLimitInformation,
-                &limits as *const _ as *const _,
-                std::mem::size_of_val(&limits) as u32,
-            )
-        } == 0
-        {
-            return Err(io::Error::last_os_error());
-        }
-        checkpoint(SetupStage::Limited, &owner.child)?;
-        // SAFETY: both job and actual suspended child handles remain owned/live.
-        // Kill-on-close was set BEFORE assignment; no unprotected running gap.
-        if unsafe { AssignProcessToJobObject(job, owner.child.as_raw_handle()) } == 0 {
-            return Err(io::Error::last_os_error());
-        }
-        checkpoint(SetupStage::Assigned, &owner.child)?;
-        resume_child(owner.child.id())?;
-        Ok(owner)
-    }
-}
-
-#[cfg(windows)]
-fn resume_child(pid: u32) -> io::Result<()> {
-    use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
-    use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
-    use windows_sys::Win32::System::Diagnostics::ToolHelp::*;
-    use windows_sys::Win32::System::Threading::{OpenThread, ResumeThread, THREAD_SUSPEND_RESUME};
-    // SAFETY: snapshot flags/PID are scalar OS values. A successful snapshot
-    // transfers one handle to RAII; failure's sentinel is never adopted.
-    let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0) };
-    if snapshot == INVALID_HANDLE_VALUE {
-        return Err(io::Error::last_os_error());
-    }
-    // SAFETY: the snapshot is a fresh valid owned handle.
-    let snapshot = unsafe { OwnedHandle::from_raw_handle(snapshot) };
-    // SAFETY: THREADENTRY32 is Windows POD with a valid zero representation.
-    let mut entry: THREADENTRY32 = unsafe { std::mem::zeroed() };
-    entry.dwSize = std::mem::size_of_val(&entry) as u32;
-    // SAFETY: the owned snapshot is valid; entry is writable and size-initialized.
-    let mut found = unsafe { Thread32First(snapshot.as_raw_handle(), &mut entry) };
-    while found != 0 {
-        if entry.th32OwnerProcessID == pid {
-            // SAFETY: scalar access flags and the enumerated live thread ID;
-            // a successful result transfers a handle, not the thread lifetime.
-            let thread = unsafe { OpenThread(THREAD_SUSPEND_RESUME, 0, entry.th32ThreadID) };
-            if thread.is_null() {
-                return Err(io::Error::last_os_error());
-            }
-            // SAFETY: OpenThread returned a fresh valid owned handle.
-            let thread = unsafe { OwnedHandle::from_raw_handle(thread) };
-            // SAFETY: thread remains owned/live for the call.
-            if unsafe { ResumeThread(thread.as_raw_handle()) } == u32::MAX {
-                return Err(io::Error::last_os_error());
-            }
-            return Ok(());
-        }
-        // SAFETY: same valid snapshot and writable initialized entry as above.
-        found = unsafe { Thread32Next(snapshot.as_raw_handle(), &mut entry) };
-    }
-    Err(io::Error::other("MCP primary thread not found"))
-}
-
-#[cfg(test)]
+#[cfg(all(test, any(unix, windows)))]
 mod tests {
     use super::*;
     use std::path::PathBuf;
@@ -276,43 +177,37 @@ mod tests {
     }
 
     #[cfg(windows)]
-    struct Probe(std::os::windows::io::OwnedHandle);
+    struct Probe {
+        pid: u32,
+        // Keep the process object alive so its PID cannot be reused.
+        _handle: std::os::windows::io::OwnedHandle,
+    }
     #[cfg(windows)]
     impl Probe {
         fn new(child: &Child) -> Self {
             use std::os::windows::io::AsHandle;
-            Self(child.as_handle().try_clone_to_owned().unwrap())
+            Self {
+                pid: child.id(),
+                _handle: child.as_handle().try_clone_to_owned().unwrap(),
+            }
         }
         fn assert_exited(&self) {
-            use std::os::windows::io::AsRawHandle;
-            use windows_sys::Win32::System::Threading::{GetExitCodeProcess, WaitForSingleObject};
-            // SAFETY: the duplicate process handle stays owned for both calls;
-            // code is a writable local. Wait observes the actual process, not PID reuse.
-            unsafe {
-                assert_eq!(WaitForSingleObject(self.0.as_raw_handle(), 5000), 0);
-                let mut code = 0;
-                assert_ne!(GetExitCodeProcess(self.0.as_raw_handle(), &mut code), 0);
-                assert_ne!(code, 259); // STILL_ACTIVE
-            }
+            assert!(!rpi_plugin_sdk::process::process_is_running(self.pid).unwrap());
         }
     }
     #[cfg(unix)]
-    struct Probe(u32);
+    struct Probe(Pid);
     #[cfg(unix)]
     impl Probe {
         fn new(child: &Child) -> Self {
-            Self(child.id())
+            Self(Pid::from_raw(child.id() as i32))
         }
         fn assert_exited(&self) {
-            // SAFETY: waitpid receives a scalar child PID and null status; no
-            // Rust memory is exposed. ECHILD proves the owner already reaped it.
+            use nix::sys::wait::{waitpid, WaitPidFlag};
+            // ECHILD proves the owner already reaped it.
             assert_eq!(
-                unsafe { libc::waitpid(self.0 as i32, std::ptr::null_mut(), libc::WNOHANG) },
-                -1
-            );
-            assert_eq!(
-                io::Error::last_os_error().raw_os_error(),
-                Some(libc::ECHILD)
+                waitpid(self.0, Some(WaitPidFlag::WNOHANG)),
+                Err(nix::errno::Errno::ECHILD)
             );
         }
     }
@@ -364,45 +259,23 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
-    fn headless_and_suspended_creation_flags_are_composed() {
-        use windows_sys::Win32::System::Threading::{CREATE_NO_WINDOW, CREATE_SUSPENDED};
-        assert_eq!(CREATION_FLAGS, CREATE_NO_WINDOW | CREATE_SUSPENDED);
-    }
-
-    #[cfg(windows)]
-    #[test]
-    fn failed_job_create_limit_assign_or_resume_cleans_suspended_child() {
-        for stage in [
-            SetupStage::Spawned,
-            SetupStage::JobCreated,
-            SetupStage::Limited,
-            SetupStage::Assigned,
-        ] {
-            let canary = Canary::new();
-            assert!(!canary.0.exists());
-            let mut probe = None;
-            let mut pid = None;
-            let result = ProcessTree::spawn_with(&mut canary.command(), |at, child| {
-                if at == SetupStage::Spawned {
-                    pid = Some(child.id());
-                    probe = Some(Probe::new(child));
-                }
-                if at == stage {
-                    Err(io::Error::other(format!(
-                        "injected failure before next phase: {stage:?}"
-                    )))
-                } else {
-                    Ok(())
-                }
-            });
-            assert!(result.is_err(), "stage {stage:?}, pid {pid:?}");
-            probe
-                .expect("actual child spawned before injection")
-                .assert_exited();
-            assert!(
-                !canary.0.exists(),
-                "suspended child executed at {stage:?}, pid {pid:?}"
-            );
-        }
+    fn failed_attach_kills_and_waits_suspended_child() {
+        let canary = Canary::new();
+        let mut probe = None;
+        let result = ProcessTree::spawn_with_attach(&mut canary.command(), |child| {
+            probe = Some(Probe::new(child));
+            Err(io::Error::other("injected process-tree attach error"))
+        });
+        assert_eq!(
+            result.unwrap_err().to_string(),
+            "injected process-tree attach error"
+        );
+        probe
+            .expect("child spawned before attachment")
+            .assert_exited();
+        assert!(
+            !canary.0.exists(),
+            "suspended child executed before attachment"
+        );
     }
 }

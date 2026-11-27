@@ -1,6 +1,6 @@
 [package]
 name = "rpi-codemode"
-version.workspace = true
+version = "0.1.18"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
@@ -25,6 +25,9 @@ supported-targets = [
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-rpi-plugin-sdk = { workspace = true }
+rpi-plugin-sdk = { workspace = true, features = ["quickjs-allocator"] }
 serde_json = { workspace = true }
 rquickjs = { version = "=0.8.1", default-features = false, features = ["allocator"] }
+
+[lints]
+workspace = true

@@ -51,13 +51,23 @@ struct FrontendState {
     config: Arc<AppConfig>,
 }
 pub async fn run(config: AppConfig) -> Result<(), Box<dyn std::error::Error>> {
-    run_until(config, async {
+    run_with_host_area(config, None).await
+}
+
+/// Run Web with a native area selection. An empty selection uses the default area.
+pub async fn run_with_host_area(
+    config: AppConfig,
+    area: Option<String>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    run_until(config, area, async {
         let _ = tokio::signal::ctrl_c().await;
     })
     .await
 }
+
 pub(crate) async fn run_until(
     config: AppConfig,
+    host_area: Option<String>,
     stop: impl std::future::Future<Output = ()> + Send + 'static,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let asset_root = asset_root(&config);
@@ -98,7 +108,7 @@ pub(crate) async fn run_until(
         session_timeout_seconds: config.session_timeout_seconds,
         admission_limit: 64,
     };
-    rpi_httpcore::serve_until(
+    rpi_httpcore::serve_until_with_host_area(
         http,
         frontend,
         move |info| {
@@ -108,6 +118,7 @@ pub(crate) async fn run_until(
             )
         },
         stop,
+        host_area.as_deref(),
     )
     .await
     .map_err(|error| error as Box<dyn std::error::Error>)

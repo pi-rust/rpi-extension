@@ -855,3 +855,31 @@ ACK. Local evidence in `target/branch-live-native-5/` and final-source repeat
 retained process handles. This qualifies that isolated Windows path only, not
 all lifecycle/fork cases on real native, HTTP live delivery, UI/HMR, Unix,
 external providers, installed extensions or full parity. No deployment is implied.
+
+## Native delegated-child observation / 原生子 Agent 观察
+
+The typed `service::delegations` API reads native-owned, parent-scoped volatile
+child rosters and compact message/tool event pages and requests native-owned
+cancellation. It requires the exact `ready.childAgents` v1 profile; older native
+hosts return Unsupported rather than an empty roster. No method launches a host
+or creates a replacement transcript store. Native plugin owner checks remain
+unchanged, and children cannot be independently prompted/resumed.
+
+`turns` is the native unsigned 32-bit observation counter, not a configured turn
+budget. Unlimited children may report more than 32 turns; roster/event capacity
+limits remain independent of the number of model turns.
+
+The complete cursor is `(parentSessionId, epoch, childId, afterSeq)`. Pages are
+bounded to 32 events / 128 KiB; native retains 256 events / 1 MiB per child and at
+most 32 children. Process restart loses this volatile data. `resyncRequired` and
+`observation_gap` must be visible to clients; a partial event tail does not prove
+successful completion. A native cancellation acknowledgement does not prove OS
+process cleanup completion. `DelegationSubscription` polls the existing native
+owner using that cursor, without a detached background task; dropping it ends
+polling. Host replacement/unavailability terminates the stream explicitly.
+
+`service::delegations` 提供父会话范围内的原生子 Agent 列表、消息/工具事件分页和取消。
+仅在原生宿主精确声明 v1 能力时启用，旧宿主明确返回不支持。数据归原生所有，不启动
+额外宿主、不建立替代历史库，也不支持子会话独立续聊。游标包含父会话、epoch、子 ID
+及序号；淘汰、超大事件和宿主替换均显式提示。记录有界且只保存在原生进程内，取消
+响应仅代表接受取消信号。订阅释放后停止轮询。

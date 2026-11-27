@@ -1182,6 +1182,70 @@
     opacity: 1;
   }
 }
+/* Composer action progress ring. When Send / Continue / Stop is awaiting
+   acknowledgement the button turns into a pale disc with a rotating arc,
+   so a click reads as accepted until the host settles the action. */
+.workspace .send-button.composer-action-pending {
+  border-radius: 50%;
+  background: var(--soft);
+  color: var(--blue-text);
+}
+.workspace .send-button.composer-action-pending.composer-action-stop {
+  color: var(--danger);
+}
+.workspace .composer-action-progress {
+  position: relative;
+  display: grid;
+  place-items: center;
+  width: 100%;
+  height: 100%;
+  border-radius: 50%;
+}
+.workspace .composer-action-progress::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  border-radius: 50%;
+  /* An arc of ~1/3 of the circle, leaving the pale disc visible through the
+     rest. Spinning it gives the indeterminate progress cue in the reference. */
+  background: conic-gradient(
+    currentColor 0deg,
+    currentColor 120deg,
+    transparent 120deg,
+    transparent 360deg
+  );
+  -webkit-mask: radial-gradient(
+    farthest-side,
+    transparent calc(100% - 2px),
+    #000 calc(100% - 2px)
+  );
+  mask: radial-gradient(
+    farthest-side,
+    transparent calc(100% - 2px),
+    #000 calc(100% - 2px)
+  );
+  animation: composer-action-spin 0.9s linear infinite;
+}
+.workspace .composer-action-progress > * {
+  position: relative;
+  z-index: 1;
+}
+.workspace .composer-action-progress .stop-indicator {
+  background: currentColor;
+  width: 8px;
+  height: 8px;
+  flex-basis: 8px;
+}
+@keyframes composer-action-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .workspace .composer-action-progress::before {
+    animation-duration: 2.4s;
+  }
+}
 /* "Send now" delivered confirmation: the entry's button flashes a green
    check once the run prints the message, then returns to the play icon. */
 .queue-send-now.queue-send-now-sent {
@@ -1689,13 +1753,17 @@
 .workspace .stat-row {
   padding: 7px 0;
 }
+.workspace .tool-card,
+.workspace .read-image-previews {
+  --tool-summary-inline-padding: 0px;
+}
 .workspace .tool-card {
   border-width: 0 0 1px;
   margin-bottom: 6px;
 }
 .workspace .tool-card > summary {
   min-height: 30px;
-  padding: 3px 0;
+  padding-block: 3px;
 }
 .workspace .tool-detail {
   padding: 6px 12px 10px 26px;
@@ -1741,6 +1809,18 @@
   }
   .workspace .empty-conversation .transcript {
     padding-top: 60px;
+  }
+  /* A tall composer (attachments, a multiline draft) can reach past the gap
+     reserved for the empty-state copy, so the project name and welcome text
+     used to show through the translucent composer. Keep the copy where it is,
+     but stop the composer from being a window onto it: the composer area paints
+     the page background and the composer keeps its own opaque surface.
+     Hiding the welcome block instead would silently remove the empty state. */
+  .workspace .empty-conversation .composer-area {
+    background: var(--bg);
+  }
+  .workspace .empty-conversation .composer {
+    background: var(--surface);
   }
   .workspace .composer-area {
     padding: 10px 13px 18px;
@@ -2011,7 +2091,7 @@
 }
 .workspace .tool-card > summary {
   min-height: 34px;
-  padding: 5px 0;
+  padding-block: 5px;
 }
 .workspace .tool-detail {
   border-top: 0;

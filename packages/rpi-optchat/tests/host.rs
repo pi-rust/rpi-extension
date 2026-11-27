@@ -9,6 +9,8 @@
 //! The plugin keeps session state in process-wide statics, so every test holds
 //! [`LOCK`] and starts a fresh session.
 
+#![forbid(unsafe_code)]
+
 use rpi_optchat::rpi_plugin_register;
 use rpi_plugin_sdk::{
     CommandHandlerFn, EventHandlerFn, EventTag, PluginApi, RuntimeActionId, StablePluginEvent,
@@ -31,11 +33,18 @@ static APPENDED: Mutex<Vec<Value>> = Mutex::new(Vec::new());
 static STATUS: Mutex<Vec<Value>> = Mutex::new(Vec::new());
 /// When set, `AppendEntry` fails, which must never lose or duplicate a message.
 static APPEND_FAILS: Mutex<bool> = Mutex::new(false);
+/// Deliver a message-end callback from inside the next append.
+static MESSAGE_DURING_APPEND: Mutex<Option<&str>> = Mutex::new(None);
 /// When false, the host answers `GetSessionBranch` without `filtered`, the way
 /// a host that ignores the query would.
 static HONORS_FILTER: Mutex<bool> = Mutex::new(true);
 /// Every `GetSessionBranch` query, so the shape a test relies on is asserted.
 static QUERIES: Mutex<Vec<Value>> = Mutex::new(Vec::new());
+/// Switch branches from inside the next query with this order.
+static SWITCH_ON_QUERY: Mutex<Option<&str>> = Mutex::new(None);
+
+// GetExecutionContext can report a session cwd different from the host's.
+static PROJECT_DIR: Mutex<Option<std::path::PathBuf>> = Mutex::new(None);
 
 fn lock() -> MutexGuard<'static, ()> {
     let guard = LOCK.lock().unwrap_or_else(|error| error.into_inner());
@@ -44,7 +53,10 @@ fn lock() -> MutexGuard<'static, ()> {
     *STATUS.lock().unwrap() = Vec::new();
     *QUERIES.lock().unwrap() = Vec::new();
     *APPEND_FAILS.lock().unwrap() = false;
+    *MESSAGE_DURING_APPEND.lock().unwrap() = None;
     *HONORS_FILTER.lock().unwrap() = true;
+    *SWITCH_ON_QUERY.lock().unwrap() = None;
+    *PROJECT_DIR.lock().unwrap() = None;
     guard
 }
 
@@ -71,19 +83,37 @@ fn runtime_action(action, args, out, _user_data) {
     // and the plugin asks for it by number, so the fake matches on the number too.
     if action == 23 {
         out.write(json!({"model": {"id": "fake-model", "provider": "fake", "api": "openai"},
-                         "thinkingLevel": "off"}).to_string());
+                         "thinkingLevel": "off", "cwd": *PROJECT_DIR.lock().unwrap()}).to_string());
         return 0;
     }
     let id = RuntimeActionId::try_from(action).expect("plugin called an undeclared action");
     match id {
         RuntimeActionId::GetSessionBranch => {
-            out.write(get_session_branch(&args).to_string());
+            let snapshot = get_session_branch(&args);
+            let switch = {
+                let mut pending = SWITCH_ON_QUERY.lock().unwrap();
+                let matches = pending.is_some_and(|order| Some(order) == args["order"].as_str());
+                if matches {
+                    *pending = None;
+                }
+                matches
+            };
+            if switch {
+                BRANCH.lock().unwrap().clear();
+                seed(&[(0, "user", "new branch")]);
+                emit(EventTag::SessionTree, StablePluginEvent::empty(EventTag::SessionTree));
+            }
+            out.write(snapshot.to_string());
         }
         RuntimeActionId::AppendEntry => {
             if *APPEND_FAILS.lock().unwrap() {
                 // A rejecting host answers with a non-zero rc, not with a JSON error.
                 out.write(json!({"error": "the host refused the entry"}).to_string());
                 return 1;
+            }
+            let message = MESSAGE_DURING_APPEND.lock().unwrap().take();
+            if let Some(message) = message {
+                emit_assistant_message(message);
             }
             out.write(append_entry(&args).to_string());
         }
@@ -173,6 +203,15 @@ fn api() -> PluginApi {
         declare: None,
         register_before_agent_start: None,
         register_oauth_provider: None,
+        register_streaming_provider: None,
+        register_tool_with_wake: None,
+        register_plugin_lifecycle: None,
+        register_tool_prompt: None,
+        register_oauth_provider_cancellable: None,
+        register_tool_result: None,
+        register_autocomplete_provider: None,
+        register_command_completions: None,
+        register_argument_suggester: None,
     };
     api.register_command = Some(register_command);
     api.register_event_handler = Some(register_event);
@@ -187,13 +226,17 @@ fn start() -> MutexGuard<'static, ()> {
     *COMMAND.lock().unwrap() = None;
     *EVENTS.lock().unwrap() = Vec::new();
     *RENDERER.lock().unwrap() = None;
+    // Simulate a primary session even when the test runner is a subagent.
+    std::env::remove_var("RPI_ORCHESTRATOR_SUBAGENT");
+    std::env::remove_var(rpi_plugin_sdk::SUBAGENT_PARENT_TRACE_ID_ENV);
+    std::env::remove_var("RPI_OPTCHAT_COMPACT");
     // Profile mirroring must not write into the checkout, and a developer's
     // environment must not decide which store these tests read.
     let store = std::env::temp_dir().join(format!("optchat-host-test-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&store);
     std::env::set_var("RPI_OPTCHAT_STORE_DIR", &store);
     std::env::set_var("RPI_OPTCHAT_PROFILE", "");
-    rpi_plugin_register(&api());
+    assert_eq!(rpi_plugin_register(&api()), 0);
     emit(
         EventTag::SessionStart,
         StablePluginEvent::empty(EventTag::SessionStart),
@@ -224,8 +267,7 @@ fn command(args: &str) -> Value {
         &mut output,
         std::ptr::null_mut(),
     );
-    let text = output.to_string_lossy();
-    rpi_plugin_sdk::callbacks::free_string(output);
+    let text = rpi_plugin_sdk::stb_take!(output, Some(rpi_plugin_sdk::callbacks::free_string));
     assert_eq!(rc, 0, "command handler failed for `{args}`");
     serde_json::from_str(&text).expect("command returned JSON")
 }
@@ -342,6 +384,29 @@ fn a_new_message_on_the_branch_reloads_the_log_instead_of_appending_past_it() {
 }
 
 #[test]
+fn a_tree_move_during_the_cached_branch_probe_reloads_the_new_branch() {
+    let _guard = start();
+    seed(&[(0, "user", "old branch")]);
+    assert!(text("view 5").contains("old branch"));
+    *SWITCH_ON_QUERY.lock().unwrap() = Some("newestFirst");
+
+    let view = text("view 5");
+    assert!(view.contains("new branch"), "{view}");
+    assert!(!view.contains("old branch"), "{view}");
+}
+
+#[test]
+fn a_tree_move_during_hydration_discards_the_stale_snapshot() {
+    let _guard = start();
+    seed(&[(0, "user", "old branch")]);
+    *SWITCH_ON_QUERY.lock().unwrap() = Some("oldestFirst");
+
+    let view = text("view 5");
+    assert!(view.contains("new branch"), "{view}");
+    assert!(!view.contains("old branch"), "{view}");
+}
+
+#[test]
 fn a_note_is_persisted_before_it_is_committed_and_keeps_its_id() {
     let _guard = start();
     let answer = text("note remember the bounded window");
@@ -410,6 +475,31 @@ fn a_message_end_is_captured_once_per_distinct_message() {
     );
     assert_eq!(APPENDED.lock().unwrap().len(), 2);
     assert!(text("status").contains("2 messages"));
+}
+
+fn emit_assistant_message(text: &str) {
+    let message = json!({"kind": "assistant", "content": text});
+    emit(
+        EventTag::MessageEnd,
+        StablePluginEvent::message(
+            EventTag::MessageEnd,
+            StbString::from_string(message.to_string()),
+        ),
+    );
+}
+
+#[test]
+fn a_capture_reentered_during_append_does_not_block_the_host() {
+    let _guard = start();
+    *MESSAGE_DURING_APPEND.lock().unwrap() = Some("reentered callback");
+    emit_assistant_message("first capture");
+    emit_assistant_message("later capture");
+
+    let appended = APPENDED.lock().unwrap();
+    assert_eq!(appended.len(), 2);
+    assert_eq!(appended[0]["data"]["text"], "first capture");
+    assert_eq!(appended[1]["data"]["text"], "later capture");
+    assert_eq!(appended[1]["data"]["i"], 1);
 }
 
 #[test]
@@ -503,8 +593,7 @@ fn an_entry_renderer_hides_optchat_entries_only() {
             &mut output,
             std::ptr::null_mut(),
         );
-        let text = output.to_string_lossy();
-        rpi_plugin_sdk::callbacks::free_string(output);
+        let text = rpi_plugin_sdk::stb_take!(output, Some(rpi_plugin_sdk::callbacks::free_string));
         (rc, text)
     };
     for value in [
@@ -551,7 +640,44 @@ extern "C" fn register_entry_renderer(
     _free: rpi_plugin_sdk::FreeStringFn,
     _: *mut std::ffi::c_void,
 ) -> i32 {
-    assert_eq!(unsafe { name.as_str() }, "optchat");
+    assert_eq!(rpi_plugin_sdk::stb_text!(name), "optchat");
     *RENDERER.lock().unwrap() = Some(render);
     0
+}
+
+#[test]
+fn profile_paths_and_relative_import_follow_the_session_project() {
+    let _guard = start();
+    let root = std::env::temp_dir().join(format!("optchat-projects-{}", std::process::id()));
+    let left = root.join("left");
+    let right = root.join("right");
+    for dir in [&left, &right] {
+        std::fs::create_dir_all(dir).unwrap();
+    }
+    std::env::remove_var("RPI_OPTCHAT_STORE_DIR");
+    *PROJECT_DIR.lock().unwrap() = Some(left.clone());
+    std::fs::write(left.join("notes.txt"), "imported from left\n").unwrap();
+    assert!(command("import notes.txt")["text"]
+        .as_str()
+        .unwrap()
+        .contains("Imported 1"));
+    assert!(left.join(".rpi/optchat/default.jsonl").is_file());
+    assert!(text("status").contains("`default` (1 stored)"));
+    assert!(text("profile").contains(&left.join(".rpi/optchat").display().to_string()));
+    assert!(command("recall imported from left")["text"]
+        .as_str()
+        .unwrap()
+        .contains("imported from left"));
+
+    *PROJECT_DIR.lock().unwrap() = Some(right.clone());
+    assert!(command("recall imported from left")["text"]
+        .as_str()
+        .unwrap()
+        .contains("holds nothing"));
+    std::env::set_var("RPI_OPTCHAT_STORE_DIR", "my-profiles");
+    command("note only on the right");
+    assert!(right.join("my-profiles/default.jsonl").is_file());
+    assert!(!left.join("my-profiles").exists());
+    std::env::remove_var("RPI_OPTCHAT_STORE_DIR");
+    std::fs::remove_dir_all(root).unwrap();
 }

@@ -1,13 +1,34 @@
 #![forbid(unsafe_code)]
 
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, ExitStatus, Stdio};
 use std::time::Duration;
 
 mod kit;
 
 use crate::kit::optional_string;
 use serde_json::Value;
+#[cfg(windows)]
 use wait_timeout::ChildExt;
+
+#[cfg(windows)]
+fn wait_for_child(child: &mut Child, timeout: Duration) -> std::io::Result<Option<ExitStatus>> {
+    child.wait_timeout(timeout)
+}
+
+// wait-timeout installs a process-wide SIGCHLD handler on Unix. Polling the
+// owned child keeps this image from leaving a signal callback behind on unload.
+#[cfg(not(windows))]
+fn wait_for_child(child: &mut Child, timeout: Duration) -> std::io::Result<Option<ExitStatus>> {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        let status = child.try_wait()?;
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if status.is_some() || remaining.is_zero() {
+            return Ok(status);
+        }
+        std::thread::sleep(remaining.min(Duration::from_millis(20)));
+    }
+}
 
 fn code_lens(params: &Value) -> Result<String, String> {
     let check = optional_string(params, "check", "diff");
@@ -28,24 +49,32 @@ fn code_lens(params: &Value) -> Result<String, String> {
         .args(args)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    if let Some(cwd) = params
+    let session_cwd = params[rpi_plugin_sdk::HOST_CONTEXT_KEY]["cwd"]
+        .as_str()
+        .filter(|value| !value.is_empty());
+    let requested_cwd = params
         .get("cwd")
         .and_then(Value::as_str)
-        .filter(|value| !value.is_empty())
-    {
-        command.current_dir(cwd);
+        .filter(|value| !value.is_empty());
+    if let Some(cwd) = requested_cwd.or(session_cwd) {
+        let cwd = std::path::Path::new(cwd);
+        match session_cwd.filter(|_| cwd.is_relative()) {
+            Some(base) => command.current_dir(std::path::Path::new(base).join(cwd)),
+            None => command.current_dir(cwd),
+        };
     }
     let mut child = command
         .spawn()
         .map_err(|err| format!("unable to run {program}: {err}"))?;
-    if child
-        .wait_timeout(Duration::from_secs(timeout))
-        .map_err(|err| format!("failed while waiting for {check}: {err}"))?
-        .is_none()
-    {
+    let wait_error = match wait_for_child(&mut child, Duration::from_secs(timeout)) {
+        Ok(Some(_)) => None,
+        Ok(None) => Some(format!("{check} timed out after {timeout}s")),
+        Err(err) => Some(format!("failed while waiting for {check}: {err}")),
+    };
+    if let Some(message) = wait_error {
         let _ = child.kill();
         let _ = child.wait();
-        return Err(format!("{check} timed out after {timeout}s"));
+        return Err(message);
     }
     let output = child
         .wait_with_output()
@@ -53,7 +82,11 @@ fn code_lens(params: &Value) -> Result<String, String> {
     let mut text = String::from_utf8_lossy(&output.stdout).to_string();
     text.push_str(&String::from_utf8_lossy(&output.stderr));
     if text.len() > 40_000 {
-        text.truncate(40_000);
+        let mut end = 40_000;
+        while !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        text.truncate(end);
         text.push_str("\n[truncated]");
     }
     Ok(format!(
@@ -63,7 +96,7 @@ fn code_lens(params: &Value) -> Result<String, String> {
     ))
 }
 
-const DESCRIPTION: &str = "Run one local diagnostic, not arbitrary shell commands or automatic fixes. Requires git/cargo (and rustfmt/clippy when selected) on PATH and a suitable repository/project directory. Defaults to git diff --check in the plugin process directory; cwd must be explicit to select another project (__rpi.cwd is not used). Returns check name, exit code and stdout followed by stderr, capped after collection at 40,000 bytes plus a truncation marker; a nonzero exit is diagnostic output, not a tool error. Spawn/wait/collection errors and timeout fail the tool. Cargo commands may run build scripts, access the network and write build/cache artifacts; no tests are run. Timeout kills only the direct child, not its descendants; output is buffered, not streamed.";
+const DESCRIPTION: &str = "Run one local diagnostic, not arbitrary shell commands or automatic fixes. Requires git/cargo (and rustfmt/clippy when selected) on PATH and a suitable repository/project directory. Defaults to git diff --check in the host session workspace when available. Use cwd to select another directory. Returns check name, exit code and stdout followed by stderr, capped after collection at 40,000 bytes plus a truncation marker; a nonzero exit is diagnostic output, not a tool error. Spawn/wait/collection errors and timeout fail the tool. Cargo commands may run build scripts, access the network and write build/cache artifacts; no tests are run. Timeout kills only the direct child, not its descendants; output is buffered, not streamed.";
 
 const PARAMETERS: &str = r#"{
   "type": "object",
@@ -77,7 +110,7 @@ const PARAMETERS: &str = r#"{
     },
     "cwd": {
       "type": "string",
-      "description": "Optional child working directory: use an absolute repository/project directory for predictable results. Omitted or empty uses the plugin process directory, not host __rpi.cwd; a relative directory is resolved from that process directory. Must exist and suit the selected check (Git repository for diff, Cargo project for cargo/fmt/clippy); does not change the host directory."
+      "description": "Optional child working directory: use an absolute repository/project directory for predictable results. Omitted or empty uses the host session workspace when available, otherwise the plugin process directory. A relative directory is resolved from that same base. Must exist and suit the selected check (Git repository for diff, Cargo project for cargo/fmt/clippy); does not change the host directory."
     },
     "timeoutSeconds": {
       "type": "integer",
@@ -89,6 +122,9 @@ const PARAMETERS: &str = r#"{
   }
 }"#;
 
+// The tool owns its child and waits inside poll. Its ABI helper stores only
+// per-call inputs and no host callback context.
+
 export_single_tool_plugin!(code_lens, "code_lens", DESCRIPTION, PARAMETERS);
 
 #[cfg(test)]
@@ -98,8 +134,8 @@ mod tests {
     #[test]
     fn registered_schema_preserves_optional_inputs_and_runtime_limits() {
         let registered = registered_tool_schema();
-        assert_eq!(registered.name.to_string_lossy(), "code_lens");
-        let description = registered.description.to_string_lossy();
+        assert_eq!(rpi_plugin_sdk::stb_text!(registered.name), "code_lens");
+        let description = rpi_plugin_sdk::stb_text!(registered.description);
         for constraint in [
             "not arbitrary",
             "nonzero exit",
@@ -109,7 +145,7 @@ mod tests {
         ] {
             assert!(description.contains(constraint), "missing {constraint}");
         }
-        let schema: Value = serde_json::from_str(&registered.parameters.to_string_lossy())
+        let schema: Value = serde_json::from_str(&rpi_plugin_sdk::stb_text!(registered.parameters))
             .expect("registered parameters must be JSON");
         assert_eq!(schema["type"], "object");
         assert_eq!(schema["additionalProperties"], true); // Host may inject __rpi.
@@ -136,7 +172,7 @@ mod tests {
         assert!(properties["cwd"]["description"]
             .as_str()
             .unwrap()
-            .contains("not host __rpi.cwd"));
+            .contains("host session workspace"));
         assert!(properties["check"]["description"]
             .as_str()
             .unwrap()

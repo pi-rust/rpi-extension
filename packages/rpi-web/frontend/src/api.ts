@@ -233,6 +233,11 @@ export interface AbortResult {
   followUp?: ReclaimedQueuedMessage[];
 }
 
+/** Native `stop_run` reply: the run is cancelled and its queue is untouched. */
+export interface StopRunResult {
+  stopped?: boolean;
+}
+
 export interface QueueItem {
   entryId: string;
   queue: string;
@@ -779,6 +784,23 @@ export const api = {
       method: "POST",
       body: JSON.stringify(metadata),
     }),
+  bulkSessionMetadata: (
+    sessionIds: string[],
+    metadata: { pinned?: boolean; archived?: boolean; tags?: string[] },
+  ) =>
+    request<{
+      updated: string[];
+      updatedSessions: {
+        sessionId: string;
+        pinned: boolean;
+        archived: boolean;
+        tags: string[];
+      }[];
+      skipped: { sessionId: string; code: string; error: string }[];
+    }>("/sessions/metadata/batch", {
+      method: "POST",
+      body: JSON.stringify({ sessionIds, patch: metadata }),
+    }),
   files: (projectId: string, path = "", root?: string) => {
     const query = new URLSearchParams({ path });
     if (root) query.set("root", root);
@@ -1008,13 +1030,13 @@ export const api = {
   },
   runTimings: (
     id: string,
-    entryIds: string[],
+    query: { entryIds?: string[]; all?: boolean },
     cursor?: string,
     signal?: AbortSignal,
   ) =>
     request<RunTimingsPage>(`/sessions/${id}/run-timings/query`, {
       method: "POST",
-      body: JSON.stringify({ entryIds, ...(cursor ? { cursor } : {}) }),
+      body: JSON.stringify({ ...query, ...(cursor ? { cursor } : {}) }),
       signal,
     }),
   messageSummaries: (
@@ -1303,6 +1325,11 @@ export const api = {
       method: "POST",
       body: JSON.stringify({ title }),
     }),
+  sessionPreview: (id: string, signal?: AbortSignal) =>
+    request<{ sessionId: string; messages: unknown[]; hasMore: boolean } | undefined>(
+      `/sessions/${id}/preview`,
+      { signal },
+    ),
   openSession: (id: string, signal?: AbortSignal) =>
     request<SessionSummary>(`/sessions/${id}/open`, { method: "POST", signal }),
   runtimeState: (id: string, signal?: AbortSignal) =>

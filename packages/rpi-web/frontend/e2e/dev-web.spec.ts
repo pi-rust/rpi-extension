@@ -48,6 +48,7 @@ const capabilities = {
     "navigate",
     "prompt",
     "abort",
+    "stop_run",
     "get_auth_status",
     "set_api_key",
   ],
@@ -61,6 +62,7 @@ const capabilities = {
     "history_mutation",
     "provider_auth",
     "session_metadata",
+    "session_bulk_metadata",
     "projects",
     "create_project",
     "session_organization",
@@ -109,6 +111,8 @@ async function mockHost(
       if (await close.count()) await close.click();
     },
   );
+  const bulkMetadataBodies: unknown[] = [];
+  let listSessionCalls = 0;
   const projects = [
     {
       id: "project-a",
@@ -141,6 +145,12 @@ async function mockHost(
       archived: false,
     });
   }
+  (page as Page & { __bulkMetadataBodies?: unknown[] }).__bulkMetadataBodies =
+    bulkMetadataBodies;
+  Object.defineProperty(page, "__listSessionCalls", {
+    configurable: true,
+    get: () => listSessionCalls,
+  });
   await page.route("**/api/v1/**", async (route: Route) => {
     const request = route.request();
     const url = new URL(request.url());
@@ -250,7 +260,34 @@ async function mockHost(
     if (path === "/api/v1/capabilities") {
       return route.fulfill({ json: capabilities });
     }
+    if (path === "/api/v1/sessions/metadata/batch") {
+      const body = request.postDataJSON() as {
+        sessionIds: string[];
+        patch: { archived?: boolean; pinned?: boolean };
+      };
+      bulkMetadataBodies.push(body);
+      const updated: string[] = [];
+      for (const id of body.sessionIds) {
+        const entry = sessions.find((s) => s.sessionId === id);
+        if (!entry) continue;
+        Object.assign(entry ?? {}, body.patch);
+        updated.push(id);
+      }
+      return route.fulfill({
+        json: {
+          updated,
+          updatedSessions: updated.map((id) => ({
+            sessionId: id,
+            pinned: body.patch.pinned ?? false,
+            archived: body.patch.archived ?? false,
+            tags: [],
+          })),
+          skipped: [],
+        },
+      });
+    }
     if (path === "/api/v1/sessions" && request.method() === "GET") {
+      listSessionCalls += 1;
       return route.fulfill({ json: { sessions } });
     }
     if (path === "/api/v1/sessions" && request.method() === "POST") {
@@ -832,52 +869,39 @@ test("editing a queued message re-enqueues it as a follow-up", async ({
     ]);
 });
 
-test("stopping a run restores the reclaimed queue to the composer", async ({
-  page,
-}) => {
+test("stopping a run keeps queued messages in the queue", async ({ page }) => {
   await mockHost(page);
-  // A run is active and the host holds one follow-up for it. `abort` replies
-  // with the reclaimed message instead of keeping it, so the UI has to restore
-  // that text or the staged input is silently lost.
+  // A run is active and the host holds one follow-up for it. Stop cancels the
+  // run but must leave the queue pending and visible; it must not restore the
+  // staged text into the composer.
   await page.route(`**/api/v1/sessions/${sessionId}/events**`, async (route) =>
     route.fulfill({
       contentType: "text/event-stream",
       body: 'id: 5\nevent: agent_start\ndata: {"type":"agent_start"}\n\n',
     }),
   );
-  let aborted = false;
   const commands: string[] = [];
   await page.route(
     `**/api/v1/sessions/${sessionId}/commands`,
     async (route) => {
       const body = route.request().postDataJSON() as { type: string };
       if (body.type === "get_queue") {
-        const items = aborted
-          ? []
-          : [
-              {
-                entryId: "queue-1",
-                queue: "followUp",
-                status: "queued",
-                text: "staged while running",
-              },
-            ];
+        const items = [
+          {
+            entryId: "queue-1",
+            queue: "followUp",
+            status: "queued",
+            text: "staged while running",
+          },
+        ];
         return route.fulfill({
           json: response({ items, count: items.length }, body.type),
         });
       }
-      if (body.type === "abort") {
-        aborted = true;
-        commands.push("abort");
+      if (body.type === "stop_run") {
+        commands.push("stop_run");
         return route.fulfill({
-          json: response(
-            {
-              aborted: true,
-              steer: [],
-              followUp: [{ text: "staged while running", images: [] }],
-            },
-            body.type,
-          ),
+          json: response({ stopped: true }, body.type),
         });
       }
       return route.fallback();
@@ -891,13 +915,11 @@ test("stopping a run restores the reclaimed queue to the composer", async ({
     page.getByRole("button", { name: "Abort", exact: true }),
   ).toBeEnabled();
   await page.getByRole("button", { name: "Abort", exact: true }).click();
-  await expect.poll(() => commands).toEqual(["abort"]);
-  await expect(input).toHaveValue("staged while running");
-  await expect(
-    page
-      .locator(".transcript-note")
-      .filter({ hasText: "Restored 1 queued message(s) to the composer" }),
-  ).toBeVisible();
+  await expect.poll(() => commands).toEqual(["stop_run"]);
+  await expect(input).toHaveValue("");
+  await expect(page.locator(".composer-queue-item")).toContainText(
+    "staged while running",
+  );
 });
 
 test("history records expand and queue history toggles", async ({ page }) => {
@@ -1195,34 +1217,18 @@ test("rename, pin, archive and restore survive reloads", async ({ page }) => {
   ).toBeVisible();
 });
 
-test("fork is available from a session context menu", async ({ page }) => {
+test("session context menu does not offer the redundant Fork action", async ({
+  page,
+}) => {
   await mockHost(page);
-  let forkBody: { title?: string } | undefined;
-  await page.route("**/api/v1/sessions/session-1/fork", async (route) => {
-    forkBody = route.request().postDataJSON();
-    return route.fulfill({
-      status: 201,
-      json: {
-        sessionId: "fork-session",
-        sourceSessionId: sessionId,
-        status: "ready",
-      },
-    });
-  });
   await page.goto("/");
-  await page.locator(".project-session").first().click({ button: "right" });
+  await clickRowAction(page, "Session actions: Mock session");
+  await expect(
+    page.getByRole("menuitem", { name: "Clone", exact: true }),
+  ).toBeVisible();
   await expect(
     page.getByRole("menuitem", { name: "Fork", exact: true }),
-  ).toBeVisible();
-  await page.getByRole("menuitem", { name: "Fork", exact: true }).click();
-  const dialog = page.getByRole("dialog", {
-    name: "Name the new fork",
-    exact: true,
-  });
-  await expect(dialog.getByRole("textbox")).toHaveValue("Fork of Mock session");
-  await dialog.getByRole("textbox").fill("Design fork");
-  await dialog.getByRole("button", { name: "Submit", exact: true }).click();
-  await expect.poll(() => forkBody).toEqual({ title: "Design fork" });
+  ).toHaveCount(0);
 });
 
 test("session menu uses clone wording and icon for the clone action", async ({
@@ -1243,9 +1249,6 @@ test("session menu uses clone wording and icon for the clone action", async ({
   });
   await page.goto("/");
   await clickRowAction(page, "Session actions: Mock session");
-  await expect(
-    page.getByRole("menuitem", { name: "Fork", exact: true }),
-  ).toBeVisible();
   const clone = page.getByRole("menuitem", { name: "Clone", exact: true });
   await expect(clone).toBeVisible();
   await expect(clone.locator("svg.lucide-copy")).toHaveCount(1);
@@ -1291,11 +1294,29 @@ test("multi-select session actions pin and archive in bulk", async ({
     .click();
   await page.getByRole("button", { name: "Select all", exact: true }).click();
   await expect(selectionBar).toContainText("3 selected");
+  const listCallsBeforeArchive = (page as Page & { __listSessionCalls: number })
+    .__listSessionCalls;
   await page.getByRole("button", { name: "Archive", exact: true }).click();
   await expect(page.locator(".session-selection-bar")).toHaveCount(0);
   await expect(page.getByRole("checkbox")).toHaveCount(0);
+  // One actual batch write, not one metadata request per checked row.
+  const batches = (page as Page & { __bulkMetadataBodies?: unknown[] })
+    .__bulkMetadataBodies;
+  expect(batches).toHaveLength(2);
+  expect((batches![1] as { sessionIds: string[] }).sessionIds.sort()).toEqual([
+    "session-1",
+    "session-2",
+    "session-3",
+  ]);
+  expect(
+    (batches![1] as { patch: { archived?: boolean } }).patch.archived,
+  ).toBe(true);
+  expect(
+    (page as Page & { __listSessionCalls: number }).__listSessionCalls,
+  ).toBe(listCallsBeforeArchive + 1);
+  // Bulk archive stays on the project view instead of jumping to archived.
   await expect(
-    page.getByRole("button", { name: "Show projects", exact: true }),
+    page.getByRole("button", { name: "Show archived chats", exact: true }),
   ).toBeVisible();
 });
 
@@ -1527,22 +1548,51 @@ test("the workspace exposes an installable manifest and icons", async ({
     display: string;
     start_url: string;
     scope: string;
-    icons: Array<{ src: string; sizes: string; type: string }>;
+    icons: Array<{ src: string; sizes: string; type: string; purpose: string }>;
   };
   expect(body.display).toBe("standalone");
   expect(body.start_url).toBe("/");
   expect(body.scope).toBe("/");
-  expect(body.icons.map((icon) => icon.sizes)).toEqual(
-    expect.arrayContaining(["192x192", "512x512"]),
+  expect(body.icons).toEqual(
+    expect.arrayContaining([
+      expect.objectContaining({ sizes: "192x192", purpose: "any" }),
+      expect.objectContaining({ sizes: "512x512", purpose: "any" }),
+      expect.objectContaining({ sizes: "512x512", purpose: "maskable" }),
+    ]),
+  );
+  await page.goto("/");
+  await expect(page.locator('link[rel="manifest"]')).toHaveAttribute(
+    "href",
+    "/manifest.webmanifest",
   );
   for (const icon of body.icons) {
     const response = await request.get(icon.src);
     expect(response.status(), icon.src).toBe(200);
     expect(response.headers()["content-type"], icon.src).toContain("image/png");
+    const asset = await page.evaluate(async (src) => {
+      const image = new Image();
+      image.src = src;
+      await image.decode();
+      const canvas = document.createElement("canvas");
+      canvas.width = image.naturalWidth;
+      canvas.height = image.naturalHeight;
+      const context = canvas.getContext("2d")!;
+      context.drawImage(image, 0, 0);
+      return {
+        size: `${canvas.width}x${canvas.height}`,
+        cornerAlpha: context.getImageData(0, 0, 1, 1).data[3],
+      };
+    }, icon.src);
+    expect(asset.size, icon.src).toBe(icon.sizes);
+    expect(asset.cornerAlpha, icon.src).toBe(
+      icon.purpose === "maskable" ? 255 : 0,
+    );
+    if (icon.purpose === "maskable") {
+      await expect(
+        page.locator('link[rel="apple-touch-icon"]'),
+      ).toHaveAttribute("href", icon.src);
+    }
   }
-  // The page must reference the manifest, or the browser never reads it.
-  const html = await (await page.goto("/")).text();
-  expect(html).toContain('rel="manifest"');
 });
 
 test("install entry opens the browser prompt and hides once installed", async ({
@@ -6743,6 +6793,198 @@ test("snapshot overlap neither duplicates committed messages nor downgrades comp
   await expect(page.locator(".transcript-note")).toHaveText(["Completed once"]);
 });
 
+test("snapshot and live events share committed assistant message IDs", async ({
+  page,
+}) => {
+  await mockHost(page);
+  const thinking = { type: "thinking", thinking: "**Checking staging**" };
+  const assistant = {
+    role: "assistant",
+    timestamp: 42,
+    content: [thinking, { type: "text", text: "Saved assistant response" }],
+  };
+  const committedEvent = {
+    messageId: "saved-assistant",
+    message: assistant,
+  };
+  await page.route(`**/api/v1/sessions/${sessionId}/open`, (route) =>
+    route.fulfill({ json: { ...session, status: "running" } }),
+  );
+  await page.route(snapshotRoute, (route) =>
+    route.fulfill({
+      json: {
+        sessionId,
+        status: "running",
+        messages: [{ ...assistant, entryId: committedEvent.messageId }],
+        events: [{ seq: 5, event: { type: "message_update", ...committedEvent } }],
+        lastSeq: 5,
+      },
+    }),
+  );
+
+  let release!: () => void;
+  const live = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  await page.route(`**/api/v1/sessions/${sessionId}/events?*`, async (route) => {
+    await live;
+    const events = [
+      { type: "message_end", ...committedEvent },
+      {
+        type: "message_start",
+        messageId: "new-assistant",
+        message: { role: "assistant", content: [] },
+      },
+      {
+        type: "message_end",
+        messageId: "new-assistant",
+        message: {
+          role: "assistant",
+          timestamp: 43,
+          content: [thinking, { type: "text", text: "New assistant response" }],
+        },
+      },
+    ];
+    return route.fulfill({
+      contentType: "text/event-stream",
+      body:
+        "retry: 60000\n" +
+        events
+          .map(
+            (event, index) =>
+              `id: ${6 + index}\nevent: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`,
+          )
+          .join(""),
+    });
+  });
+
+  try {
+    await page.goto(`/?session=${sessionId}`);
+    const thoughts = page.locator(".thinking-row");
+    const saved = page.getByText("Saved assistant response", { exact: true });
+    await expect(saved).toHaveCount(1);
+    await expect(thoughts).toHaveCount(1);
+    release();
+    await expect(
+      page.getByText("New assistant response", { exact: true }),
+    ).toBeVisible();
+    await expect(saved).toHaveCount(1);
+    await expect(thoughts).toHaveCount(2);
+  } finally {
+    release();
+  }
+});
+
+test("read images show outside tool details on live completion and reload", async ({
+  page,
+}) => {
+  await mockHost(page);
+  const data =
+    "iVBORw0KGgoAAAANSUhEUgAAA8AAAALQAQAAAAB3DCQZAAAAa0lEQVR42u3BAQ0AAADCoPdPbQ43oAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAHgyVF8AAZzfEVQAAAAASUVORK5CYII=";
+  const content = [{ type: "image", data, mimeType: "image/png" }];
+  let finished = false;
+  await page.route(snapshotRoute, (route) =>
+    route.fulfill({
+      json: {
+        sessionId,
+        lastSeq: finished ? 5 : 4,
+        events: [],
+        messages: [
+          {
+            role: "assistant",
+            entryId: "read-image-assistant",
+            content: [
+              {
+                type: "toolCall",
+                id: "read-image",
+                name: "read",
+                arguments: { path: "assets/diagram.png" },
+              },
+            ],
+          },
+          ...(finished
+            ? [
+                {
+                  role: "toolResult",
+                  entryId: "read-image-result",
+                  toolCallId: "read-image",
+                  toolName: "read",
+                  content,
+                },
+              ]
+            : []),
+        ],
+      },
+    }),
+  );
+  let release!: () => void;
+  const started = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  await page.route(`**/api/v1/sessions/${sessionId}/events?*`, async (route) => {
+    await started;
+    const event = {
+      type: "tool_execution_end",
+      toolCallId: "read-image",
+      toolName: "read",
+      result: { content },
+    };
+    return route.fulfill({
+      contentType: "text/event-stream",
+      body: `retry: 60000\nid: 5\nevent: tool_execution_end\ndata: ${JSON.stringify(event)}\n\n`,
+    });
+  });
+
+  try {
+    await page.goto("/");
+    const card = page.locator(".tool-card").filter({ hasText: "diagram.png" });
+    const preview = page.getByRole("button", {
+      name: "Enlarge image: diagram.png",
+    });
+    await expect(card).toBeVisible();
+    await expect(preview).toHaveCount(0);
+    release();
+    await expect(card).toHaveClass(/tool-done/);
+    await expect(card).not.toHaveAttribute("open", "");
+    await expect(preview).toBeVisible();
+    await expect(preview).toHaveJSProperty("naturalWidth", 960);
+    const figure = preview.locator("..");
+    const label = card.locator(".tool-summary-text");
+    expect((await figure.boundingBox())!.x).toBeCloseTo(
+      (await label.boundingBox())!.x,
+    );
+    const thumbnail = await preview.boundingBox();
+    expect(thumbnail!.width).toBeLessThanOrEqual(320);
+    expect(thumbnail!.height).toBeLessThanOrEqual(200);
+    await expect(card.locator("img")).toHaveCount(0);
+    await preview.focus();
+    await preview.press("Enter");
+    const viewer = page.getByRole("dialog", { name: "Image viewer" });
+    const fullImage = viewer.getByRole("img", { name: "diagram.png" });
+    await expect(fullImage).toBeVisible();
+    await expect(fullImage).toHaveJSProperty("naturalWidth", 960);
+    await page.keyboard.press("Escape");
+    await expect(viewer).toHaveCount(0);
+    await expect(preview).toBeFocused();
+    await card.locator("summary").click();
+    await expect(card.locator(".tool-arguments")).toContainText("diagram.png");
+    await expect(card).not.toContainText(data);
+    await expect(preview).toHaveCount(1);
+
+    finished = true;
+    await page.setViewportSize({ width: 390, height: 844 });
+    await page.reload();
+    await expect(card).not.toHaveAttribute("open", "");
+    await expect(preview).toBeVisible();
+    await expect(preview).toHaveCount(1);
+    expect((await figure.boundingBox())!.x).toBeCloseTo(
+      (await label.boundingBox())!.x,
+    );
+  } finally {
+    release();
+  }
+});
+
 test("native permission dialog blocks global new-chat shortcuts", async ({
   page,
 }) => {
@@ -10442,6 +10684,14 @@ test.describe("run timing regressions", () => {
     totalBytes: 100,
     ...extra,
   });
+  // The footer asks for `{all:true}` (the whole session) independently of the
+  // per-row `entryIds` lookup. Assertions about row lookups must ignore the
+  // session-total request instead of assuming every request carries entryIds.
+  type TimingQuery = { entryIds?: string[]; all?: boolean; cursor?: string };
+  const rowQueries = (queries: TimingQuery[]) =>
+    queries.filter((query) => !query.all);
+  const sessionQueries = (queries: TimingQuery[]) =>
+    queries.filter((query) => query.all === true);
   const gate = () => {
     let release!: () => void;
     const promise = new Promise<void>((resolve) => {
@@ -10461,23 +10711,39 @@ test.describe("run timing regressions", () => {
     page,
   }) => {
     await mockHost(page);
-    await history(page, [
-      { role: "user", entryId: "work-prompt", content: "Do work" },
-      finalMessage("work-final", "Worked"),
-    ]);
-    await page.route(timingRoute, (route) =>
-      route.fulfill({
-        json: timingPage([
-          nativeTiming("work-final", "work-run-1", "completed", 138_000),
-          nativeTiming("work-final", "work-run-2", "failed", 2_000),
-        ]),
-      }),
-    );
+    // Only the newest round is in the loaded transcript. The footer must
+    // still add the older native run discovered by the all-session lookup.
+    await history(page, [finalMessage("work-final", "Worked")]);
+    const queries: unknown[] = [];
+    await page.route(timingRoute, (route) => {
+      const body = route.request().postDataJSON();
+      queries.push(body);
+      return route.fulfill({
+        json: timingPage(
+          body.all
+            ? [
+                nativeTiming("older-final", "older-run", "completed", 60_000),
+                nativeTiming("work-final", "work-run-1", "completed", 138_000),
+                nativeTiming("work-final", "work-run-2", "failed", 2_000),
+              ]
+            : [
+                nativeTiming("work-final", "work-run-1", "completed", 138_000),
+                nativeTiming("work-final", "work-run-2", "failed", 2_000),
+              ],
+        ),
+      });
+    });
     await page.goto("/");
     const metrics = page.locator(".composer-metrics.slim-metrics");
+    // The older run has no row in the loaded transcript, so summing the
+    // per-row timings would report only the most recent round.
     await expect(
-      metrics.getByLabel("Session work: 2m 20s", { exact: true }),
-    ).toContainText("2m 20s");
+      metrics.getByLabel("Session work: 3m 20s", { exact: true }),
+    ).toContainText("3m 20s");
+    expect(queries).toContainEqual({ all: true });
+    expect(queries).toContainEqual({
+      entryIds: ["work-final"],
+    });
     const labels = await metrics
       .locator(".composer-metric")
       .evaluateAll((nodes) =>
@@ -10486,8 +10752,120 @@ test.describe("run timing regressions", () => {
     expect(labels).toEqual(["Cache hit", "Context", "Session work"]);
     await chooseLanguage(page, "zh");
     await expect(
-      metrics.getByLabel("会话工作时长: 2m 20s", { exact: true }),
+      metrics.getByLabel("会话工作时长: 3m 20s", { exact: true }),
     ).toBeVisible();
+  });
+
+  test("composer footer ticks during an active run and settles to recorded time", async ({
+    page,
+  }) => {
+    await mockHost(page);
+    const messages = [finalMessage()];
+    const liveRun = "current-run";
+    const now = new Date("2026-11-27T12:00:00Z");
+    const historyData = {
+      records: [],
+      hasMore: false,
+      openOperations: [
+        {
+          id: liveRun,
+          lane: "main",
+          intent: { kind: "run" },
+          timestamp: now.getTime() - 20_000,
+        },
+      ],
+    };
+    const nativeStart = gate();
+    const refresh = gate();
+    const completion = gate();
+    let refreshed = false;
+    let settled = false;
+    await page.clock.install({ time: now });
+    await page.route(snapshotRoute, (route) =>
+      route.fulfill({
+        json: {
+          sessionId,
+          messages: refreshed
+            ? [...messages, finalMessage("refreshed", "Refreshed transcript")]
+            : messages,
+          events: [],
+          lastSeq: settled ? 6 : refreshed ? 5 : 4,
+          status: settled ? "ready" : "running",
+        },
+      }),
+    );
+    await page.route(`**/api/v1/sessions/${sessionId}/open`, (route) =>
+      route.fulfill({ json: session }),
+    );
+    await page.route(`**/api/v1/sessions/${sessionId}/commands`, async (route) => {
+      if (route.request().postDataJSON().type !== "get_history")
+        return route.fallback();
+      await nativeStart.promise;
+      return route.fulfill({ json: response(historyData) });
+    });
+    await page.route(timingRoute, (route) =>
+      route.fulfill({
+        json: timingPage([
+          nativeTiming(undefined, "previous-run", "completed", 2_000),
+          ...(settled ? [nativeTiming(undefined, liveRun, "completed", 36_000)] : []),
+        ]),
+      }),
+    );
+    await page.route(`**/api/v1/sessions/${sessionId}/events?*`, async (route) => {
+      if (!refreshed) {
+        await refresh.promise;
+        refreshed = true;
+        return route.fulfill({
+          contentType: "text/event-stream",
+          body: 'retry: 100\nid: 5\nevent: agent_start\ndata: {"type":"agent_start"}\n\n',
+        });
+      }
+      await completion.promise;
+      const event = { type: "agent_settled", runId: liveRun, outcome: "completed" };
+      return route.fulfill({
+        contentType: "text/event-stream",
+        body: `retry: 60000\nid: 6\nevent: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`,
+      });
+    });
+
+    try {
+      await page.goto(`/?session=${sessionId}`);
+      const metric = page.getByLabel(/^Session work:/);
+      await expect(metric).toHaveAttribute(
+        "title",
+        "Recorded work time plus time since this page detected the current run",
+      );
+      nativeStart.release();
+      await expect(metric).toHaveAttribute(
+        "title",
+        "Recorded work time plus the current run",
+      );
+      refresh.release();
+      await expect(page.getByText("Refreshed transcript")).toBeVisible();
+      await expect(metric).toHaveAttribute(
+        "title",
+        "Recorded work time plus the current run",
+      );
+      const elapsedSeconds = async () => {
+        const text = await metric.innerText();
+        const part = (unit: string) =>
+          Number(text.match(new RegExp(`(\\d+)${unit}`))?.[1] ?? 0);
+        return part("h") * 3600 + part("m") * 60 + part("s");
+      };
+      await expect.poll(elapsedSeconds).toBeGreaterThanOrEqual(22);
+      const before = await elapsedSeconds();
+      await page.clock.runFor(2500);
+      await expect.poll(elapsedSeconds).toBeGreaterThanOrEqual(before + 2);
+      settled = true;
+      completion.release();
+      await expect(metric).toHaveText("38s");
+      await page.clock.runFor(3000);
+      await expect(metric).toHaveText("38s");
+    } finally {
+      nativeStart.release();
+      refresh.release();
+      completion.release();
+    }
   });
 
   test("composer footer shows unknown work when native timings are unavailable", async ({
@@ -10562,7 +10940,7 @@ test.describe("run timing regressions", () => {
         ],
       },
     ]);
-    const requests: Array<{ entryIds: string[]; cursor?: string }> = [];
+    const requests: TimingQuery[] = [];
     await page.route(timingRoute, (route) => {
       expect(route.request().method()).toBe("POST");
       requests.push(route.request().postDataJSON());
@@ -10585,12 +10963,18 @@ test.describe("run timing regressions", () => {
       ).toHaveCount(0);
       await expect(page.locator(".tool-card .run-elapsed")).toHaveCount(0);
     }
-    expect(requests.length).toBeGreaterThanOrEqual(2);
-    for (const request of requests)
+    const rows = rowQueries(requests);
+    expect(rows.length).toBeGreaterThanOrEqual(2);
+    for (const request of rows)
       expect(request.entryIds).toContain("elapsed-final");
     expect(
-      requests.filter((request) => !request.cursor).length,
+      rows.filter((request) => !request.cursor).length,
     ).toBeGreaterThanOrEqual(2);
+    // The session-total lookup is asked once per binding, not once per reload
+    // of the row list, and never reuses a row cursor.
+    expect(sessionQueries(requests).length).toBeGreaterThanOrEqual(1);
+    for (const request of sessionQueries(requests))
+      expect(request.cursor).toBeUndefined();
   });
 
   test("run elapsed live completion refreshes native snapshot before attaching the footer", async ({
@@ -10620,8 +11004,8 @@ test.describe("run timing regressions", () => {
       }),
     );
     await page.route(timingRoute, (route) => {
-      const { entryIds } = route.request().postDataJSON();
-      queriedFinal ||= entryIds.includes("elapsed-final");
+      const { entryIds, all } = route.request().postDataJSON() as TimingQuery;
+      if (!all) queriedFinal ||= Boolean(entryIds?.includes("elapsed-final"));
       return route.fulfill({
         json: timingPage(queriedFinal ? [nativeTiming()] : []),
       });
@@ -10676,15 +11060,21 @@ test.describe("run timing regressions", () => {
     });
     const queries: string[][] = [];
     await page.route(timingRoute, (route) => {
-      const { entryIds } = route.request().postDataJSON();
-      queries.push(entryIds);
+      const allTimings = [
+        nativeTiming(),
+        nativeTiming("older-a", "run-older-a"),
+        nativeTiming("older-b", "run-older-b"),
+      ];
+      const { entryIds, all } = route.request().postDataJSON() as TimingQuery;
+      // The session-total lookup returns every finished run by definition.
+      if (!all) queries.push(entryIds ?? []);
       return route.fulfill({
         json: timingPage(
-          [
-            nativeTiming(),
-            nativeTiming("older-a", "run-older-a"),
-            nativeTiming("older-b", "run-older-b"),
-          ].filter((timing) => entryIds.includes(timing.finalEntryId)),
+          all
+            ? allTimings
+            : allTimings.filter((timing) =>
+                entryIds?.includes(timing.finalEntryId),
+              ),
         ),
       });
     });
@@ -10774,7 +11164,11 @@ test.describe("run timing regressions", () => {
     const restart = gate();
     const queries: Array<{ entryIds: string[]; cursor?: string }> = [];
     await page.route(timingRoute, async (route) => {
-      queries.push(route.request().postDataJSON());
+      const query = route.request().postDataJSON() as TimingQuery;
+      // The session-total reader is a separate stream; this test scripts the
+      // row reader's conflict handling only.
+      if (query.all) return route.fulfill({ json: timingPage([]) });
+      queries.push(query as { entryIds: string[]; cursor?: string });
       if (queries.length === 1)
         return route.fulfill({
           json: timingPage([nativeTiming("elapsed-final", "before-reset")], {
@@ -10818,7 +11212,10 @@ test.describe("run timing regressions", () => {
     await history(page, [finalMessage()]);
     const queries: Array<{ cursor?: string }> = [];
     await page.route(timingRoute, (route) => {
-      queries.push(route.request().postDataJSON());
+      const query = route.request().postDataJSON() as TimingQuery;
+      if (query.all)
+        return route.fulfill({ json: timingPage([nativeTiming()]) });
+      queries.push(query);
       const n = queries.length;
       return route.fulfill({
         json: timingPage(n === 1 ? [] : [nativeTiming()], {
@@ -10846,6 +11243,10 @@ test.describe("run timing regressions", () => {
     await history(page, [finalMessage()]);
     let requests = 0;
     await page.route(timingRoute, (route) => {
+      const { all } = route.request().postDataJSON() as TimingQuery;
+      // The bounded-continuation budget belongs to one row lookup; the
+      // session-total reader completes immediately and must not consume it.
+      if (all) return route.fulfill({ json: timingPage([]) });
       requests++;
       return route.fulfill({
         json: timingPage([], {
@@ -10899,6 +11300,15 @@ test.describe("run timing regressions", () => {
     const errors: string[] = [];
     page.on("pageerror", (error) => errors.push(error.message));
     await page.route(timingRoute, (route) => {
+      // Older backends lack the endpoint for both readers. The posture under
+      // test is that one 404 silences the row reader instead of retrying it on
+      // every pagination; the session-total reader answers independently.
+      const { all } = route.request().postDataJSON() as TimingQuery;
+      if (all)
+        return route.fulfill({
+          status: 404,
+          json: { error: "Unknown endpoint" },
+        });
       requests++;
       return route.fulfill({
         status: 404,
@@ -10991,7 +11401,9 @@ test.describe("run timing regressions", () => {
     const conflicts = [gate(), gate(), gate()];
     const queries: Array<{ entryIds: string[]; cursor?: string }> = [];
     await page.route(timingRoute, async (route) => {
-      queries.push(route.request().postDataJSON());
+      const query = route.request().postDataJSON() as TimingQuery;
+      if (query.all) return route.fulfill({ json: timingPage([]) });
+      queries.push(query as { entryIds: string[]; cursor?: string });
       const index = queries.length - 1;
       const pass = Math.floor(index / 2);
       if (pass >= conflicts.length)
@@ -11072,9 +11484,8 @@ test.describe("run timing regressions", () => {
           },
         );
       await page.route(timingRoute, (route) => {
-        expect(route.request().postDataJSON().entryIds).toContain(
-          "terminal-result",
-        );
+        const { entryIds, all } = route.request().postDataJSON() as TimingQuery;
+        if (!all) expect(entryIds).toContain("terminal-result");
         return route.fulfill({
           json: timingPage([
             nativeTiming("terminal-result", "terminal-run", "aborted"),
@@ -11214,8 +11625,9 @@ test.describe("run timing regressions", () => {
     const refreshed = gate();
     const queries: Array<{ entryIds: string[]; cursor?: string }> = [];
     await page.route(timingRoute, async (route) => {
-      const query = route.request().postDataJSON();
-      queries.push(query);
+      const query = route.request().postDataJSON() as TimingQuery;
+      if (query.all) return route.fulfill({ json: timingPage([]) });
+      queries.push(query as { entryIds: string[]; cursor?: string });
       if (queries.length === 1)
         return route.fulfill({
           json: timingPage([nativeTiming("batch-0", "old-first")], {
@@ -19000,7 +19412,7 @@ test.describe("retirement", () => {
     ).toHaveCount(1);
     await clickRowAction(page, "Session actions: Mock session");
     await expect(
-      page.getByRole("menuitem", { name: "Fork", exact: true }),
+      page.getByRole("menuitem", { name: "Clone", exact: true }),
     ).toBeVisible();
     await expect(
       page.getByRole("menuitem", { name: "Archive", exact: true }),
@@ -19081,6 +19493,14 @@ test("startup auto-archives stale sessions by last completed turn", async ({
       return route.fulfill({ json: { sessions } });
     return route.fallback();
   });
+  await page.route(
+    "**/api/v1/sessions/metadata/batch",
+    async (route: Route) => {
+      const body = route.request().postDataJSON() as { sessionIds: string[] };
+      archived.push(...body.sessionIds);
+      return route.fallback();
+    },
+  );
   await page.route(/\/sessions\/[^/]+\/metadata$/, async (route: Route) => {
     const id = new URL(route.request().url()).pathname.split("/")[4];
     archived.push(id);
@@ -19151,6 +19571,10 @@ test("changing auto-archive settings never re-runs startup or moves the chat", a
     if (route.request().method() === "GET")
       return route.fulfill({ json: { sessions: [session, stale] } });
     sessionMutations.push(`${route.request().method()} /sessions`);
+    return route.fallback();
+  });
+  await page.route("**/api/v1/sessions/metadata/batch", (route: Route) => {
+    sessionMutations.push("metadata");
     return route.fallback();
   });
   await page.route(/\/sessions\/[^/]+\/metadata$/, (route: Route) => {

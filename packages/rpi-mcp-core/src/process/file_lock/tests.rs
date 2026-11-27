@@ -19,17 +19,12 @@ fn observation_lease_is_noncreating_shared_and_excludes_independent_writer_handl
         .write(true)
         .open(&path)
         .unwrap();
-    assert_eq!(
-        platform_lock(&writer, true).unwrap_err().kind(),
-        io::ErrorKind::WouldBlock
-    );
+    let try_write = || fs2::FileExt::try_lock_exclusive(&writer).map_err(lock_error);
+    assert_eq!(try_write().unwrap_err().kind(), io::ErrorKind::WouldBlock);
     drop(first);
-    assert_eq!(
-        platform_lock(&writer, true).unwrap_err().kind(),
-        io::ErrorKind::WouldBlock
-    );
+    assert_eq!(try_write().unwrap_err().kind(), io::ErrorKind::WouldBlock);
     drop(second);
-    platform_lock(&writer, true).unwrap();
+    try_write().unwrap();
     assert!(
         matches!(SharedFileLock::try_open(&path),Err(e) if e.kind()==io::ErrorKind::WouldBlock)
     );
