@@ -1280,6 +1280,79 @@ code {
 .settings-toggle input {
   accent-color: var(--blue);
 }
+.auto-update-settings,
+.auto-archive-settings {
+  border-top: 1px solid var(--line);
+  padding-top: 16px;
+}
+.update-targets {
+  display: grid;
+  gap: 12px;
+  margin: 12px 0;
+}
+.update-target {
+  display: grid;
+  gap: 4px;
+  padding: 10px 12px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--soft);
+}
+.update-target span {
+  color: var(--muted);
+  font-size: 12px;
+}
+.update-target button {
+  justify-self: start;
+}
+.update-proxy {
+  display: grid;
+  gap: 6px;
+  margin-top: 16px;
+}
+.settings-text {
+  width: 100%;
+  box-sizing: border-box;
+}
+.update-proxy-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+.update-task {
+  display: grid;
+  gap: 6px;
+  margin-top: 12px;
+  padding: 10px 12px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  font-size: 12px;
+}
+.update-log {
+  max-height: 160px;
+  overflow: auto;
+  white-space: pre-wrap;
+  word-break: break-word;
+  margin: 0;
+  font-size: 11px;
+  color: var(--muted);
+}
+.update-error {
+  color: #e5484d;
+}
+.update-badge {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 16px;
+  height: 16px;
+  padding: 0 4px;
+  border-radius: 999px;
+  background: var(--blue);
+  color: white;
+  font-size: 10px;
+  font-weight: 700;
+}
 .user-avatar {
   width: 24px;
   height: 24px;

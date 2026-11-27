@@ -52,6 +52,10 @@ import {
   X,
 } from "lucide-react";
 import { useInstallApp } from "./installApp";
+import {
+  readAutoUpdatePreference,
+  writeAutoUpdatePreference,
+} from "./autoUpdate";
 import { FilePreview } from "./FilePreview";
 import { readPreviewLink } from "./previewLink";
 import type { ProjectFileLink } from "./messageLinks";
@@ -92,6 +96,8 @@ import { delegationInfo, isDelegationTool } from "./delegation";
 import { queueDeliverAs } from "./queueKind";
 import {
   api,
+  type UpdateInfo,
+  type UpdateTaskStatus,
   ApiError,
   commandData,
   hostIsRetired,
@@ -358,6 +364,8 @@ const LOCAL_SLASH_COMMANDS = new Set(["/help", "/tools"]);
  * reports the session as unavailable. A healthy stream refills the budget.
  */
 const MAX_REARMS = 3;
+/** One install poll per second, bounded so a lost status cannot spin forever. */
+const UPDATE_POLL_BUDGET = 900;
 
 const FAST_SNAPSHOT_OPTIONS = {
   limit: 40,
@@ -840,6 +848,123 @@ export default function App() {
   const [autoArchive, setAutoArchive] = useState<SessionAutoArchivePreference>(
     readSessionAutoArchivePreference,
   );
+  const [autoUpdate, setAutoUpdate] = useState(readAutoUpdatePreference);
+  const [updateInfo, setUpdateInfo] = useState<UpdateInfo | null>(null);
+  const [updateBusy, setUpdateBusy] = useState(false);
+  const [updateError, setUpdateError] = useState("");
+  const [proxyDraft, setProxyDraft] = useState("");
+  const [proxyBusy, setProxyBusy] = useState(false);
+  const [updateTaskId, setUpdateTaskId] = useState<string | null>(null);
+  /** The status poll hit its budget while the task still reported running. */
+  const [updateTimeout, setUpdateTimeout] = useState(false);
+  const [updateTask, setUpdateTask] = useState<UpdateTaskStatus | null>(null);
+
+  const checkUpdates = useCallback(async (force = false) => {
+    setUpdateBusy(true);
+    setUpdateError("");
+    try {
+      const info = await api.updatesCheck(force);
+      setUpdateInfo(info);
+      setProxyDraft(info.proxy ?? "");
+    } catch (cause) {
+      setUpdateError(cause instanceof Error ? cause.message : String(cause));
+    } finally {
+      setUpdateBusy(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    if (!authChecked || (authRequired && !authenticated)) return;
+    if (!readAutoUpdatePreference().enabled) return;
+    void checkUpdates();
+  }, [authChecked, authRequired, authenticated, checkUpdates]);
+
+  useEffect(() => {
+    if (!updateTaskId) return;
+    let active = true;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    // Bound the poll: an install task is dropped by the backend after a few
+    // minutes, and a lost terminal state must not leave an endless timer.
+    let polls = 0;
+    const poll = async () => {
+      try {
+        const result = await api.updateTaskStatus(updateTaskId);
+        if (!active) return;
+        setUpdateTask(result);
+        if (result.state === "running" && ++polls < UPDATE_POLL_BUDGET) {
+          timer = setTimeout(() => void poll(), 1000);
+        } else if (result.state === "running") {
+          setUpdateTimeout(true);
+        }
+      } catch (cause) {
+        if (!active) return;
+        setUpdateError(cause instanceof Error ? cause.message : String(cause));
+      }
+    };
+    void poll();
+    return () => {
+      active = false;
+      if (timer) clearTimeout(timer);
+    };
+  }, [updateTaskId]);
+
+  const saveProxy = useCallback(async () => {
+    setProxyBusy(true);
+    setUpdateError("");
+    try {
+      const result = await api.saveUpdatesProxy(proxyDraft);
+      setUpdateInfo((previous) =>
+        previous
+          ? {
+              ...previous,
+              proxy: result.proxy,
+              proxyConfigured: result.proxyConfigured,
+            }
+          : previous,
+      );
+      void checkUpdates(true);
+    } catch (cause) {
+      setUpdateError(cause instanceof Error ? cause.message : String(cause));
+    } finally {
+      setProxyBusy(false);
+    }
+  }, [proxyDraft, checkUpdates]);
+
+  const startUpdate = useCallback(async (target: "host" | "extension") => {
+    setUpdateError("");
+    setUpdateTimeout(false);
+    try {
+      const result = await api.installUpdate(target);
+      setUpdateTaskId(result.taskId);
+      setUpdateTask({
+        state: "running",
+        target,
+        message: "Update is running…",
+        log: "",
+        restartRequired: false,
+      });
+    } catch (cause) {
+      setUpdateError(cause instanceof Error ? cause.message : String(cause));
+    }
+  }, []);
+
+  const webExtensionUpdate = useMemo(() => {
+    // A partial answer (an older backend, or the local fallback that drops the
+    // inventory when `rpi updates` is unavailable) must degrade to "unknown",
+    // not throw: an exception here unmounts the whole workspace.
+    const extensions = updateInfo?.extensions;
+    if (!Array.isArray(extensions)) return null;
+    return (
+      extensions.find((entry) => entry?.name === "rpi-web") ??
+      extensions[0] ??
+      null
+    );
+  }, [updateInfo]);
+  const updateAvailable = Boolean(
+    updateInfo?.host?.updatable || webExtensionUpdate?.updatable,
+  );
+  const updateRunning = updateTask?.state === "running";
+
   // The startup sweep reads the preference once, through a ref: a settings
   // change must not re-run session bootstrap or move the restored chat.
   const autoArchiveRef = useRef(autoArchive);
@@ -6225,6 +6350,193 @@ export default function App() {
                 {t("mappedToolNames")}
               </button>
             </div>
+            <div className="auto-update-settings">
+              <label htmlFor="settings-auto-update-enabled">
+                {language === "zh" ? "自动更新" : "Automatic updates"}
+              </label>
+              <label
+                className="settings-toggle"
+                htmlFor="settings-auto-update-enabled"
+              >
+                <input
+                  id="settings-auto-update-enabled"
+                  type="checkbox"
+                  checked={autoUpdate.enabled}
+                  onChange={(event) => {
+                    const next = { enabled: event.target.checked };
+                    setAutoUpdate(next);
+                    writeAutoUpdatePreference(next);
+                    if (next.enabled) void checkUpdates();
+                  }}
+                />
+                {language === "zh"
+                  ? "打开网页时检查新版本"
+                  : "Check for new versions on open"}
+              </label>
+              <p className="form-hint">
+                {language === "zh"
+                  ? "仅检查并提示，不会自动安装；安装后需重启 rpi 宿主生效。开启后每次打开页面会调用一次原生 rpi 检查更新。"
+                  : "Checks and notifies only; updates are installed manually and require restarting the rpi host. When enabled, each page open runs one native rpi check."}
+              </p>
+              <div className="update-targets">
+                <div className="update-target">
+                  <strong>{language === "zh" ? "宿主 rpi" : "rpi host"}</strong>
+                  <span>
+                    {language === "zh" ? "当前" : "Current"}: v
+                    {updateInfo?.host?.current ?? "—"}
+                    {updateInfo?.host?.latest
+                      ? ` · ${language === "zh" ? "最新" : "latest"}: v${updateInfo.host.latest}`
+                      : ""}
+                  </span>
+                  <button
+                    type="button"
+                    className="settings-refresh"
+                    disabled={!updateInfo?.host?.updatable || updateRunning}
+                    onClick={() => void startUpdate("host")}
+                  >
+                    {language === "zh" ? "更新宿主" : "Update host"}
+                  </button>
+                </div>
+                <div className="update-target">
+                  <strong>rpi-web</strong>
+                  <span>
+                    {language === "zh" ? "当前" : "Current"}: v
+                    {webExtensionUpdate?.current ?? "—"}
+                    {webExtensionUpdate?.latest
+                      ? ` · ${language === "zh" ? "最新" : "latest"}: v${webExtensionUpdate.latest}`
+                      : ""}
+                    {webExtensionUpdate?.reason === "local-install"
+                      ? ` · ${language === "zh" ? "本地安装，不适用" : "local install"}`
+                      : ""}
+                  </span>
+                  <button
+                    type="button"
+                    className="settings-refresh"
+                    disabled={!webExtensionUpdate?.updatable || updateRunning}
+                    onClick={() => void startUpdate("extension")}
+                  >
+                    {language === "zh" ? "更新扩展" : "Update extension"}
+                  </button>
+                </div>
+              </div>
+              <div className="update-proxy">
+                <label htmlFor="settings-update-proxy">
+                  {language === "zh"
+                    ? "代理地址（可选）"
+                    : "Proxy URL (optional)"}
+                </label>
+                <input
+                  id="settings-update-proxy"
+                  className="settings-text"
+                  type="url"
+                  placeholder="http://127.0.0.1:7890"
+                  value={proxyDraft}
+                  onChange={(event) => setProxyDraft(event.target.value)}
+                />
+                <p className="form-hint">
+                  {language === "zh"
+                    ? "填写本地代理监听地址，不是订阅链接。仅支持 http:// 或 https://。"
+                    : "Enter a local proxy listener URL, not a subscription link. Only http:// and https:// are supported."}
+                </p>
+                <div className="update-proxy-actions">
+                  <button
+                    type="button"
+                    className="settings-refresh"
+                    disabled={proxyBusy}
+                    onClick={() => void saveProxy()}
+                  >
+                    {language === "zh" ? "保存代理" : "Save proxy"}
+                  </button>
+                  <button
+                    type="button"
+                    className="settings-refresh"
+                    disabled={proxyBusy}
+                    onClick={() => {
+                      // A rejected clear must report, and the draft only
+                      // changes once the server accepted it.
+                      setUpdateError("");
+                      void api
+                        .saveUpdatesProxy("")
+                        .then((result) => {
+                          setProxyDraft("");
+                          setUpdateInfo((previous) =>
+                            previous
+                              ? {
+                                  ...previous,
+                                  proxy: result.proxy,
+                                  proxyConfigured: result.proxyConfigured,
+                                }
+                              : previous,
+                          );
+                        })
+                        .catch((cause: unknown) =>
+                          setUpdateError(
+                            cause instanceof Error
+                              ? cause.message
+                              : String(cause),
+                          ),
+                        );
+                    }}
+                  >
+                    {language === "zh" ? "清除" : "Clear"}
+                  </button>
+                  <button
+                    type="button"
+                    className="settings-refresh"
+                    disabled={updateBusy}
+                    onClick={() => void checkUpdates(true)}
+                  >
+                    <RefreshCw
+                      size={14}
+                      className={updateBusy ? "spin" : undefined}
+                    />
+                    {language === "zh" ? "立即检查" : "Check now"}
+                  </button>
+                </div>
+              </div>
+              {updateTask && (
+                <div className="update-task" role="status">
+                  <strong>
+                    {updateTask.state === "running"
+                      ? language === "zh"
+                        ? "更新进行中"
+                        : "Update running"
+                      : updateTask.state === "succeeded"
+                        ? language === "zh"
+                          ? "更新成功"
+                          : "Update succeeded"
+                        : language === "zh"
+                          ? "更新失败"
+                          : "Update failed"}
+                  </strong>
+                  <span>{updateTask.message}</span>
+                  {updateTask.log && (
+                    <pre className="update-log">{updateTask.log}</pre>
+                  )}
+                </div>
+              )}
+              {updateInfo?.error && (
+                <p className="form-hint update-error">{updateInfo.error}</p>
+              )}
+              {updateError && (
+                <p className="form-hint update-error">{updateError}</p>
+              )}
+              {updateTimeout && (
+                <p className="form-hint update-error">
+                  {language === "zh"
+                    ? "更新仍在运行，请稍后重新打开设置查看结果。"
+                    : "The update is still running. Reopen Settings later to check the result."}
+                </p>
+              )}
+              {updateInfo?.checkedAt && (
+                <p className="form-hint">
+                  {language === "zh" ? "上次检查" : "Last checked"}:{" "}
+                  {new Date(updateInfo.checkedAt).toLocaleString(
+                    language === "zh" ? "zh-CN" : "en-US",
+                  )}
+                </p>
+              )}
+            </div>
             <div className="auto-archive-settings">
               <label htmlFor="settings-auto-archive-days">
                 {language === "zh" ? "自动会话归档" : "Auto-archive sessions"}
@@ -6412,6 +6724,16 @@ export default function App() {
               >
                 <Settings2 size={14} />
                 <span>{language === "zh" ? "设置" : "Settings"}</span>
+                {updateAvailable && (
+                  <span
+                    className="update-badge"
+                    title={
+                      language === "zh" ? "有新版本可更新" : "Update available"
+                    }
+                  >
+                    !
+                  </span>
+                )}
                 <kbd>Ctrl ,</kbd>
               </button>
             </div>

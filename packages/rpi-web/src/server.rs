@@ -84,6 +84,7 @@ pub(crate) async fn run_until(
     } else {
         files.fallback(get(|| async { StatusCode::NOT_FOUND }))
     };
+    let update_routes = crate::updates::routes(Arc::new(config.clone()));
     let frontend = Router::new()
         .route("/", get(index))
         .nest_service("/assets", files)
@@ -97,7 +98,8 @@ pub(crate) async fn run_until(
         .route("/manifest-icon-maskable.png", get(manifest_icon_maskable))
         .with_state(FrontendState {
             config: Arc::new(config.clone()),
-        });
+        })
+        .merge(update_routes);
     let http = rpi_httpcore::AppConfig {
         service_name: "rpi-web",
         service_version: Some(env!("CARGO_PKG_VERSION")),
