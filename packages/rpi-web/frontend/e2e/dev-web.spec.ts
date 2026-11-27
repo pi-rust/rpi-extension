@@ -6793,6 +6793,88 @@ test("snapshot overlap neither duplicates committed messages nor downgrades comp
   await expect(page.locator(".transcript-note")).toHaveText(["Completed once"]);
 });
 
+test("snapshot and live events share committed assistant message IDs", async ({
+  page,
+}) => {
+  await mockHost(page);
+  const thinking = { type: "thinking", thinking: "**Checking staging**" };
+  const assistant = {
+    role: "assistant",
+    timestamp: 42,
+    content: [thinking, { type: "text", text: "Saved assistant response" }],
+  };
+  const committedEvent = {
+    messageId: "saved-assistant",
+    message: assistant,
+  };
+  await page.route(`**/api/v1/sessions/${sessionId}/open`, (route) =>
+    route.fulfill({ json: { ...session, status: "running" } }),
+  );
+  await page.route(snapshotRoute, (route) =>
+    route.fulfill({
+      json: {
+        sessionId,
+        status: "running",
+        messages: [{ ...assistant, entryId: committedEvent.messageId }],
+        events: [{ seq: 5, event: { type: "message_update", ...committedEvent } }],
+        lastSeq: 5,
+      },
+    }),
+  );
+
+  let release!: () => void;
+  const live = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  await page.route(`**/api/v1/sessions/${sessionId}/events?*`, async (route) => {
+    await live;
+    const events = [
+      { type: "message_end", ...committedEvent },
+      {
+        type: "message_start",
+        messageId: "new-assistant",
+        message: { role: "assistant", content: [] },
+      },
+      {
+        type: "message_end",
+        messageId: "new-assistant",
+        message: {
+          role: "assistant",
+          timestamp: 43,
+          content: [thinking, { type: "text", text: "New assistant response" }],
+        },
+      },
+    ];
+    return route.fulfill({
+      contentType: "text/event-stream",
+      body:
+        "retry: 60000\n" +
+        events
+          .map(
+            (event, index) =>
+              `id: ${6 + index}\nevent: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`,
+          )
+          .join(""),
+    });
+  });
+
+  try {
+    await page.goto(`/?session=${sessionId}`);
+    const thoughts = page.locator(".thinking-row");
+    const saved = page.getByText("Saved assistant response", { exact: true });
+    await expect(saved).toHaveCount(1);
+    await expect(thoughts).toHaveCount(1);
+    release();
+    await expect(
+      page.getByText("New assistant response", { exact: true }),
+    ).toBeVisible();
+    await expect(saved).toHaveCount(1);
+    await expect(thoughts).toHaveCount(2);
+  } finally {
+    release();
+  }
+});
+
 test("read images show outside tool details on live completion and reload", async ({
   page,
 }) => {
