@@ -43,7 +43,11 @@ jobs:
           for section, name in [('dependencies', 'rpi-ai'), ('dependencies', 'rpi-plugin-sdk'),
                                 ('dev-dependencies', 'rpi-extensions')]:
               dependency = data[section][name]
-              dependencies.append(workspace[name] if dependency.get('workspace') else dependency)
+              if isinstance(dependency, dict) and dependency.get('workspace'):
+                  dependency = workspace[name]
+              if isinstance(dependency, str):
+                  dependency = {'version': dependency}
+              dependencies.append(dependency)
           versions = [dependency['version'] for dependency in dependencies]
           assert len(set(versions)) == 1 and re.fullmatch(r'=[0-9]+\.[0-9]+\.[0-9]+', versions[0])
           revisions = [dependency.get('rev') for dependency in dependencies]
