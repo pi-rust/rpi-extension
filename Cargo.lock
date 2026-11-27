@@ -2509,7 +2509,7 @@ name = "rpi-acp"
 version = "0.2.19"
 dependencies = [
  "rpi-extcore",
- "rpi-plugin-sdk 0.3.20",
+ "rpi-plugin-sdk 0.8.3",
  "serde",
  "serde_json",
  "tokio",
@@ -2680,7 +2680,7 @@ version = "0.2.5"
 dependencies = [
  "axum",
  "rpi-httpcore",
- "rpi-plugin-sdk 0.3.20",
+ "rpi-plugin-sdk 0.8.3",
  "serde_json",
  "tokio",
 ]
@@ -2717,7 +2717,6 @@ dependencies = [
  "serde_json",
  "tokio",
  "tokio-tungstenite 0.29.0",
- "wait-timeout",
 ]
 
 [[package]]
@@ -2769,7 +2768,7 @@ dependencies = [
  "futures-util",
  "reqwest 0.12.28",
  "rpi-extcore",
- "rpi-plugin-sdk 0.3.20",
+ "rpi-plugin-sdk 0.8.3",
  "serde",
  "serde_json",
  "tokio",
@@ -2820,16 +2819,16 @@ dependencies = [
  "rpi-plugin-sdk 0.3.20",
  "serde",
  "serde_json",
- "wait-timeout",
+ "tempfile",
 ]
 
 [[package]]
 name = "rpi-orchestrator"
 version = "0.1.17"
 dependencies = [
+ "libc",
  "rpi-plugin-sdk 0.3.20",
  "serde_json",
- "wait-timeout",
 ]
 
 [[package]]
@@ -2885,11 +2884,13 @@ version = "0.8.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5fe8bbf9418b634fb41297b5969f3b5e1c15c52f8d66a9e8bdbc0c4ba866f6e0"
 dependencies = [
+ "libc",
  "reqwest 0.12.28",
  "rpi-ai",
  "serde",
  "serde_json",
  "tokio",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -2996,7 +2997,7 @@ dependencies = [
  "axum",
  "futures-util",
  "reqwest 0.12.28",
- "rpi-plugin-sdk 0.3.20",
+ "rpi-plugin-sdk 0.8.3",
  "serde",
  "serde_json",
  "tokio",
@@ -3012,12 +3013,13 @@ dependencies = [
  "hound",
  "reqwest 0.12.28",
  "rodio",
- "rpi-plugin-sdk 0.3.20",
+ "rpi-plugin-sdk 0.8.3",
  "rpi-tts",
  "serde",
  "serde_json",
  "sherpa-onnx",
  "symphonia",
+ "tempfile",
  "tokio",
  "unicode-width",
 ]
@@ -3029,7 +3031,7 @@ dependencies = [
  "axum",
  "rpi-extcore",
  "rpi-httpcore",
- "rpi-plugin-sdk 0.3.20",
+ "rpi-plugin-sdk 0.8.3",
  "serde",
  "serde_json",
  "tokio",

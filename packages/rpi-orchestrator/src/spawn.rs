@@ -12,13 +12,16 @@
 
 use std::io::{Read, Write};
 use std::path::Path;
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::mpsc::{self, Receiver};
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use rpi_plugin_sdk::process::ProcessTree;
-use wait_timeout::ChildExt;
 
 use crate::control::Control;
 
@@ -39,6 +42,86 @@ pub const SUBAGENT_ENV: &str = "RPI_ORCHESTRATOR_SUBAGENT";
 /// How often the wait loop re-checks cancellation/timeout. Bounds how long a
 /// cancelled call can keep a child alive.
 pub(crate) const POLL_SLICE: Duration = Duration::from_millis(100);
+const PIPE_POLL_INTERVAL: Duration = Duration::from_millis(10);
+
+pub(crate) fn wait_child(
+    child: &mut Child,
+    duration: Duration,
+) -> std::io::Result<Option<ExitStatus>> {
+    let deadline = Instant::now() + duration;
+    loop {
+        let status = child.try_wait()?;
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if status.is_some() || remaining.is_zero() {
+            return Ok(status);
+        }
+        std::thread::sleep(remaining.min(PIPE_POLL_INTERVAL));
+    }
+}
+
+struct PipeWorker {
+    thread: Option<JoinHandle<()>>,
+    stop: Arc<AtomicBool>,
+}
+
+impl PipeWorker {
+    fn start(run: impl FnOnce(Arc<AtomicBool>) + Send + 'static) -> Self {
+        let stop = Arc::new(AtomicBool::new(false));
+        let worker_stop = stop.clone();
+        let thread = std::thread::spawn(move || run(worker_stop));
+        Self {
+            thread: Some(thread),
+            stop,
+        }
+    }
+}
+
+impl Drop for PipeWorker {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Release);
+        if let Some(thread) = self.thread.take() {
+            // Unix pipe workers use nonblocking descriptors and can leave even
+            // when a descendant still has the other end open.
+            if cfg!(unix) || thread.is_finished() {
+                let _ = thread.join();
+            }
+        }
+    }
+}
+
+#[cfg(unix)]
+#[allow(unsafe_code)]
+fn set_nonblocking(fd: std::os::fd::BorrowedFd<'_>) -> std::io::Result<()> {
+    use std::os::fd::AsRawFd;
+    // SAFETY: the BorrowedFd keeps the descriptor live for both operations.
+    let flags = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GETFL) };
+    if flags < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    if unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+pub(crate) fn prepare_pipes(child: &Child) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::fd::AsFd;
+        if let Some(stdin) = &child.stdin {
+            set_nonblocking(stdin.as_fd())?;
+        }
+        if let Some(stdout) = &child.stdout {
+            set_nonblocking(stdout.as_fd())?;
+        }
+        if let Some(stderr) = &child.stderr {
+            set_nonblocking(stderr.as_fd())?;
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = child;
+    Ok(())
+}
 
 /// Build the child command. Separate from `run` so it is unit-testable without
 /// spawning anything.
@@ -126,12 +209,12 @@ pub fn truncate_output(mut text: String) -> String {
 /// Collect a reader's bounded output, giving up at `deadline` instead of
 /// blocking on a descendant that still holds the pipe.
 pub(crate) fn collect_reader(
-    reader: Option<(Receiver<String>, JoinHandle<()>)>,
+    reader: Option<PipeReader>,
     deadline: Instant,
     control: &Control,
 ) -> Result<String, String> {
     control.check()?;
-    let Some((receiver, _handle)) = reader else {
+    let Some(reader) = reader else {
         return Ok(String::new());
     };
     loop {
@@ -140,7 +223,7 @@ pub(crate) fn collect_reader(
         if remaining.is_zero() {
             return Err("subagent timed out while collecting output".into());
         }
-        match receiver.recv_timeout(remaining.min(POLL_SLICE)) {
+        match reader.receiver.recv_timeout(remaining.min(POLL_SLICE)) {
             Ok(text) => return Ok(text),
             Err(mpsc::RecvTimeoutError::Timeout) => continue,
             Err(mpsc::RecvTimeoutError::Disconnected) => return Ok(String::new()),
@@ -157,6 +240,7 @@ pub fn run(
     provider: Option<&str>,
     model: Option<&str>,
     control: &Control,
+    cwd: Option<&Path>,
 ) -> Result<String, String> {
     let exe = std::env::current_exe()
         .map_err(|err| format!("cannot resolve the rpi executable: {err}"))?;
@@ -168,6 +252,7 @@ pub fn run(
         provider,
         model,
         control,
+        cwd,
     )
 }
 
@@ -181,10 +266,15 @@ pub fn run_with_exe(
     provider: Option<&str>,
     model: Option<&str>,
     control: &Control,
+    cwd: Option<&Path>,
 ) -> Result<String, String> {
     // Fail before launching anything if already cancelled.
     control.check()?;
-    let (mut child, tree) = spawn_command(&mut child_command(exe, max_turns, provider, model))
+    let mut command = child_command(exe, max_turns, provider, model);
+    if let Some(cwd) = cwd {
+        command.current_dir(cwd);
+    }
+    let (mut child, tree) = spawn_command(&mut command)
         .map_err(|err| format!("failed to start subagent `{}`: {err}", exe.display()))?;
 
     let deadline = Instant::now() + Duration::from_secs(timeout_secs);
@@ -198,7 +288,7 @@ pub fn run_with_exe(
 
     // Writing is part of the bounded lifecycle too: a child that never reads
     // stdin must not make the tool hang before the wait loop starts.
-    write_stdin(child.stdin.take(), task);
+    let _input = write_stdin(child.stdin.take(), task);
 
     // Wait in slices so cancellation and the wall-clock deadline are both observed
     // while the child is still running.
@@ -214,7 +304,7 @@ pub fn run_with_exe(
         let slice = deadline
             .saturating_duration_since(Instant::now())
             .min(POLL_SLICE);
-        match child.wait_timeout(slice) {
+        match wait_child(&mut child, slice) {
             Ok(Some(status)) => {
                 let mut text = match collect_reader(out_reader, deadline, control) {
                     Ok(text) => text,
@@ -258,7 +348,13 @@ pub(crate) fn spawn_command(command: &mut Command) -> Result<(Child, ProcessTree
     ProcessTree::prepare(command);
     let mut child = command.spawn().map_err(|error| error.to_string())?;
     match ProcessTree::attach(&child) {
-        Ok(tree) => Ok((child, tree)),
+        Ok(tree) => match prepare_pipes(&child) {
+            Ok(()) => Ok((child, tree)),
+            Err(error) => {
+                kill_and_reap(&mut child, &tree);
+                Err(error.to_string())
+            }
+        },
         Err(error) => {
             let _ = child.kill();
             let _ = child.wait();
@@ -298,33 +394,39 @@ fn kill_descendants(pid: u32) {
         .status();
 }
 
-fn write_stdin(mut stdin: Option<std::process::ChildStdin>, task: &str) {
-    // A child that never reads (or exits first) must not block the caller, so the
-    // write happens on its own thread; EPIPE is not fatal — the exit status is
-    // what decides success. Dropping the handle closes the pipe so the child
-    // observes EOF.
+fn write_stdin(stdin: Option<std::process::ChildStdin>, task: &str) -> Option<PipeWorker> {
+    let mut stdin = stdin?;
     let task = task.to_owned();
-    std::thread::spawn(move || {
-        if let Some(stdin) = stdin.as_mut() {
-            let _ = stdin.write_all(task.as_bytes());
-            let _ = stdin.flush();
+    Some(PipeWorker::start(move |stop| {
+        let mut remaining = task.as_bytes();
+        while !remaining.is_empty() && !stop.load(Ordering::Acquire) {
+            match stdin.write(remaining) {
+                Ok(0) => break,
+                Ok(written) => remaining = &remaining[written..],
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(PIPE_POLL_INTERVAL);
+                }
+                Err(_) => break,
+            }
         }
-    });
+    }))
 }
 
-/// Read a child's stream with a hard cap, signalling completion over a channel so
-/// the caller can apply its own deadline. The thread keeps draining after the cap
-/// so the child never blocks on a full pipe, and stops as soon as the child (and
-/// any descendant that inherited the pipe) closes it.
-pub(crate) fn spawn_reader<R: Read + Send + 'static>(
-    mut reader: R,
-) -> (Receiver<String>, JoinHandle<()>) {
+pub(crate) struct PipeReader {
+    receiver: Receiver<String>,
+    _worker: PipeWorker,
+}
+
+/// Read a child's stream with a hard cap, signalling completion over a channel.
+/// The worker continues draining after the cap to keep the child unblocked.
+pub(crate) fn spawn_reader<R: Read + Send + 'static>(mut reader: R) -> PipeReader {
     let (sender, receiver) = mpsc::channel();
-    let handle = std::thread::spawn(move || {
+    let worker = PipeWorker::start(move |stop| {
         let mut output = Vec::new();
         let mut buf = [0u8; 8192];
         let mut truncated = false;
-        loop {
+        while !stop.load(Ordering::Acquire) {
             match reader.read(&mut buf) {
                 Ok(0) => break,
                 Ok(count) => {
@@ -336,6 +438,10 @@ pub(crate) fn spawn_reader<R: Read + Send + 'static>(
                         truncated = true;
                     }
                 }
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(PIPE_POLL_INTERVAL);
+                }
                 Err(_) => break,
             }
         }
@@ -345,7 +451,10 @@ pub(crate) fn spawn_reader<R: Read + Send + 'static>(
         }
         let _ = sender.send(text);
     });
-    (receiver, handle)
+    PipeReader {
+        receiver,
+        _worker: worker,
+    }
 }
 
 #[cfg(test)]
@@ -385,8 +494,7 @@ mod tests {
         let (mut parent, tree) = spawn_command(&mut command).unwrap();
         let stdout = parent.stdout.take().map(spawn_reader);
         let stderr = parent.stderr.take().map(spawn_reader);
-        let exited = parent
-            .wait_timeout(Duration::from_secs(15))
+        let exited = wait_child(&mut parent, Duration::from_secs(15))
             .unwrap()
             .is_some();
         if !exited {
@@ -640,13 +748,14 @@ mod tests {
         // `No API key` / `No model matches` from the child used to surface with
         // no attribution at all, so the caller could only guess again.
         let error = run_with_exe(
-            Path::new("/bin/false"),
+            Path::new("false"),
             "task",
             1,
             5,
             Some("openai"),
             Some("gpt-6-astra"),
             &Control::default(),
+            None,
         )
         .unwrap_err();
         assert!(
@@ -696,7 +805,7 @@ mod tests {
             std::thread::sleep(Duration::from_millis(800));
             canceller.cancel();
         });
-        let _ = run_with_exe(&script, "ignored", 8, 30, None, None, &control);
+        let _ = run_with_exe(&script, "ignored", 8, 30, None, None, &control, None);
         let _ = handle.join();
 
         let grandchild = std::fs::read_to_string(&pidfile)
@@ -730,6 +839,7 @@ mod tests {
             None,
             None,
             &control,
+            None,
         )
         .unwrap_err();
         assert!(err.contains("cancelled"), "got: {err}");
@@ -761,7 +871,7 @@ mod tests {
             canceller.cancel();
         });
         let start = Instant::now();
-        let err = run_with_exe(&script, "ignored", 8, 30, None, None, &control).unwrap_err();
+        let err = run_with_exe(&script, "ignored", 8, 30, None, None, &control, None).unwrap_err();
         let elapsed = start.elapsed();
         let _ = handle.join();
         let _ = std::fs::remove_file(&script);

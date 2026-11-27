@@ -33,7 +33,7 @@ supported-targets = [
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-rpi-plugin-sdk = "0.3.20"
+rpi-plugin-sdk = "=0.8.3"
 rpi-tts = { path = "../rpi-tts", version = "0.1.17" }
 serde_json = { workspace = true }
 reqwest = { workspace = true, features = ["multipart"] }
@@ -41,6 +41,7 @@ tokio = { workspace = true, features = ["rt-multi-thread", "sync", "time", "macr
 
 serde = { version = "1", features = ["derive"] }
 unicode-width = "0.2"
+tempfile = "3"
 
 # Embedded offline STT (optional): sherpa-onnx, statically linked, prebuilt
 # binaries auto-downloaded at build time.

@@ -1,5 +1,6 @@
-#![forbid(unsafe_code)]
+#![deny(unsafe_code)]
 //! Test-only native runtime-action probe. Never install this example as a package.
+use rpi_plugin_sdk::callbacks::OwnedString;
 use rpi_plugin_sdk::handles::ToolHandles;
 use rpi_plugin_sdk::{
     FreeStringFn, PluginApi, RuntimeActionId, StableToolSchema, StbString, StbStringRef,
@@ -16,6 +17,7 @@ struct Drive {
     done: bool,
 }
 
+#[allow(unsafe_code)]
 fn call_runtime(id: RuntimeActionId, args: Value) -> Result<Value, String> {
     let runtime = *RUNTIME
         .get()
@@ -28,8 +30,9 @@ fn call_runtime(id: RuntimeActionId, args: Value) -> Result<Value, String> {
         &mut output,
         runtime.user_data,
     );
-    let text = output.to_string_lossy();
-    (runtime.free_string)(output);
+    // SAFETY: the host owns the allocation and supplies its matching deallocator.
+    let text =
+        unsafe { OwnedString::from_raw(output, Some(runtime.free_string)) }.to_string_lossy();
     if rc != 0 {
         return Err(format!("runtime action {id:?}: {text}"));
     }
@@ -40,13 +43,14 @@ fn call_runtime(id: RuntimeActionId, args: Value) -> Result<Value, String> {
     }
 }
 
+#[allow(unsafe_code)]
 extern "C" fn execute(
     _: StbStringRef,
     params: StbString,
     free: Option<FreeStringFn>,
 ) -> StepHandle {
-    let text = params.to_string_lossy();
-    params.free_with(free);
+    // SAFETY: the caller transfers ownership of the tool parameters.
+    let text = unsafe { OwnedString::from_raw(params, free) }.to_string_lossy();
     HANDLES.insert(Drive {
         params: serde_json::from_str(&text).unwrap_or(Value::Null),
         done: false,

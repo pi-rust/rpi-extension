@@ -13,7 +13,7 @@
 //! fails with the explicit `ask_user requires an interactive UI` error instead
 //! of returning a selector payload that the model could mistake for an answer.
 
-#![forbid(unsafe_code)]
+#![deny(unsafe_code)]
 
 use rpi_plugin_sdk::handles::ToolHandles;
 use std::ffi::c_void;
@@ -22,7 +22,8 @@ use std::sync::OnceLock;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use rpi_plugin_sdk::{
-    PluginApi, StableToolSchema, StbString, StbStringRef, StepHandle, StepResult, ToolPartialCb,
+    FreeStringFn, PluginApi, RuntimeActionFn, StableToolSchema, StbString, StbStringRef,
+    StepHandle, StepResult, ToolPartialCb,
 };
 use serde_json::{json, Value};
 
@@ -35,12 +36,33 @@ const RUNTIME_ACTION_UI_DIALOG: u32 = 17;
 /// Keeps the driver's spin loop from burning a core while the user thinks.
 const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(25);
 
-/// Host fn pointers captured once at register time. `runtime_action` lets the
-/// tool drive the UI bridge; `user_data` is the host's opaque context.
-// Reuse the SDK's host-context lifetime and thread-safety contract.
-type HostRuntime = PluginApi;
+#[derive(Clone, Copy)]
+struct HostFns {
+    action: RuntimeActionFn,
+    free: FreeStringFn,
+}
 
-static HOST_RUNTIME: OnceLock<HostRuntime> = OnceLock::new();
+// Only the native host's process-lifetime trampoline and allocator are shared.
+static HOST: OnceLock<HostFns> = OnceLock::new();
+
+#[derive(Clone, Copy)]
+struct HostRuntime {
+    fns: HostFns,
+    invocation: usize,
+}
+
+impl HostRuntime {
+    fn for_invocation(params: &Value) -> Option<Self> {
+        let invocation = params[rpi_plugin_sdk::HOST_CONTEXT_KEY]["runtimeHandle"]
+            .as_u64()
+            .and_then(|handle| usize::try_from(handle).ok())
+            .filter(|handle| *handle != 0)?;
+        Some(Self {
+            fns: *HOST.get()?,
+            invocation,
+        })
+    }
+}
 
 /// Monotonic suffix so concurrent questions never share a `requestId`.
 static REQUEST_SEQ: AtomicU64 = AtomicU64::new(1);
@@ -313,14 +335,14 @@ fn next_request_id() -> String {
 fn invoke_ui_dialog(runtime: &HostRuntime, args: &Value) -> Result<Value, String> {
     let args_json = serde_json::to_string(args).map_err(|error| error.to_string())?;
     let mut output = StbString::empty();
-    let rc = (runtime.runtime_action)(
+    let rc = (runtime.fns.action)(
         RUNTIME_ACTION_UI_DIALOG,
         StbStringRef::from_str(&args_json),
         &mut output,
-        runtime.user_data,
+        runtime.invocation as *mut c_void,
     );
     let text = output.to_string_lossy();
-    (runtime.free_string)(output);
+    (runtime.fns.free)(output);
     if rc != 0 {
         if let Ok(value) = serde_json::from_str::<Value>(&text) {
             if let Some(error) = value.get("error").and_then(Value::as_str) {
@@ -371,6 +393,7 @@ struct AskAnswer {
 static HANDLES: ToolHandles<Drive> = ToolHandles::new();
 
 struct Drive {
+    runtime: Option<HostRuntime>,
     params: Value,
     tool_call_id: String,
     started: bool,
@@ -459,6 +482,12 @@ fn pending_progress(question: &AskQuestion) -> Value {
     })
 }
 
+fn close_pending(drive: &mut Drive) {
+    if let (Some(runtime), Some(pending)) = (drive.runtime, drive.pending.take()) {
+        cancel_ui_dialog(&runtime, &pending.request_id);
+    }
+}
+
 /// Open the next queued question, or return `None` when none remain.
 fn open_next(drive: &mut Drive, runtime: &HostRuntime) -> Result<Option<Value>, String> {
     let Some(question) = drive.remaining.pop_front() else {
@@ -471,7 +500,6 @@ fn open_next(drive: &mut Drive, runtime: &HostRuntime) -> Result<Option<Value>, 
         "toolCallId": drive.tool_call_id,
         "ui": question.to_ui(None),
     });
-    let response = invoke_ui_dialog(runtime, &request)?;
     let deadline = question
         .timeout
         .map(|seconds| Instant::now() + Duration::from_secs(seconds));
@@ -480,7 +508,7 @@ fn open_next(drive: &mut Drive, runtime: &HostRuntime) -> Result<Option<Value>, 
         question,
         deadline,
     });
-    Ok(Some(response))
+    invoke_ui_dialog(runtime, &request).map(Some)
 }
 
 /// Poll the currently open question. `Ok(Some(done))` when the whole plan is
@@ -493,9 +521,7 @@ fn poll_open_question(drive: &mut Drive, runtime: &HostRuntime) -> Result<Option
         .deadline
         .is_some_and(|deadline| Instant::now() >= deadline)
     {
-        let request_id = pending.request_id.clone();
-        cancel_ui_dialog(runtime, &request_id);
-        drive.pending = None;
+        close_pending(drive);
         return Err("ask timed out".into());
     }
     let request_id = pending.request_id.clone();
@@ -614,8 +640,10 @@ fn execute(tool_call_id, params, free) {
     let tool_call_id = tool_call_id.to_owned();
     let text = params.to_string_lossy();
     params.free_with(free);
+    let params = serde_json::from_str(&text).unwrap_or(Value::Null);
     HANDLES.insert(Drive {
-        params: serde_json::from_str(&text).unwrap_or(Value::Null),
+        runtime: HostRuntime::for_invocation(&params),
+        params,
         tool_call_id,
         started: false,
         finished: false,
@@ -637,15 +665,14 @@ extern "C" fn poll(handle: StepHandle, _: Option<ToolPartialCb>, _: *mut c_void)
         ));
     };
     let mut drive = entry.lock();
-    let Some(runtime) = HOST_RUNTIME.get().copied() else {
+    let Some(runtime) = drive.runtime else {
         return StepResult::err(StbString::from_string(
-            "ask_user requires an interactive UI".into(),
+            "ask_user requires a host-provided tool invocation runtimeHandle; upgrade the host"
+                .into(),
         ));
     };
     if entry.cancelled.load(Ordering::SeqCst) {
-        if let Some(pending) = drive.pending.as_ref() {
-            cancel_ui_dialog(&runtime, &pending.request_id);
-        }
+        close_pending(&mut drive);
         return StepResult::err(StbString::from_string("ask cancelled".into()));
     }
     if drive.finished {
@@ -673,7 +700,11 @@ extern "C" fn poll(handle: StepHandle, _: Option<ToolPartialCb>, _: *mut c_void)
                     );
                 StepResult::pending(StbString::from_string(progress.to_string()))
             }
-            Err(error) => StepResult::err(StbString::from_string(error)),
+            Err(error) => {
+                drive.finished = true;
+                close_pending(&mut drive);
+                StepResult::err(StbString::from_string(error))
+            }
         };
     }
 
@@ -686,14 +717,16 @@ extern "C" fn poll(handle: StepHandle, _: Option<ToolPartialCb>, _: *mut c_void)
             // Park briefly so the driver's spin loop does not burn a core.
             std::thread::sleep(POLL_INTERVAL);
             if entry.cancelled.load(Ordering::SeqCst) {
-                if let Some(pending) = drive.pending.as_ref() {
-                    cancel_ui_dialog(&runtime, &pending.request_id);
-                }
+                close_pending(&mut drive);
                 return StepResult::err(StbString::from_string("ask cancelled".into()));
             }
             StepResult::pending(StbString::from_string(String::new()))
         }
-        Err(error) => StepResult::err(StbString::from_string(error)),
+        Err(error) => {
+            drive.finished = true;
+            close_pending(&mut drive);
+            StepResult::err(StbString::from_string(error))
+        }
     }
 }
 
@@ -701,17 +734,14 @@ extern "C" fn cancel(handle: StepHandle) {
     if let Some(entry) = HANDLES.get(handle) {
         entry.cancel();
         // Serialize access to pending UI state with poll, after signalling it.
-        let drive = entry.lock();
-        if let Some(runtime) = HOST_RUNTIME.get() {
-            if let Some(pending) = drive.pending.as_ref() {
-                cancel_ui_dialog(runtime, &pending.request_id);
-            }
-        }
+        close_pending(&mut entry.lock());
     }
 }
 
 extern "C" fn destroy(handle: StepHandle) {
-    drop(HANDLES.remove(handle));
+    if let Some(entry) = HANDLES.remove(handle) {
+        close_pending(&mut entry.lock());
+    }
 }
 
 use rpi_plugin_sdk::callbacks::free_string;
@@ -831,12 +861,19 @@ fn tool_schema() -> StableToolSchema {
     }
 }
 
-rpi_plugin_sdk::export_plugin!(|api| {
+fn register_plugin(api: &PluginApi) -> i32 {
     let Some(register) = api.register_tool else {
         return 1;
     };
-    let runtime = *api;
-    let _ = HOST_RUNTIME.set(runtime);
+    let installed = HOST.get_or_init(|| HostFns {
+        action: api.runtime_action,
+        free: api.free_string,
+    });
+    if installed.action as usize != api.runtime_action as usize
+        || installed.free as usize != api.free_string as usize
+    {
+        return 1;
+    }
     let schema = Box::new(tool_schema());
     let rc = register(&*schema, execute, poll, cancel, destroy, free_string);
     drop(schema);
@@ -846,7 +883,14 @@ rpi_plugin_sdk::export_plugin!(|api| {
         let _ = register_command(name, description, ask_command);
     }
     rc
-});
+}
+
+// Opt in to sharing the library image across native Host registrations.
+#[allow(unsafe_code)] // The marker only exports a symbol.
+#[no_mangle]
+pub extern "C" fn rpi_plugin_shared_sessions_v1() {}
+
+rpi_plugin_sdk::export_plugin!(register_plugin);
 
 #[cfg(test)]
 mod tests {

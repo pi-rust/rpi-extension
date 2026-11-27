@@ -1,4 +1,4 @@
-#![forbid(unsafe_code)]
+#![deny(unsafe_code)]
 
 use rpi_plugin_sdk::handles::ToolHandles;
 use rpi_plugin_sdk::{
@@ -479,6 +479,11 @@ fn tool_schema() -> StableToolSchema {
         ),
     }
 }
+
+// Each call owns its query, HTTP work, and cancellation handle.
+#[allow(unsafe_code)] // Export the shared-session marker symbol.
+#[no_mangle]
+pub extern "C" fn rpi_plugin_shared_sessions_v1() {}
 
 rpi_plugin_sdk::export_plugin!(|api| {
     let Some(register) = api.register_tool else {

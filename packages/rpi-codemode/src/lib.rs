@@ -283,6 +283,12 @@ fn schema() -> rpi_plugin_sdk::StableToolSchema {
         }).to_string()),
     }
 }
+// The worker owns its invocation capability and QuickJS runtime. Destroy
+// cancels and joins it while the host still keeps this image loaded.
+#[allow(unsafe_code)] // Export the optional Host ABI marker.
+#[no_mangle]
+pub extern "C" fn rpi_plugin_shared_sessions_v1() {}
+
 rpi_plugin_sdk::export_plugin!(|api| {
     let Some(register) = api.register_tool else {
         return 1;

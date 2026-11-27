@@ -42,6 +42,10 @@ pub fn set_permission_bypass(enabled: bool) {
     PERMISSION_BYPASS.store(enabled, Ordering::Release);
 }
 
+pub(crate) fn permission_bypass() -> bool {
+    PERMISSION_BYPASS.load(Ordering::Acquire)
+}
+
 #[cfg(test)]
 use rpi_extcore::process::configure_permission_gate;
 
@@ -93,6 +97,15 @@ impl Session {
         cwd: PathBuf,
         saved: Option<&Path>,
     ) -> Result<Arc<Self>, String> {
+        Self::spawn_with_bypass(id, cwd, saved, permission_bypass()).await
+    }
+
+    pub(crate) async fn spawn_with_bypass(
+        id: String,
+        cwd: PathBuf,
+        saved: Option<&Path>,
+        bypass: bool,
+    ) -> Result<Arc<Self>, String> {
         let directory = crate::history::session_directory(&id)?;
         let (model, provider) = forwarded_model_provider();
         let rpc = HostSession::spawn_options(SessionOptions {
@@ -106,7 +119,7 @@ impl Session {
             model,
             provider,
             permission_gate: !env_flag("RPI_ACP_NO_PERMISSION_GATE"),
-            bypass: PERMISSION_BYPASS.load(Ordering::Acquire),
+            bypass,
             resources: None,
         })
         .await?;

@@ -16,7 +16,7 @@
 use rpi_plugin_sdk::{StbString, StbStringRef};
 use serde_json::Value;
 use std::ffi::c_void;
-use std::sync::Mutex;
+use std::path::Path;
 
 /// ABI id of `RuntimeActionId::GetExecutionContext`.
 ///
@@ -25,22 +25,43 @@ use std::sync::Mutex;
 /// id, not by name.
 const GET_EXECUTION_CONTEXT: u32 = 23;
 
-/// Process-lifetime host function pointers. Never retain a registration's
-/// `user_data`: a candidate reload may be rolled back and freed.
+/// The runtime entry points for one registration. The host's registration
+/// handle is used only for synchronous event callbacks.
 #[derive(Clone, Copy)]
-struct RuntimeFns {
-    action: extern "C" fn(u32, StbStringRef, *mut StbString, *mut c_void) -> i32,
-    free: extern "C" fn(StbString),
+pub(crate) struct Runtime {
+    action: rpi_plugin_sdk::RuntimeActionFn,
+    free: rpi_plugin_sdk::FreeStringFn,
+    event_handle: usize,
 }
 
-static HOST: Mutex<Option<RuntimeFns>> = Mutex::new(None);
+impl From<&rpi_plugin_sdk::PluginApi> for Runtime {
+    fn from(api: &rpi_plugin_sdk::PluginApi) -> Self {
+        Self {
+            action: api.runtime_action,
+            free: api.free_string,
+            event_handle: api.user_data as usize,
+        }
+    }
+}
 
-/// Capture the host action bridge. Called once from the plugin entrypoint.
-pub(crate) fn install(plugin: &rpi_plugin_sdk::PluginApi) {
-    *HOST.lock().unwrap_or_else(|error| error.into_inner()) = Some(RuntimeFns {
-        action: plugin.runtime_action,
-        free: plugin.free_string,
-    });
+impl Runtime {
+    pub(crate) fn event_context(&self) -> Option<Value> {
+        if self.event_handle == 0 {
+            return None;
+        }
+        self.execution_context(self.event_handle).ok()
+    }
+
+    fn execution_context(&self, handle: usize) -> Result<Value, String> {
+        call_host(self, handle, GET_EXECUTION_CONTEXT, &serde_json::json!({}))
+    }
+}
+
+pub(crate) fn tool_cwd(params: &Value) -> Option<&Path> {
+    params[rpi_plugin_sdk::HOST_CONTEXT_KEY]["cwd"]
+        .as_str()
+        .filter(|cwd| !cwd.is_empty())
+        .map(Path::new)
 }
 
 /// The provider/model a child process should run on.
@@ -109,14 +130,11 @@ fn runtime_handle(params: &Value) -> Option<usize> {
 /// Read the calling session's binding from the host. Best-effort by design: a
 /// missing bridge, a missing handle, a failing action or a malformed reply all
 /// yield an empty selection.
-pub(crate) fn parent_selection(params: &Value) -> Selection {
-    let Some(host) = *HOST.lock().unwrap_or_else(|error| error.into_inner()) else {
+pub(crate) fn parent_selection(runtime: Option<&Runtime>, params: &Value) -> Selection {
+    let Some(runtime) = runtime else {
         return Selection::default();
     };
-    select_with(
-        |handle| call_host(&host, handle, GET_EXECUTION_CONTEXT, &serde_json::json!({})),
-        params,
-    )
+    select_with(|handle| runtime.execution_context(handle), params)
 }
 
 /// Look the binding up through `lookup`, which receives the invocation handle.
@@ -150,7 +168,7 @@ pub(crate) fn selection_from_context(context: &Value) -> Selection {
 }
 
 /// Invoke a host runtime action and parse its JSON reply.
-fn call_host(host: &RuntimeFns, handle: usize, action: u32, args: &Value) -> Result<Value, String> {
+fn call_host(host: &Runtime, handle: usize, action: u32, args: &Value) -> Result<Value, String> {
     let encoded = args.to_string();
     let mut out = StbString::empty();
     let rc = (host.action)(

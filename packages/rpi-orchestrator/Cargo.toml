@@ -27,4 +27,5 @@ crate-type = ["cdylib", "rlib"]
 [dependencies]
 rpi-plugin-sdk = { workspace = true, features = ["process"] }
 serde_json = { workspace = true }
-wait-timeout = { workspace = true }
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"

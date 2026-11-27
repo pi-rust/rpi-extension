@@ -131,7 +131,7 @@ async fn list_dispatcher_cross_method_duplicates_typed_ids_cancel_and_eof() {
                 writer,
                 Ok(root.clone()),
                 Arc::new(Mutex::new(HashMap::new())),
-                |_, _, _| async { Err("no session opening in this fixture".to_owned()) },
+                |_, _, _, _| async { Err("no session opening in this fixture".to_owned()) },
             )
         )
         .await

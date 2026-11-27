@@ -18,12 +18,11 @@
 //
 // Every ABI shape this extension touches goes through an SDK macro
 // (`event_handler!`, `string_handler!`, `execute_handler!`, `call_action!`,
-// `stb_text!`), which keeps the raw-pointer contract inside the SDK. `forbid`
-// rather than `deny` so a future `#[allow(unsafe_code)]` cannot quietly reopen
-// the door. The entrypoint emitted by `export_plugin!` takes a raw
+// `stb_text!`), which keeps the raw-pointer contract inside the SDK. The
+// entrypoint emitted by `export_plugin!` takes a raw
 // `*const PluginApi` by ABI definition, which is why the pointer-deref lint is
 // allowed here; the dereference itself happens inside the SDK's macro.
-#![forbid(unsafe_code)]
+#![deny(unsafe_code)]
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
 pub mod active_tools;
@@ -48,8 +47,9 @@ use rpi_plugin_sdk::{
 };
 use serde_json::{json, Value};
 use std::ffi::c_void;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
 /// Name advertised in `welcome` and `/health` (upstream compatibility).
@@ -60,29 +60,6 @@ const SERVER_VERSION: &str = env!("CARGO_PKG_VERSION");
 const STATUS_KEY: &str = "office-bridge";
 /// Deltas are coalesced into ~frame-sized batches.
 const DELTA_FLUSH_MS: u64 = 60;
-
-/* ── host API storage ──────────────────────────────────────────────── */
-
-static API: OnceLock<Mutex<Option<PluginApi>>> = OnceLock::new();
-
-fn api_store() -> &'static Mutex<Option<PluginApi>> {
-    API.get_or_init(|| Mutex::new(None))
-}
-
-/// Resolve the host function table, rebinding `user_data` to the callback's
-/// owner (a native reload may present a different owner than registration).
-fn api(owner: *mut c_void) -> Option<PluginApi> {
-    let mut api = {
-        let stored = api_store()
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner());
-        (*stored)?
-    };
-    if !owner.is_null() {
-        api.user_data = owner;
-    }
-    Some(api)
-}
 
 fn call_action(api: PluginApi, action: RuntimeActionId, args: Value) -> Result<Value, String> {
     let encoded = args.to_string();
@@ -147,41 +124,132 @@ impl DeltaState {
 
 struct State {
     controller: Controller,
-    /// Pane-prompt correlation; the key is the pane id replies route to.
-    prompts: PanePromptTracker<String>,
-    delta: DeltaState,
-    port: u16,
     autostart: bool,
 }
 
-static STATE: OnceLock<Mutex<State>> = OnceLock::new();
-
-fn state() -> &'static Mutex<State> {
-    STATE.get_or_init(|| {
-        Mutex::new(State {
-            controller: Controller::new(protocol::BRIDGE_DEFAULT_PORT),
-            prompts: PanePromptTracker::default(),
-            delta: DeltaState::default(),
-            port: protocol::BRIDGE_DEFAULT_PORT,
-            autostart: false,
-        })
-    })
+#[derive(Default)]
+struct Replies {
+    prompts: PanePromptTracker<String>,
+    delta: DeltaState,
 }
 
-fn with_state<R>(body: impl FnOnce(&mut State) -> R) -> R {
-    let mut state = state().lock().unwrap_or_else(|poison| poison.into_inner());
-    body(&mut state)
+// Slots stay reserved until the host has retired the registration's callbacks.
+// Event and lifecycle cookies are never reused, even when a slot is reclaimed.
+static REGISTRATIONS: Mutex<Registrations> = Mutex::new(Registrations {
+    slots: [const { None }; tools::EXECUTOR_SLOTS.len()],
+    next_id: 1,
+});
+
+struct Registrations {
+    slots: [Option<Arc<Registration>>; tools::EXECUTOR_SLOTS.len()],
+    next_id: usize,
 }
 
-fn server_lookup() -> Option<Arc<server::Server>> {
-    with_state(|state| state.controller.server().cloned())
+fn registrations() -> std::sync::MutexGuard<'static, Registrations> {
+    REGISTRATIONS.lock().unwrap_or_else(|p| p.into_inner())
 }
 
-fn panes_lookup() -> Vec<Pane> {
-    with_state(|state| state.controller.panes())
+struct Registration {
+    id: usize,
+    slot: usize,
+    api: PluginApi,
+    state: Mutex<State>,
+    // The hub can clear a stopped prompt even while the controller joins it.
+    replies: Mutex<Replies>,
+    worker: Mutex<Option<Worker>>,
+    initialized: AtomicBool,
+    stopping: AtomicBool,
 }
 
-/* ── worker: the only thread that calls back into the host ─────────── */
+impl Registration {
+    fn new(id: usize, slot: usize, api: PluginApi) -> Self {
+        Self {
+            id,
+            slot,
+            api,
+            state: Mutex::new(State {
+                controller: Controller::new(protocol::BRIDGE_DEFAULT_PORT),
+                autostart: false,
+            }),
+            replies: Mutex::new(Replies::default()),
+            worker: Mutex::new(None),
+            initialized: AtomicBool::new(false),
+            stopping: AtomicBool::new(false),
+        }
+    }
+
+    fn reserve(api: PluginApi) -> Option<Arc<Self>> {
+        let mut registrations = registrations();
+        if registrations
+            .slots
+            .iter()
+            .flatten()
+            .any(|r| r.api.user_data == api.user_data)
+        {
+            return None;
+        }
+        let slot = registrations.slots.iter().position(Option::is_none)?;
+        let id = registrations.next_id;
+        registrations.next_id = id.checked_add(1)?;
+        let registration = Arc::new(Self::new(id, slot, api));
+        registrations.slots[slot] = Some(registration.clone());
+        Some(registration)
+    }
+
+    fn lookup(cookie: *mut c_void) -> Option<Arc<Self>> {
+        registrations()
+            .slots
+            .iter()
+            .flatten()
+            .find(|r| r.id == cookie as usize)
+            .cloned()
+    }
+
+    fn for_callback(cookie: *mut c_void) -> Option<Arc<Self>> {
+        Self::lookup(cookie).filter(|r| r.check_running().is_ok())
+    }
+
+    fn for_command(owner: *mut c_void) -> Option<Arc<Self>> {
+        registrations()
+            .slots
+            .iter()
+            .flatten()
+            .find(|r| r.api.user_data == owner && r.check_running().is_ok())
+            .cloned()
+    }
+
+    fn for_tool(slot: usize) -> Option<Arc<Self>> {
+        registrations().slots[slot]
+            .as_ref()
+            .filter(|r| r.check_running().is_ok())
+            .cloned()
+    }
+
+    fn with_state<R>(&self, body: impl FnOnce(&mut State) -> R) -> R {
+        body(&mut self.state.lock().unwrap_or_else(|p| p.into_inner()))
+    }
+
+    fn with_replies<R>(&self, body: impl FnOnce(&mut Replies) -> R) -> R {
+        body(&mut self.replies.lock().unwrap_or_else(|p| p.into_inner()))
+    }
+
+    fn clear_replies(&self) {
+        self.with_replies(|replies| {
+            replies.prompts.clear();
+            replies.delta.clear();
+        });
+    }
+
+    fn server(&self) -> Option<Arc<server::Server>> {
+        self.with_state(|state| state.controller.server().cloned())
+    }
+
+    fn panes(&self) -> Vec<Pane> {
+        self.with_state(|state| state.controller.panes())
+    }
+}
+
+/* ── worker: host calls initiated by the bridge ────────────────────── */
 
 enum Job {
     UserMessage {
@@ -211,158 +279,164 @@ enum Job {
     Abort {
         prompt_id: Option<String>,
     },
-    /// `finish_shutdown` asked the worker to exit; reply once it has stopped.
-    Shutdown(Sender<()>),
+    Shutdown,
 }
 
 struct Worker {
     tx: Sender<Job>,
-    join: Mutex<Option<std::thread::JoinHandle<()>>>,
+    join: std::thread::JoinHandle<()>,
 }
 
-static WORKER: OnceLock<Worker> = OnceLock::new();
-
-fn worker_state() -> &'static Worker {
-    WORKER.get_or_init(|| {
-        let (tx, rx) = std::sync::mpsc::channel();
-        let join = std::thread::Builder::new()
-            .name("rpi-office-worker".into())
-            .spawn(move || run_worker(rx))
-            .expect("spawn rpi-office worker");
-        Worker {
-            tx,
-            join: Mutex::new(Some(join)),
+impl Registration {
+    fn enqueue(self: &Arc<Self>, job: Job) {
+        let mut worker = self.worker.lock().unwrap_or_else(|p| p.into_inner());
+        if self.stopping.load(Ordering::Acquire) {
+            return;
         }
-    })
-}
-
-fn worker() -> &'static Sender<Job> {
-    &worker_state().tx
-}
-
-/// Stop and join the worker so no plugin code can run after `finish_shutdown`.
-fn shutdown_worker() -> bool {
-    let Some(worker) = WORKER.get() else {
-        return true;
-    };
-    let (tx, rx) = std::sync::mpsc::channel();
-    if worker.tx.send(Job::Shutdown(tx)).is_ok() {
-        let _ = rx.recv_timeout(Duration::from_secs(5));
-    }
-    let handle = worker
-        .join
-        .lock()
-        .unwrap_or_else(|poison| poison.into_inner())
-        .take();
-    if let Some(handle) = handle {
-        let _ = handle.join();
-    }
-    true
-}
-
-fn run_worker(rx: Receiver<Job>) {
-    loop {
-        match rx.recv_timeout(Duration::from_millis(DELTA_FLUSH_MS)) {
-            Ok(Job::UserMessage { pane, text }) => inject_pane_prompt(&pane, &text),
-            Ok(Job::PanesChanged) => {
-                if let Some(api) = api(std::ptr::null_mut()) {
-                    reconcile_tools(api);
-                    refresh_status(api);
-                }
+        if worker.is_none() {
+            let (tx, rx) = std::sync::mpsc::channel();
+            let registration = self.clone();
+            let join = std::thread::Builder::new()
+                .name("rpi-office-worker".into())
+                .spawn(move || registration.run_worker(rx));
+            match join {
+                Ok(join) => *worker = Some(Worker { tx, join }),
+                Err(error) => eprintln!("[rpi-office] could not start the worker: {error}"),
             }
-            Ok(Job::Delta {
-                pane_id,
-                prompt_id,
-                text,
-            }) => buffer_delta(&pane_id, &prompt_id, &text),
-            Ok(Job::Flush) => flush_deltas(),
-            Ok(Job::Final {
-                pane_id,
-                prompt_id,
-                text,
-                message_id,
-            }) => {
-                flush_deltas();
-                push_to_pane(
+        }
+        if let Some(worker) = worker.as_ref() {
+            let _ = worker.tx.send(job);
+        }
+    }
+
+    fn begin_shutdown(&self) {
+        self.stopping.store(true, Ordering::Release);
+        // If a command is changing the listener, finish will stop the server
+        // it leaves behind. Begin never waits for that command or joins it.
+        if let Ok(mut state) = self.state.try_lock() {
+            state.controller.begin_shutdown();
+        }
+        if let Ok(worker) = self.worker.try_lock() {
+            if let Some(worker) = worker.as_ref() {
+                let _ = worker.tx.send(Job::Shutdown);
+            }
+        }
+    }
+
+    fn finish_shutdown(self: &Arc<Self>) {
+        self.begin_shutdown();
+        self.with_state(|state| {
+            state.controller.begin_shutdown();
+            state.controller.finish_shutdown();
+        });
+        let worker = self.worker.lock().unwrap_or_else(|p| p.into_inner()).take();
+        if let Some(worker) = worker {
+            let _ = worker.tx.send(Job::Shutdown);
+            let _ = worker.join.join();
+        }
+        self.clear_replies();
+        let mut registrations = registrations();
+        let slot = &mut registrations.slots[self.slot];
+        if slot.as_ref().is_some_and(|r| Arc::ptr_eq(r, self)) {
+            *slot = None;
+        }
+    }
+
+    fn run_worker(&self, rx: Receiver<Job>) {
+        while !self.stopping.load(Ordering::Acquire) {
+            let job = rx.recv_timeout(Duration::from_millis(DELTA_FLUSH_MS));
+            if self.stopping.load(Ordering::Acquire) {
+                break;
+            }
+            match job {
+                Ok(Job::UserMessage { pane, text }) => self.inject_pane_prompt(&pane, &text),
+                Ok(Job::PanesChanged) => {
+                    self.reconcile_tools(self.api);
+                    self.refresh_status(self.api);
+                }
+                Ok(Job::Delta {
+                    pane_id,
+                    prompt_id,
+                    text,
+                }) => {
+                    self.buffer_delta(&pane_id, &prompt_id, &text);
+                }
+                Ok(Job::Flush) => self.flush_deltas(),
+                Ok(Job::Final {
+                    pane_id,
+                    prompt_id,
+                    text,
+                    message_id,
+                }) => {
+                    self.flush_deltas();
+                    self.push_to_pane(
+                        &pane_id,
+                        protocol::agent_final(&text, Some(&prompt_id), message_id.as_deref()),
+                    );
+                    self.refresh_status(self.api);
+                }
+                Ok(Job::ToolActivity {
+                    pane_id,
+                    tool,
+                    status,
+                    summary,
+                }) => self.push_to_pane(
                     &pane_id,
-                    protocol::agent_final(&text, Some(&prompt_id), message_id.as_deref()),
-                );
-                if let Some(api) = api(std::ptr::null_mut()) {
-                    refresh_status(api);
-                }
-            }
-            Ok(Job::ToolActivity {
-                pane_id,
-                tool,
-                status,
-                summary,
-            }) => push_to_pane(
-                &pane_id,
-                protocol::tool_activity(&tool, &status, summary.as_deref()),
-            ),
-            Ok(Job::Abort { prompt_id }) => abort_run(prompt_id.as_deref()),
-            Ok(Job::Shutdown(done)) => {
-                flush_deltas();
-                let _ = done.send(());
-                break;
-            }
-            Err(RecvTimeoutError::Timeout) => flush_deltas(),
-            Err(RecvTimeoutError::Disconnected) => {
-                flush_deltas();
-                break;
+                    protocol::tool_activity(&tool, &status, summary.as_deref()),
+                ),
+                Ok(Job::Abort { prompt_id }) => self.abort_run(prompt_id.as_deref()),
+                Ok(Job::Shutdown) | Err(RecvTimeoutError::Disconnected) => break,
+                Err(RecvTimeoutError::Timeout) => self.flush_deltas(),
             }
         }
     }
 }
 
-/// Inject a pane prompt into the shared conversation.
-fn inject_pane_prompt(pane: &Pane, text: &str) {
-    let Some(api) = api(std::ptr::null_mut()) else {
-        return;
-    };
-    let prompt_id = protocol::next_call_id("prompt");
-    let sent_text = format!(
-        "{}\n{}",
-        format_document_tag(
-            pane.host.as_str(),
-            pane.document_name.as_deref(),
-            pane.document_id.as_deref()
-        ),
-        text
-    );
-    with_state(|state| {
-        state.prompts.enqueue(PanePromptEntry {
-            pane: pane.pane_id.clone(),
-            prompt_id: prompt_id.clone(),
-            sent_text: sent_text.clone(),
-        })
-    });
-    // followUp: delivered immediately when idle (and starts a turn), queued
-    // until the current turn settles when busy.
-    let result = call_action(
-        api,
-        RuntimeActionId::SendMessage,
-        json!({"text": sent_text, "triggerTurn": true, "deliverAs": "followUp"}),
-    );
-    if let Err(error) = result {
-        eprintln!("[rpi-office] could not inject the pane prompt: {error}");
+impl Registration {
+    /// Inject a pane prompt into the shared conversation.
+    fn inject_pane_prompt(&self, pane: &Pane, text: &str) {
+        let api = self.api;
+        let prompt_id = protocol::next_call_id("prompt");
+        let sent_text = format!(
+            "{}\n{}",
+            format_document_tag(
+                pane.host.as_str(),
+                pane.document_name.as_deref(),
+                pane.document_id.as_deref()
+            ),
+            text
+        );
+        self.with_replies(|replies| {
+            replies.prompts.enqueue(PanePromptEntry {
+                pane: pane.pane_id.clone(),
+                prompt_id: prompt_id.clone(),
+                sent_text: sent_text.clone(),
+            })
+        });
+        // followUp: delivered immediately when idle (and starts a turn), queued
+        // until the current turn settles when busy.
+        let result = call_action(
+            api,
+            RuntimeActionId::SendMessage,
+            json!({"text": sent_text, "triggerTurn": true, "deliverAs": "followUp"}),
+        );
+        if let Err(error) = result {
+            eprintln!("[rpi-office] could not inject the pane prompt: {error}");
+        }
+        self.refresh_status(api);
     }
-    refresh_status(api);
-}
 
-/// Abort the in-flight run on behalf of a pane's Stop button.
-///
-/// The host's `Abort` is cooperative, so late stream events may still arrive;
-/// the local reply binding is cleared by `on_abort_request` before this runs.
-/// The response's `aborted` flag is only logged: on this host it is `true` even
-/// for a second call on the same run, so it must not drive any control flow.
-fn abort_run(prompt_id: Option<&str>) {
-    let Some(api) = api(std::ptr::null_mut()) else {
-        return;
-    };
-    match call_action(api, RuntimeActionId::Abort, json!({})) {
-        Ok(value) => {
-            eprintln!(
+    /// Abort the in-flight run on behalf of a pane's Stop button.
+    ///
+    /// The host's `Abort` is cooperative, so late stream events may still arrive;
+    /// the local reply binding is cleared by `on_abort_request` before this runs.
+    /// The response's `aborted` flag is only logged: on this host it is `true` even
+    /// for a second call on the same run, so it must not drive any control flow.
+    fn abort_run(&self, prompt_id: Option<&str>) {
+        let api = self.api;
+        match call_action(api, RuntimeActionId::Abort, json!({})) {
+            Ok(value) => {
+                eprintln!(
                 "[rpi-office] abort requested (prompt {}) → aborted={} run={} steer={} followUp={}",
                 prompt_id.unwrap_or("-"),
                 value["aborted"],
@@ -370,52 +444,53 @@ fn abort_run(prompt_id: Option<&str>) {
                 value["steer"].as_array().map(Vec::len).unwrap_or(0),
                 value["followUp"].as_array().map(Vec::len).unwrap_or(0),
             );
+            }
+            Err(error) => eprintln!(
+                "[rpi-office] abort failed (prompt {}): {error}",
+                prompt_id.unwrap_or("-")
+            ),
         }
-        Err(error) => eprintln!(
-            "[rpi-office] abort failed (prompt {}): {error}",
-            prompt_id.unwrap_or("-")
-        ),
+        self.refresh_status(api);
     }
-    refresh_status(api);
-}
 
-fn buffer_delta(pane_id: &str, prompt_id: &str, text: &str) {
-    with_state(|state| {
-        let switched = state.delta.pane_id.as_deref() != Some(pane_id)
-            || state.delta.prompt_id.as_deref() != Some(prompt_id);
-        if switched {
-            state.delta.clear();
-            state.delta.pane_id = Some(pane_id.to_string());
-            state.delta.prompt_id = Some(prompt_id.to_string());
+    fn buffer_delta(&self, pane_id: &str, prompt_id: &str, text: &str) {
+        self.with_replies(|replies| {
+            let switched = replies.delta.pane_id.as_deref() != Some(pane_id)
+                || replies.delta.prompt_id.as_deref() != Some(prompt_id);
+            if switched {
+                replies.delta.clear();
+                replies.delta.pane_id = Some(pane_id.to_string());
+                replies.delta.prompt_id = Some(prompt_id.to_string());
+            }
+            replies.delta.buffer.push_str(text);
+        });
+    }
+
+    fn flush_deltas(&self) {
+        let pending = self.with_replies(|replies| {
+            if replies.delta.buffer.is_empty() {
+                return None;
+            }
+            let text = std::mem::take(&mut replies.delta.buffer);
+            Some((
+                replies.delta.pane_id.clone(),
+                replies.delta.prompt_id.clone(),
+                text,
+            ))
+        });
+        let Some((Some(pane_id), prompt_id, text)) = pending else {
+            return;
+        };
+        self.push_to_pane(
+            &pane_id,
+            protocol::agent_delta(&text, prompt_id.as_deref(), None),
+        );
+    }
+
+    fn push_to_pane(&self, pane_id: &str, message: Value) {
+        if let Some(server) = self.server() {
+            let _ = server.push_to_pane(pane_id, message);
         }
-        state.delta.buffer.push_str(text);
-    });
-}
-
-fn flush_deltas() {
-    let pending = with_state(|state| {
-        if state.delta.buffer.is_empty() {
-            return None;
-        }
-        let text = std::mem::take(&mut state.delta.buffer);
-        Some((
-            state.delta.pane_id.clone(),
-            state.delta.prompt_id.clone(),
-            text,
-        ))
-    });
-    let Some((Some(pane_id), prompt_id, text)) = pending else {
-        return;
-    };
-    push_to_pane(
-        &pane_id,
-        protocol::agent_delta(&text, prompt_id.as_deref(), None),
-    );
-}
-
-fn push_to_pane(pane_id: &str, message: Value) {
-    if let Some(server) = server_lookup() {
-        let _ = server.push_to_pane(pane_id, message);
     }
 }
 
@@ -436,31 +511,33 @@ fn active_tool_names(api: PluginApi) -> Result<Vec<String>, String> {
         .ok_or_else(|| "runtime did not return an active tool list".to_string())
 }
 
-/// Reconcile the host's active tool set with the bridge lifecycle and panes.
-fn reconcile_tools(api: PluginApi) {
-    let Ok(current) = active_tool_names(api) else {
-        return;
-    };
-    let (enabled, panes) = with_state(|state| {
-        (
-            state.controller.is_on(),
-            state
-                .controller
-                .panes()
-                .into_iter()
-                .map(|pane| PaneCapability {
-                    host: pane.host,
-                    ops: pane.ops.clone(),
-                })
-                .collect::<Vec<_>>(),
-        )
-    });
-    let next = active_tools::reconcile_bridge_tool_activation(&current, enabled, &panes);
-    if next != current {
-        if let Err(error) =
-            call_action(api, RuntimeActionId::SetActiveTools, json!({"tools": next}))
-        {
-            eprintln!("[rpi-office] could not update the active tools: {error}");
+impl Registration {
+    /// Reconcile the host's active tool set with the bridge lifecycle and panes.
+    fn reconcile_tools(&self, api: PluginApi) {
+        let Ok(current) = active_tool_names(api) else {
+            return;
+        };
+        let (enabled, panes) = self.with_state(|state| {
+            (
+                state.controller.is_on(),
+                state
+                    .controller
+                    .panes()
+                    .into_iter()
+                    .map(|pane| PaneCapability {
+                        host: pane.host,
+                        ops: pane.ops.clone(),
+                    })
+                    .collect::<Vec<_>>(),
+            )
+        });
+        let next = active_tools::reconcile_bridge_tool_activation(&current, enabled, &panes);
+        if next != current {
+            if let Err(error) =
+                call_action(api, RuntimeActionId::SetActiveTools, json!({"tools": next}))
+            {
+                eprintln!("[rpi-office] could not update the active tools: {error}");
+            }
         }
     }
 }
@@ -502,26 +579,31 @@ fn status_line(snapshot: &BridgeSnapshot, panes: &[Pane]) -> Option<String> {
     }
 }
 
-fn refresh_status(api: PluginApi) {
-    let (snapshot, panes) =
-        with_state(|state| (state.controller.snapshot(), state.controller.panes()));
-    let line = status_line(&snapshot, &panes);
-    let mut args = json!({"key": STATUS_KEY});
-    if let Some(line) = line {
-        args["value"] = json!(line);
-    }
-    if let Err(error) = call_action(api, RuntimeActionId::SetStatus, args) {
-        eprintln!("[rpi-office] could not update the status line: {error}");
+impl Registration {
+    fn refresh_status(&self, api: PluginApi) {
+        let (snapshot, panes) =
+            self.with_state(|state| (state.controller.snapshot(), state.controller.panes()));
+        let line = status_line(&snapshot, &panes);
+        let mut args = json!({"key": STATUS_KEY});
+        if let Some(line) = line {
+            args["value"] = json!(line);
+        }
+        if let Err(error) = call_action(api, RuntimeActionId::SetStatus, args) {
+            eprintln!("[rpi-office] could not update the status line: {error}");
+        }
     }
 }
 
 /* ── server hooks (never call the host inline: they enqueue) ────────── */
 
-struct PluginHooks;
+struct PluginHooks(Weak<Registration>);
 
 impl server::Hooks for PluginHooks {
     fn on_user_message(&self, text: &str, pane: &Pane) {
-        let _ = worker().send(Job::UserMessage {
+        let Some(registration) = self.0.upgrade() else {
+            return;
+        };
+        registration.enqueue(Job::UserMessage {
             pane: pane.clone(),
             text: text.to_string(),
         });
@@ -531,29 +613,34 @@ impl server::Hooks for PluginHooks {
         // Release the local reply binding first so a late delta or final cannot
         // land in the pane's stopped buffer, then ask the host to abort the run
         // (`client-abort`, backed by `RuntimeActionId::Abort`).
-        let matched = with_state(|state| {
-            if let Some(active) = state.prompts.active() {
+        let Some(registration) = self.0.upgrade() else {
+            return;
+        };
+        let matched = registration.with_replies(|replies| {
+            if let Some(active) = replies.prompts.active() {
                 let same_pane = active.pane == pane.pane_id;
                 let same_prompt = prompt_id
                     .map(|prompt_id| prompt_id == active.prompt_id)
                     .unwrap_or(true);
                 if same_pane && same_prompt {
-                    state.prompts.complete();
-                    state.delta.clear();
+                    replies.prompts.complete();
+                    replies.delta.clear();
                     return true;
                 }
             }
             false
         });
         if matched {
-            let _ = worker().send(Job::Abort {
+            registration.enqueue(Job::Abort {
                 prompt_id: prompt_id.map(str::to_owned),
             });
         }
     }
 
     fn on_panes_changed(&self, _panes: &[Pane]) {
-        let _ = worker().send(Job::PanesChanged);
+        if let Some(registration) = self.0.upgrade() {
+            registration.enqueue(Job::PanesChanged);
+        }
     }
 
     fn on_log(&self, message: &str) {
@@ -561,33 +648,36 @@ impl server::Hooks for PluginHooks {
     }
 }
 
-fn hooks() -> Arc<dyn server::Hooks> {
-    static HOOKS: OnceLock<Arc<PluginHooks>> = OnceLock::new();
-    HOOKS.get_or_init(|| Arc::new(PluginHooks)).clone() as Arc<dyn server::Hooks>
-}
-
-/* ── lifecycle helpers shared by commands and events ───────────────── */
-
-fn connect_bridge(port: Option<u16>, owner: *mut c_void) -> Result<BridgeSnapshot, String> {
-    let snapshot = with_state(|state| state.controller.connect(port, &health_meta, hooks()))?;
-    if let Some(api) = api(owner) {
-        reconcile_tools(api);
-        refresh_status(api);
+impl Registration {
+    fn hooks(self: &Arc<Self>) -> Arc<dyn server::Hooks> {
+        Arc::new(PluginHooks(Arc::downgrade(self)))
     }
-    Ok(snapshot)
-}
 
-fn close_bridge(owner: *mut c_void) -> Result<BridgeSnapshot, String> {
-    let snapshot = with_state(|state| {
-        state.prompts.clear();
-        state.delta.clear();
-        state.controller.close()
-    })?;
-    if let Some(api) = api(owner) {
-        reconcile_tools(api);
-        refresh_status(api);
+    fn connect_bridge(
+        self: &Arc<Self>,
+        port: Option<u16>,
+        api: PluginApi,
+    ) -> Result<BridgeSnapshot, String> {
+        let snapshot = self.with_state(|state| {
+            self.check_running()?;
+            state.controller.connect(port, &health_meta, self.hooks())
+        })?;
+        self.reconcile_tools(api);
+        self.refresh_status(api);
+        Ok(snapshot)
     }
-    Ok(snapshot)
+
+    fn check_running(&self) -> Result<(), String> {
+        if self.stopping.load(Ordering::Acquire) {
+            return Err("Office bridge registration is shutting down.".into());
+        }
+        Ok(())
+    }
+
+    fn close_bridge(&self) -> Result<BridgeSnapshot, String> {
+        self.clear_replies();
+        self.with_state(|state| state.controller.close())
+    }
 }
 
 /* ── content helpers ───────────────────────────────────────────────── */
@@ -700,16 +790,14 @@ feature you are unsure about.",
 /// `SessionStart` (measured on `rpi 0.24.0`). Both entry points share this
 /// function so a print-mode session still resolves flags, reconciles the tool
 /// set and honours `--office-bridge-autostart`.
-fn ensure_initialized(api: PluginApi, owner: *mut c_void) {
-    static INITIALIZED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-    if INITIALIZED.swap(true, std::sync::atomic::Ordering::SeqCst) {
+fn ensure_initialized(registration: &Arc<Registration>, api: PluginApi) {
+    if registration.initialized.swap(true, Ordering::AcqRel) {
         return;
     }
     let port = config::resolve_port(cli_flag(api, config::FLAG_PORT).as_ref(), &env_value);
     let autostart =
         config::resolve_autostart(cli_flag(api, config::FLAG_AUTOSTART).as_ref(), &env_value);
-    with_state(|state| {
-        state.port = port;
+    registration.with_state(|state| {
         state.autostart = autostart;
         if state.controller.snapshot().state == lifecycle::LifecycleState::Off {
             state.controller = Controller::new(port);
@@ -717,11 +805,12 @@ fn ensure_initialized(api: PluginApi, owner: *mut c_void) {
     });
     // Always reconcile: with the bridge off this removes every office tool from
     // the active set, so an offline session does not advertise Office support.
-    reconcile_tools(api);
+    registration.reconcile_tools(api);
     if autostart
-        && with_state(|state| state.controller.snapshot().state == lifecycle::LifecycleState::Off)
+        && registration
+            .with_state(|state| state.controller.snapshot().state == lifecycle::LifecycleState::Off)
     {
-        match connect_bridge(Some(port), owner) {
+        match registration.connect_bridge(Some(port), api) {
             Ok(snapshot) => eprintln!(
                 "[rpi-office] bridge listening on ws://127.0.0.1:{}",
                 snapshot.actual_port.unwrap_or(snapshot.port)
@@ -729,13 +818,13 @@ fn ensure_initialized(api: PluginApi, owner: *mut c_void) {
             Err(error) => eprintln!("[rpi-office] autostart failed: {error}"),
         }
     }
-    refresh_status(api);
+    registration.refresh_status(api);
 }
 
 rpi_plugin_sdk::event_handler! {
 fn on_session_start(_event, owner) {
-    if let Some(api) = api(owner) {
-        ensure_initialized(api, owner);
+    if let Some(registration) = Registration::for_callback(owner) {
+        ensure_initialized(&registration, registration.api);
     }
     0
 }
@@ -743,8 +832,8 @@ fn on_session_start(_event, owner) {
 
 rpi_plugin_sdk::event_handler! {
 fn on_agent_start(_event, owner) {
-    if let Some(api) = api(owner) {
-        ensure_initialized(api, owner);
+    if let Some(registration) = Registration::for_callback(owner) {
+        ensure_initialized(&registration, registration.api);
     }
     0
 }
@@ -752,15 +841,14 @@ fn on_agent_start(_event, owner) {
 
 rpi_plugin_sdk::event_handler! {
 fn on_session_shutdown(_event, owner) {
-    let result = with_state(|state| {
-        state.prompts.clear();
-        state.delta.clear();
-        state.controller.close()
-    });
-    if let Err(error) = result {
-        eprintln!("[rpi-office] shutdown close failed: {error}");
-    }
-    if let Some(api) = api(owner) {
+    if let Some(registration) = Registration::lookup(owner) {
+        registration.begin_shutdown();
+        if registration.api.register_plugin_lifecycle.is_none() {
+            registration.finish_shutdown();
+        } else if let Err(error) = registration.close_bridge() {
+            eprintln!("[rpi-office] shutdown close failed: {error}");
+        }
+        let api = registration.api;
         let _ = call_action(api, RuntimeActionId::SetStatus, json!({"key": STATUS_KEY}));
     }
     0
@@ -768,7 +856,8 @@ fn on_session_shutdown(_event, owner) {
 }
 
 rpi_plugin_sdk::event_handler! {
-fn on_message_start(event, _owner) {
+fn on_message_start(event, owner) {
+    let Some(registration) = Registration::for_callback(owner) else { return 0 };
     let Ok(message) = serde_json::from_str::<Value>(&event.message_text().unwrap_or_default())
     else {
         return 0;
@@ -780,22 +869,23 @@ fn on_message_start(event, _owner) {
     if text.is_empty() {
         return 0;
     }
-    with_state(|state| {
-        let _ = state.prompts.bind_delivered_user_message(&text);
+    registration.with_replies(|replies| {
+        let _ = replies.prompts.bind_delivered_user_message(&text);
     });
     0
 }
 }
 
 rpi_plugin_sdk::event_handler! {
-fn on_message_update(event, _owner) {
+fn on_message_update(event, owner) {
+    let Some(registration) = Registration::for_callback(owner) else { return 0 };
     let payload: Value =
         serde_json::from_str(&event.message_text().unwrap_or_default()).unwrap_or(Value::Null);
     let Some(text) = delta_text(&payload) else {
         return 0;
     };
-    let active = with_state(|state| {
-        state.prompts.active().map(|entry| {
+    let active = registration.with_replies(|replies| {
+        replies.prompts.active().map(|entry| {
             (
                 entry.pane.clone(),
                 entry.prompt_id.clone(),
@@ -806,7 +896,7 @@ fn on_message_update(event, _owner) {
         return 0;
     };
     // A v2 pane cannot render a delta; the final reply is all it gets.
-    let protocol_version = panes_lookup()
+    let protocol_version = registration.panes()
         .into_iter()
         .find(|pane| pane.pane_id == pane_id)
         .map(|pane| pane.protocol_version)
@@ -814,7 +904,7 @@ fn on_message_update(event, _owner) {
     if protocol_version < protocol::BRIDGE_PROTOCOL_VERSION {
         return 0;
     }
-    let _ = worker().send(Job::Delta {
+    registration.enqueue(Job::Delta {
         pane_id,
         prompt_id,
         text,
@@ -825,6 +915,7 @@ fn on_message_update(event, _owner) {
 
 rpi_plugin_sdk::event_handler! {
 fn on_message_end(event, owner) {
+    let Some(registration) = Registration::for_callback(owner) else { return 0 };
     let Ok(message) = serde_json::from_str::<Value>(&event.message_text().unwrap_or_default())
     else {
         return 0;
@@ -834,22 +925,20 @@ fn on_message_end(event, owner) {
     }
     let text = flatten_text_content(&message["content"]);
     let message_id = message["id"].as_str().map(str::to_owned);
-    let active = with_state(|state| {
-        let entry = state.prompts.complete();
-        state.delta.clear();
+    let active = registration.with_replies(|replies| {
+        let entry = replies.prompts.complete();
+        replies.delta.clear();
         entry
     });
     let Some(entry) = active else {
         return 0;
     };
-    let _ = worker().send(Job::Flush);
-    if let Some(api) = api(owner) {
-        refresh_status(api);
-    }
+    registration.enqueue(Job::Flush);
+    registration.refresh_status(registration.api);
     if text.is_empty() {
         return 0;
     }
-    let _ = worker().send(Job::Final {
+    registration.enqueue(Job::Final {
         pane_id: entry.pane,
         prompt_id: entry.prompt_id,
         text,
@@ -860,19 +949,21 @@ fn on_message_end(event, owner) {
 }
 
 rpi_plugin_sdk::event_handler! {
-fn on_agent_settled(_event, _owner) {
+fn on_agent_settled(_event, owner) {
+    let Some(registration) = Registration::for_callback(owner) else { return 0 };
     // An aborted/settled turn that produced no final must not leave a pane
     // bound to the next, unrelated turn.
-    with_state(|state| {
-        state.prompts.complete();
-        state.delta.clear();
+    registration.with_replies(|replies| {
+        replies.prompts.complete();
+        replies.delta.clear();
     });
     0
 }
 }
 
 rpi_plugin_sdk::event_handler! {
-fn on_tool_execution_start(event, _owner) {
+fn on_tool_execution_start(event, owner) {
+    let Some(registration) = Registration::for_callback(owner) else { return 0 };
     let Some(call) = event.tool_call() else { return 0 };
     if catalog::catalog().host_for_tool(&call.tool_name).is_some()
         || call.tool_name == active_tools::OFFICE_LIST_TOOL
@@ -880,9 +971,9 @@ fn on_tool_execution_start(event, _owner) {
         return 0;
     }
     let args: Value = serde_json::from_str(&call.params).unwrap_or(Value::Null);
-    let pane_id = with_state(|state| state.prompts.active().map(|entry| entry.pane.clone()));
+    let pane_id = registration.with_replies(|replies| replies.prompts.active().map(|entry| entry.pane.clone()));
     if let Some(pane_id) = pane_id {
-        let _ = worker().send(Job::ToolActivity {
+        registration.enqueue(Job::ToolActivity {
             pane_id,
             tool: call.tool_name.clone(),
             status: "start".into(),
@@ -894,21 +985,22 @@ fn on_tool_execution_start(event, _owner) {
 }
 
 rpi_plugin_sdk::event_handler! {
-fn on_tool_execution_end(event, _owner) {
+fn on_tool_execution_end(event, owner) {
+    let Some(registration) = Registration::for_callback(owner) else { return 0 };
     let Some(result) = event.tool_result() else { return 0 };
     if catalog::catalog().host_for_tool(&result.tool_name).is_some()
         || result.tool_name == active_tools::OFFICE_LIST_TOOL
     {
         return 0;
     }
-    let pane_id = with_state(|state| state.prompts.active().map(|entry| entry.pane.clone()));
+    let pane_id = registration.with_replies(|replies| replies.prompts.active().map(|entry| entry.pane.clone()));
     if let Some(pane_id) = pane_id {
         let (status, summary) = if result.is_error {
             ("error", Some(result.result.clone()))
         } else {
             ("end", None)
         };
-        let _ = worker().send(Job::ToolActivity {
+        registration.enqueue(Job::ToolActivity {
             pane_id,
             tool: result.tool_name,
             status: status.into(),
@@ -922,11 +1014,11 @@ fn on_tool_execution_end(event, _owner) {
 /* ── system prompt transformer ─────────────────────────────────────── */
 
 rpi_plugin_sdk::string_handler! {
-fn before_agent_start(input, out, _owner) {
+fn before_agent_start(input, out, owner) {
     let env: Value = serde_json::from_str(input).unwrap_or(Value::Null);
     let current = env["systemPrompt"].as_str().unwrap_or_default();
-    let panes = panes_lookup();
-    let Some(block) = pane_context_block(&panes) else {
+    let Some(registration) = Registration::for_callback(owner) else { return 0 };
+    let Some(block) = pane_context_block(&registration.panes()) else {
         return 0;
     };
     // The response replaces the prompt, so append to the current value.
@@ -937,23 +1029,15 @@ fn before_agent_start(input, out, _owner) {
 
 /* ── plugin lifecycle (reload / shutdown safety) ────────────────────── */
 
-/// `begin_shutdown`: non-blocking half. Ask the hub to close panes and exit,
-/// drop prompt correlation, and refuse to start new work.
-extern "C" fn plugin_begin_shutdown(_user_data: *mut c_void) {
-    with_state(|state| {
-        state.prompts.clear();
-        state.delta.clear();
-        state.controller.begin_shutdown();
-    });
+extern "C" fn plugin_begin_shutdown(owner: *mut c_void) {
+    if let Some(registration) = Registration::lookup(owner) {
+        registration.begin_shutdown();
+    }
 }
 
-/// `finish_shutdown`: blocking half. Join both plugin threads, then report 0 so
-/// the host may unload the library; returning nonzero would keep it resident.
-extern "C" fn plugin_finish_shutdown(_user_data: *mut c_void) -> i32 {
-    with_state(|state| state.controller.finish_shutdown());
-    let _ = shutdown_worker();
-    if let Some(api) = api(std::ptr::null_mut()) {
-        let _ = call_action(api, RuntimeActionId::SetStatus, json!({"key": STATUS_KEY}));
+extern "C" fn plugin_finish_shutdown(owner: *mut c_void) -> i32 {
+    if let Some(registration) = Registration::lookup(owner) {
+        registration.finish_shutdown();
     }
     0
 }
@@ -965,11 +1049,14 @@ fn command_text(raw: &str, owner: *mut c_void) -> String {
         let envelope: Value =
             serde_json::from_str(raw).map_err(|error| format!("Invalid command: {error}"))?;
         let args = envelope["args"].as_str().unwrap_or_default();
+        let registration = Registration::for_command(owner)
+            .ok_or("Office bridge registration is shutting down.")?;
+        let api = registration.api;
         match commands::parse_office_command(args) {
             commands::OfficeCommand::Help => Ok(commands::office_command_help()),
             commands::OfficeCommand::Error(message) => Err(message),
             commands::OfficeCommand::Status => {
-                let (snapshot, panes, autostart) = with_state(|state| {
+                let (snapshot, panes, autostart) = registration.with_state(|state| {
                     (
                         state.controller.snapshot(),
                         state.controller.panes(),
@@ -983,27 +1070,29 @@ fn command_text(raw: &str, owner: *mut c_void) -> String {
                 }))
             }
             commands::OfficeCommand::Connect { port } => {
-                let snapshot = connect_bridge(port, owner)?;
+                let snapshot = registration.connect_bridge(port, api)?;
                 Ok(format!(
                     "Office bridge listening on ws://127.0.0.1:{}. Open the Pi for Office add-in, or run /office status.",
                     snapshot.actual_port.unwrap_or(snapshot.port)
                 ))
             }
             commands::OfficeCommand::Close => {
-                close_bridge(owner)?;
+                registration.close_bridge()?;
+                registration.reconcile_tools(api);
+                registration.refresh_status(api);
                 Ok("Office bridge closed. The add-in is disconnected; run /office connect to resume."
                     .to_string())
             }
             commands::OfficeCommand::Restart { port } => {
-                let snapshot = with_state(|state| {
-                    state.prompts.clear();
-                    state.delta.clear();
-                    state.controller.restart(port, &health_meta, hooks())
+                registration.clear_replies();
+                let snapshot = registration.with_state(|state| {
+                    registration.check_running()?;
+                    state
+                        .controller
+                        .restart(port, &health_meta, registration.hooks())
                 })?;
-                if let Some(api) = api(owner) {
-                    reconcile_tools(api);
-                    refresh_status(api);
-                }
+                registration.reconcile_tools(api);
+                registration.refresh_status(api);
                 Ok(format!(
                     "Office bridge restarted on ws://127.0.0.1:{}.",
                     snapshot.actual_port.unwrap_or(snapshot.port)
@@ -1024,8 +1113,8 @@ fn office_command(input, out, owner) {
 
 rpi_plugin_sdk::string_handler! {
 fn office_tools_command(_input, out, owner) {
-    let active = api(owner)
-        .and_then(|api| active_tool_names(api).ok())
+    let active = Registration::for_command(owner)
+        .and_then(|registration| active_tool_names(registration.api).ok())
         .unwrap_or_default();
     out.write(
         json!({
@@ -1043,7 +1132,7 @@ fn office_tools_command(_input, out, owner) {
 
 // Prompt-editor autocomplete: offer attached documents for a `#` mention.
 rpi_plugin_sdk::string_handler! {
-fn document_mentions(input, out, _owner) {
+fn document_mentions(input, out, owner) {
     let query: Value = serde_json::from_str(input).unwrap_or(Value::Null);
     let Some(line_prefix) = query["linePrefix"].as_str() else {
         return 1;
@@ -1051,11 +1140,8 @@ fn document_mentions(input, out, _owner) {
     let Some(needle) = mentions::mention_needle(line_prefix) else {
         return 1;
     };
-    let panes = panes_lookup();
-    if panes.is_empty() {
-        return 1;
-    }
-    let items = mentions::document_items(&panes, needle);
+    let Some(registration) = Registration::for_callback(owner) else { return 1 };
+    let items = mentions::document_items(&registration.panes(), needle);
     if items.is_empty() {
         return 1;
     }
@@ -1066,7 +1152,10 @@ fn document_mentions(input, out, _owner) {
 
 // `/office` argument completions.
 rpi_plugin_sdk::string_handler! {
-fn office_command_arguments(input, out, _owner) {
+fn office_command_arguments(input, out, owner) {
+    if Registration::for_callback(owner).is_none() {
+        return 1;
+    }
     let query: Value = serde_json::from_str(input).unwrap_or(Value::Null);
     let prefix = query["argumentPrefix"].as_str().unwrap_or_default();
     match commands::office_argument_completions_json(prefix) {
@@ -1082,10 +1171,25 @@ fn office_command_arguments(input, out, _owner) {
 /* ── registration ──────────────────────────────────────────────────── */
 
 fn register(api: &PluginApi) -> i32 {
-    *api_store()
-        .lock()
-        .unwrap_or_else(|poison| poison.into_inner()) = Some(*api);
-    tools::install(server_lookup, panes_lookup);
+    let Some(registration) = Registration::reserve(*api) else {
+        return 1;
+    };
+    let rc = rpi_plugin_sdk::guard_or(1, || register_callbacks(&registration));
+    if rc != 0 {
+        registration.finish_shutdown();
+    }
+    rc
+}
+
+fn register_callbacks(registration: &Registration) -> i32 {
+    let api = &registration.api;
+    let cookie = registration.id as *mut c_void;
+    if let Some(register_lifecycle) = api.register_plugin_lifecycle {
+        let rc = register_lifecycle(plugin_begin_shutdown, plugin_finish_shutdown, cookie);
+        if rc != 0 {
+            return rc;
+        }
+    }
 
     if let Some(register_flag) = api.register_flag {
         let _ = register_flag(
@@ -1127,7 +1231,7 @@ fn register(api: &PluginApi) -> i32 {
     let rc = rpi_plugin_sdk::register_autocomplete_provider(
         api,
         document_mentions as AutocompleteProviderFn,
-        api.user_data,
+        cookie,
     );
     if rc != 0 && rc != -1 {
         return rc;
@@ -1136,7 +1240,7 @@ fn register(api: &PluginApi) -> i32 {
         api,
         "office",
         office_command_arguments as CommandArgumentCompletionFn,
-        api.user_data,
+        cookie,
     );
     if rc != 0 && rc != -1 {
         return rc;
@@ -1166,14 +1270,7 @@ fn register(api: &PluginApi) -> i32 {
         ),
     ];
     for (tag, handler) in handlers {
-        let rc = register_event(tag, handler, api.user_data);
-        if rc != 0 {
-            return rc;
-        }
-    }
-
-    if let Some(register_lifecycle) = api.register_plugin_lifecycle {
-        let rc = register_lifecycle(plugin_begin_shutdown, plugin_finish_shutdown, api.user_data);
+        let rc = register_event(tag, handler, cookie);
         if rc != 0 {
             return rc;
         }
@@ -1183,15 +1280,20 @@ fn register(api: &PluginApi) -> i32 {
         let rc = register_before_agent_start(
             before_agent_start as BeforeAgentStartFn,
             rpi_plugin_sdk::callbacks::free_string as FreeStringFn,
-            api.user_data,
+            cookie,
         );
         if rc != 0 {
             return rc;
         }
     }
 
-    tools::register(api)
+    tools::register(api, registration.slot)
 }
+
+// The loader probes this fixed ABI symbol on this specific library image.
+#[allow(unsafe_code)]
+#[no_mangle]
+pub extern "C" fn rpi_plugin_shared_sessions_v1() {}
 
 rpi_plugin_sdk::export_plugin!(register);
 

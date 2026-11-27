@@ -1,6 +1,6 @@
 //! Capability-driven Web bridge for the native `rpi --mode rpc` host.
 
-#![forbid(unsafe_code)]
+#![deny(unsafe_code)]
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
 mod assets;

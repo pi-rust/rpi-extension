@@ -6,34 +6,80 @@ use serde_json::{json, Value};
 use std::ffi::c_void;
 use std::sync::{
     mpsc::{self, Receiver},
-    Mutex,
+    Arc, Mutex, Weak,
 };
 use std::thread::JoinHandle;
 
-pub type Builder = fn(&Value, &Control) -> Result<Value, String>;
 struct State {
     receiver: Receiver<Result<Value, String>>,
-    worker: Option<JoinHandle<()>>,
     completed: bool,
 }
 static HANDLES: ToolHandles<Drive> = ToolHandles::new();
 
 struct Drive {
-    control: Control,
+    worker: Arc<Worker>,
     state: Mutex<State>,
+}
+
+struct Worker {
+    control: Control,
+    thread: Mutex<Option<JoinHandle<()>>>,
+}
+
+impl Worker {
+    fn join(&self) {
+        if let Some(thread) = self.thread.lock().unwrap_or_else(|p| p.into_inner()).take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+#[derive(Default)]
+pub(crate) struct Workers(Mutex<WorkerSet>);
+
+#[derive(Default)]
+struct WorkerSet {
+    stopping: bool,
+    live: Vec<Weak<Worker>>,
+}
+
+impl Workers {
+    pub(crate) fn is_stopping(&self) -> bool {
+        self.0.lock().unwrap_or_else(|p| p.into_inner()).stopping
+    }
+
+    pub(crate) fn stop(&self) {
+        let mut set = self.0.lock().unwrap_or_else(|p| p.into_inner());
+        set.stopping = true;
+        for worker in set.live.iter().filter_map(Weak::upgrade) {
+            worker.control.cancel();
+        }
+    }
+
+    pub(crate) fn join(&self) {
+        let mut set = self.0.lock().unwrap_or_else(|p| p.into_inner());
+        for worker in set.live.drain(..).filter_map(|worker| worker.upgrade()) {
+            worker.join();
+        }
+    }
 }
 
 pub fn execute(
     params: StbString,
     free_params: Option<FreeStringFn>,
-    builder: Builder,
+    workers: &Workers,
+    builder: impl FnOnce(&Value, &Control) -> Result<Value, String> + Send + 'static,
 ) -> StepHandle {
     let text = params.to_string_lossy();
     params.free_with(free_params);
+    let mut set = workers.0.lock().unwrap_or_else(|p| p.into_inner());
+    if set.stopping {
+        return std::ptr::null_mut();
+    }
     let control = Control::default();
     let worker_control = control.clone();
     let (sender, receiver) = mpsc::sync_channel(1);
-    let worker = std::thread::spawn(move || {
+    let Ok(thread) = std::thread::Builder::new().spawn(move || {
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             worker_control.check()?;
             let params: Value = serde_json::from_str(&text)
@@ -45,12 +91,19 @@ pub fn execute(
         }))
         .unwrap_or_else(|_| Err("MCP worker panicked".into()));
         let _ = sender.send(result);
-    });
-    HANDLES.insert(Drive {
+    }) else {
+        return std::ptr::null_mut();
+    };
+    let worker = Arc::new(Worker {
         control,
+        thread: Mutex::new(Some(thread)),
+    });
+    set.live.retain(|worker| worker.strong_count() != 0);
+    set.live.push(Arc::downgrade(&worker));
+    HANDLES.insert(Drive {
+        worker,
         state: Mutex::new(State {
             receiver,
-            worker: Some(worker),
             completed: false,
         }),
     })
@@ -95,18 +148,14 @@ pub fn poll(handle: StepHandle, _: Option<ToolPartialCb>, _: *mut c_void) -> Ste
 pub fn cancel(handle: StepHandle) {
     if let Some(entry) = HANDLES.get(handle) {
         entry.cancel();
-        entry.lock().control.cancel();
+        entry.lock().worker.control.cancel();
     }
 }
 pub fn destroy(handle: StepHandle) {
     if let Some(entry) = HANDLES.remove(handle) {
         let drive = entry.lock();
-        drive.control.cancel();
-        if let Ok(mut state) = drive.state.lock() {
-            if let Some(worker) = state.worker.take() {
-                let _ = worker.join();
-            }
-        };
+        drive.worker.control.cancel();
+        drive.worker.join();
     }
 }
 pub fn text_result(text: impl Into<String>) -> Value {
@@ -143,6 +192,7 @@ mod tests {
         let handle = execute(
             StbString::from_string("{}".into()),
             Some(plugin_free_string),
+            &Workers::default(),
             wait,
         );
         let start = Instant::now();

@@ -1,8 +1,10 @@
-#![forbid(unsafe_code)]
+#![deny(unsafe_code)]
 
 use rpi_mcp_core::{config, connection, control, http, transport};
 mod jsonrpc;
 mod kit;
+mod lifecycle;
+mod registration;
 mod runtime;
 
 pub use config::{Exposure, HttpServer, McpConfig, McpServerConfig, StdioServer};
@@ -11,6 +13,8 @@ pub use connection::{
     parse_tools_list, tools_call_request, tools_list_request, ServerInfo, PROTOCOL_VERSION,
 };
 pub use control::Control;
+pub use lifecycle::rpi_plugin_register;
+use registration::Registration;
 pub use rpi_mcp_core::jsonrpc::{
     call_result_text, tool_list, ErrorObject, Notification, Request, Response, Tool,
 };
@@ -18,11 +22,13 @@ pub use rpi_mcp_core::{
     ClientIdentity, CoreRequestContext, DiscoveredServer, McpRuntime, ResourceUpdate,
     ResourceUpdateBatch,
 };
+use rpi_plugin_sdk::{PluginApi, ToolExecuteFn};
 pub use runtime::{
     call_from_config, call_from_config_with_timeout, close_from_config, discover_from_config,
     resources_from_config, shutdown_connections, take_resource_updates,
 };
 use serde_json::{json, Value};
+use std::ffi::c_void;
 pub use transport::StdioTransport;
 
 /// Compatibility HTTP helper retains the adapter's wire identity.
@@ -42,12 +48,22 @@ pub fn http_request(
     transport.request(request, &Control::default())
 }
 
-fn mcp_call(params: &Value, control: &Control) -> Result<Value, String> {
-    jsonrpc::agent_tool_result(&runtime::call(params, control)?)
+fn mcp_call(
+    runtime: &McpRuntime,
+    context: &CoreRequestContext,
+    params: &Value,
+    control: &Control,
+) -> Result<Value, String> {
+    jsonrpc::agent_tool_result(&runtime.call(context, params, control)?)
 }
-fn mcp_list(params: &Value, control: &Control) -> Result<Value, String> {
+fn mcp_list(
+    runtime: &McpRuntime,
+    context: &CoreRequestContext,
+    params: &Value,
+    control: &Control,
+) -> Result<Value, String> {
     Ok(kit::text_result(
-        runtime::list(params, control)?.to_string(),
+        runtime.list(context, params, control)?.to_string(),
     ))
 }
 fn mcp_request(params: &Value, control: &Control) -> Result<Value, String> {
@@ -82,52 +98,44 @@ fn mcp_request(params: &Value, control: &Control) -> Result<Value, String> {
     Ok(kit::text_result(result.to_string()))
 }
 
-static RUNTIME: std::sync::OnceLock<rpi_plugin_sdk::PluginApi> = std::sync::OnceLock::new();
-
-/// Dispatch a host runtime action (used to append the resource-update message).
-fn call_runtime(id: rpi_plugin_sdk::RuntimeActionId, args: Value) -> Result<Value, String> {
-    let runtime = *RUNTIME.get().ok_or("mcp runtime unavailable")?;
-    let mut out = rpi_plugin_sdk::StbString::empty();
-    // Bind the JSON to a local: `StbStringRef` borrows it for the call, so an
-    // inline `&args.to_string()` would drop the buffer immediately and hand the
-    // host a dangling pointer.
-    let input_json = args.to_string();
-    let input = rpi_plugin_sdk::StbStringRef::from_str(&input_json);
-    let rc = (runtime.runtime_action)(id.into(), input, &mut out, runtime.user_data);
-    let text = out.to_string_lossy();
-    (runtime.free_string)(out);
-    if rc != 0 {
-        return Err(if text.is_empty() {
-            "runtime action failed".into()
-        } else {
-            text
-        });
-    }
-    if text.trim().is_empty() {
-        Ok(Value::Null)
-    } else {
-        serde_json::from_str(&text).map_err(|e| format!("invalid runtime response: {e}"))
-    }
-}
-
-fn mcp_resource(params: &Value, control: &Control) -> Result<Value, String> {
+fn mcp_resource(
+    runtime: &McpRuntime,
+    context: &CoreRequestContext,
+    params: &Value,
+    control: &Control,
+) -> Result<Value, String> {
     Ok(kit::text_result(
-        runtime::resources(params, control)?.to_string(),
+        runtime.resources(context, params, control)?.to_string(),
     ))
 }
 
 /// TurnEnd: surface any resource updates read since the last turn. TurnEnd is a
 /// turn boundary, so the appended message never splits an assistant `tool_calls`
 /// from its `toolResult`s (the HTTP 400 that motivated this timing).
-extern "C" fn turn_end(_: rpi_plugin_sdk::StablePluginEvent, _: *mut std::ffi::c_void) -> i32 {
+extern "C" fn turn_end(_: rpi_plugin_sdk::StablePluginEvent, cookie: *mut c_void) -> i32 {
     match std::panic::catch_unwind(|| {
-        runtime::flush_resource_updates(|message| {
-            call_runtime(
-                rpi_plugin_sdk::RuntimeActionId::AppendEntry,
-                json!({"message": message}),
-            )
-            .map(|_| ())
-        })
+        let Some(registration) = registration::for_event(cookie) else {
+            return Ok(());
+        };
+        if registration.workers.is_stopping() {
+            return Ok(());
+        }
+        let Some(active_scope) = registration.active_scope() else {
+            return Ok(());
+        };
+        runtime::flush_resource_updates_with(
+            &registration.runtime,
+            &active_scope,
+            |message| {
+                registration
+                    .call_host(
+                        rpi_plugin_sdk::RuntimeActionId::AppendEntry.into(),
+                        json!({"message": message}),
+                    )
+                    .map(|_| ())
+            },
+            || registration.active_scope().as_deref() == Some(active_scope.as_str()),
+        )
     }) {
         Ok(Ok(())) => 0,
         _ => 1,
@@ -135,20 +143,44 @@ extern "C" fn turn_end(_: rpi_plugin_sdk::StablePluginEvent, _: *mut std::ffi::c
 }
 
 macro_rules! tool_entry {
-    ($execute:ident, $builder:ident) => {
-        extern "C" fn $execute(
+    ($execute:ident, $builder:expr) => {
+        extern "C" fn $execute<const SLOT: usize>(
             _: rpi_plugin_sdk::StbStringRef,
             params: rpi_plugin_sdk::StbString,
             free: Option<rpi_plugin_sdk::FreeStringFn>,
         ) -> rpi_plugin_sdk::StepHandle {
-            kit::execute(params, free, $builder)
+            let Some(registration) = registration::for_tool(SLOT) else {
+                params.free_with(free);
+                return std::ptr::null_mut();
+            };
+            let worker_registration = registration.clone();
+            kit::execute(
+                params,
+                free,
+                &registration.workers,
+                move |params, control| ($builder)(&worker_registration, params, control),
+            )
         }
     };
 }
-tool_entry!(call_execute, mcp_call);
-tool_entry!(list_execute, mcp_list);
-tool_entry!(request_execute, mcp_request);
-tool_entry!(resource_execute, mcp_resource);
+macro_rules! managed_tool_entry {
+    ($execute:ident, $builder:ident) => {
+        tool_entry!($execute, |registration: &Registration, params, control| {
+            $builder(
+                &registration.runtime,
+                &registration.context(params),
+                params,
+                control,
+            )
+        });
+    };
+}
+managed_tool_entry!(call_execute, mcp_call);
+managed_tool_entry!(list_execute, mcp_list);
+tool_entry!(request_execute, |_, params, control| mcp_request(
+    params, control
+));
+managed_tool_entry!(resource_execute, mcp_resource);
 extern "C" fn tool_poll(
     handle: rpi_plugin_sdk::StepHandle,
     callback: Option<rpi_plugin_sdk::ToolPartialCb>,
@@ -162,13 +194,14 @@ extern "C" fn tool_cancel(handle: rpi_plugin_sdk::StepHandle) {
 extern "C" fn tool_destroy(handle: rpi_plugin_sdk::StepHandle) {
     kit::destroy(handle)
 }
-extern "C" fn session_shutdown(
-    _: rpi_plugin_sdk::StablePluginEvent,
-    _: *mut std::ffi::c_void,
-) -> i32 {
-    std::panic::catch_unwind(shutdown_connections)
-        .map(|_| 0)
-        .unwrap_or(1)
+extern "C" fn session_shutdown(_: rpi_plugin_sdk::StablePluginEvent, cookie: *mut c_void) -> i32 {
+    std::panic::catch_unwind(|| {
+        if let Some(registration) = registration::for_event(cookie) {
+            registration.shutdown();
+            registration.release_legacy_slot();
+        }
+    })
+    .map_or(1, |()| 0)
 }
 // Metadata shared by registration and Rust schema tests.
 fn tool_schemas() -> [(&'static str, &'static str, &'static str); 4] {
@@ -184,22 +217,78 @@ fn tool_schemas() -> [(&'static str, &'static str, &'static str); 4] {
     ]
 }
 
-// The SDK entrypoint validates the API and contains registration panics.
-rpi_plugin_sdk::export_plugin!(|api| {
-    let Some(register) = api.register_tool else {
+const fn executors<const SLOT: usize>() -> [ToolExecuteFn; 4] {
+    [
+        request_execute::<SLOT>,
+        call_execute::<SLOT>,
+        list_execute::<SLOT>,
+        resource_execute::<SLOT>,
+    ]
+}
+
+// ABI v4 execute has no registration cookie. The loader keeps callbacks alive
+// until finish; only then can a shared registration's execute slot be reused.
+#[rustfmt::skip]
+static EXECUTORS: [[ToolExecuteFn; 4]; registration::SLOT_COUNT] = [
+        executors::<0>(), executors::<1>(), executors::<2>(), executors::<3>(),
+        executors::<4>(), executors::<5>(), executors::<6>(), executors::<7>(),
+        executors::<8>(), executors::<9>(), executors::<10>(), executors::<11>(),
+        executors::<12>(), executors::<13>(), executors::<14>(), executors::<15>(),
+        executors::<16>(), executors::<17>(), executors::<18>(), executors::<19>(),
+        executors::<20>(), executors::<21>(), executors::<22>(), executors::<23>(),
+        executors::<24>(), executors::<25>(), executors::<26>(), executors::<27>(),
+        executors::<28>(), executors::<29>(), executors::<30>(), executors::<31>(),
+        executors::<32>(), executors::<33>(), executors::<34>(), executors::<35>(),
+        executors::<36>(), executors::<37>(), executors::<38>(), executors::<39>(),
+        executors::<40>(), executors::<41>(), executors::<42>(), executors::<43>(),
+        executors::<44>(), executors::<45>(), executors::<46>(), executors::<47>(),
+        executors::<48>(), executors::<49>(), executors::<50>(), executors::<51>(),
+        executors::<52>(), executors::<53>(), executors::<54>(), executors::<55>(),
+        executors::<56>(), executors::<57>(), executors::<58>(), executors::<59>(),
+        executors::<60>(), executors::<61>(), executors::<62>(), executors::<63>(),
+        executors::<64>(), executors::<65>(), executors::<66>(), executors::<67>(),
+        executors::<68>(), executors::<69>(), executors::<70>(), executors::<71>(),
+        executors::<72>(), executors::<73>(), executors::<74>(), executors::<75>(),
+        executors::<76>(), executors::<77>(), executors::<78>(), executors::<79>(),
+        executors::<80>(), executors::<81>(), executors::<82>(), executors::<83>(),
+        executors::<84>(), executors::<85>(), executors::<86>(), executors::<87>(),
+        executors::<88>(), executors::<89>(), executors::<90>(), executors::<91>(),
+        executors::<92>(), executors::<93>(), executors::<94>(), executors::<95>(),
+        executors::<96>(), executors::<97>(), executors::<98>(), executors::<99>(),
+        executors::<100>(), executors::<101>(), executors::<102>(), executors::<103>(),
+        executors::<104>(), executors::<105>(), executors::<106>(), executors::<107>(),
+        executors::<108>(), executors::<109>(), executors::<110>(), executors::<111>(),
+        executors::<112>(), executors::<113>(), executors::<114>(), executors::<115>(),
+        executors::<116>(), executors::<117>(), executors::<118>(), executors::<119>(),
+        executors::<120>(), executors::<121>(), executors::<122>(), executors::<123>(),
+        executors::<124>(), executors::<125>(), executors::<126>(), executors::<127>(),
+];
+
+fn register(api: &PluginApi, lifecycle: Option<lifecycle::Register>) -> i32 {
+    if api.register_tool.is_none() {
         return 1;
+    }
+    let (slot, registration) = match registration::install(*api, lifecycle) {
+        Ok(installed) => installed,
+        Err(rc) => return rc,
     };
-    // A reload must not leave old workers or sessions owned by this DLL.
-    shutdown_connections();
-    let executors: [rpi_plugin_sdk::ToolExecuteFn; 4] = [
-        request_execute,
-        call_execute,
-        list_execute,
-        resource_execute,
-    ];
-    for ((name, description, parameters), execute) in tool_schemas().into_iter().zip(executors) {
+    let rc = register_callbacks(api, slot, registration.cookie());
+    if rc != 0 {
+        registration.shutdown();
+        registration.release_legacy_slot();
+    }
+    rc
+}
+
+fn register_callbacks(api: &PluginApi, slot: usize, cookie: *mut c_void) -> i32 {
+    let register_tool = api
+        .register_tool
+        .expect("tool registrar checked before slot installation");
+    for ((name, description, parameters), execute) in
+        tool_schemas().into_iter().zip(EXECUTORS[slot])
+    {
         let schema = kit::schema(name, description, parameters);
-        let rc = register(
+        let rc = register_tool(
             &schema,
             execute,
             tool_poll,
@@ -208,36 +297,23 @@ rpi_plugin_sdk::export_plugin!(|api| {
             kit::plugin_free_string,
         );
         // The registrar consumes schema strings via plugin_free_string.
-        // Only the stack schema container remains ours after this call.
         if rc != 0 {
             return rc;
         }
     }
-    // Remember the host API so the TurnEnd handler can append resource updates.
-    let _ = RUNTIME.set(*api);
-    if let Some(register) = api.register_event_handler {
-        // SessionShutdown is a marker without session identity: release all
-        // connections in this extension instance.
-        if register(
+    if let Some(register_event) = api.register_event_handler {
+        let rc = register_event(
             rpi_plugin_sdk::EventTag::SessionShutdown,
             session_shutdown,
-            std::ptr::null_mut(),
-        ) != 0
-        {
-            return 1;
+            cookie,
+        );
+        if rc != 0 {
+            return rc;
         }
-        // TurnEnd: show resource updates read since the last turn (a safe boundary).
-        if register(
-            rpi_plugin_sdk::EventTag::TurnEnd,
-            turn_end,
-            std::ptr::null_mut(),
-        ) != 0
-        {
-            return 1;
-        }
+        return register_event(rpi_plugin_sdk::EventTag::TurnEnd, turn_end, cookie);
     }
     0
-});
+}
 
 #[cfg(test)]
 mod tests {
@@ -345,19 +421,23 @@ mod tests {
 
     #[test]
     fn dispatcher_validates_parameters() {
-        assert!(mcp_call(
+        let runtime = runtime::new_runtime();
+        let call = |params: &Value, control: &Control| {
+            mcp_call(&runtime, &runtime::context(params), params, control)
+        };
+        assert!(call(
             &json!({"url":"https://example.com/mcp"}),
             &Control::default()
         )
         .unwrap_err()
         .contains("tool"));
-        assert!(mcp_call(
+        assert!(call(
             &json!({"url":"http://localhost/mcp","tool":"x","arguments":[]}),
             &Control::default()
         )
         .unwrap_err()
         .contains("object"));
-        assert!(mcp_call(
+        assert!(call(
             &json!({"url":"http://localhost/mcp","tool":"x","timeoutSeconds":0}),
             &Control::default()
         )

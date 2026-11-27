@@ -6,7 +6,6 @@ use super::{
     metadata::SessionStore,
     project::ProjectPort,
     request::{self, PreparedRequest},
-    shared,
 };
 use serde_json::{json, Value};
 use std::{
@@ -98,10 +97,11 @@ impl driver::Body for LiveBody {
 }
 
 /// The per-request source: resolves credentials, prepares the body and performs one send.
-pub struct Live {
+pub(super) struct Live {
     pub net: Arc<Net>,
     pub root: String,
     pub idle: Option<Duration>,
+    pub(super) state: Arc<super::State>,
 }
 impl driver::Source for Live {
     type Body = LiveBody;
@@ -112,7 +112,7 @@ impl driver::Source for Live {
         uuid_v4()
     }
     fn sessions(&self) -> &Mutex<SessionStore> {
-        &shared().sessions
+        &self.state.sessions
     }
     async fn open(
         &self,
@@ -141,7 +141,8 @@ impl driver::Source for Live {
             // stream uses it without project discovery, even after a restart.
             Some(project) => project.to_owned(),
             None => {
-                let packed = shared()
+                let packed = self
+                    .state
                     .credentials
                     .lock()
                     .unwrap()
@@ -156,7 +157,7 @@ impl driver::Source for Live {
                     secrets.project(&project);
                 }
                 let resolved = deadline
-                    .wait(shared().projects.ensure(
+                    .wait(self.state.projects.ensure(
                         self.net.clone(),
                         json!({"type":"oauth","refresh":packed,"access":token,"expires":now_ms() + 60_000}),
                     ))
@@ -169,7 +170,7 @@ impl driver::Source for Live {
         };
         secrets.project(&project);
         let prepared: PreparedRequest = {
-            let mut sessions = shared().sessions.lock().unwrap();
+            let mut sessions = self.state.sessions.lock().unwrap();
             request::prepare(
                 model,
                 context,

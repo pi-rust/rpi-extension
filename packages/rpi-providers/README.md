@@ -273,3 +273,15 @@ cargo test -p rpi-providers --test streaming live_deepseek_extension_stream -- -
 Rust 调用方从原核心入口迁到 `rpi_providers::deepseek::DeepSeekProvider::new(api_key)`；
 该构造函数不读取环境变量。接入标准见
 [Provider 接入规范](https://github.com/bigfish1913/pi-rust/blob/feature-stream-porider/docs/extensions/provider-integration.md)。
+
+### Shared library images
+
+The bundle exports `rpi_plugin_shared_sessions_v1` for the shared-image Host,
+which provides the plugin lifecycle callback. The SDK owns streaming runtimes
+and HTTP pools per provider registration. Antigravity and Codex also bind their
+pending PKCE attempts and upstream conversation metadata to that registration.
+Antigravity keeps its access-token bridge and project discovery with the same
+owner. OAuth workers join before their callbacks return. Shutdown stops new
+work, cancels streaming and joins runtime tasks before the registration state
+is removed. Older hosts without lifecycle hooks use the standard entrypoint,
+per-request runtimes and the legacy per-image vendor state.

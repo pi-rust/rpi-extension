@@ -137,9 +137,15 @@ Budget schemas advertise the intended ranges. Runtime clamps unsigned integers
 (`maxTurns` 1–32, `timeoutSeconds` 10–1800, `maxParallel` 1–16); missing or
 non-unsigned values use defaults. No parsing behavior is changed by this guidance.
 `expectFile` and `verify` are trimmed optional strings; paths and verification
-commands resolve in the shared process cwd. Verification has a separate timeout
+commands resolve in the calling session’s workspace. Verification has a separate timeout
 of the node's configured length, runs through the platform shell, and is not a
 sandbox. Prefer focused checks that test the requested deliverable.
+
+## Shared Unix Host
+
+Each registration owns its plan graph and subprocess workers. Unix builds opt in
+to shared images and join their cancellable pipe workers during shutdown. Windows
+builds use private images.
 
 ## How it stays bounded
 

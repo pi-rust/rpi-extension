@@ -1,4 +1,4 @@
-#![forbid(unsafe_code)]
+#![deny(unsafe_code)]
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
 mod kit;
@@ -9,7 +9,7 @@ use rpi_plugin_sdk::{StbString, StbStringRef, StepHandle, StepResult, ToolPartia
 use serde_json::{json, Value};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, OnceLock};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -27,7 +27,15 @@ struct RuntimeFns {
     action: extern "C" fn(u32, StbStringRef, *mut StbString, *mut std::ffi::c_void) -> i32,
     free: extern "C" fn(StbString),
 }
-static HOST: Mutex<Option<RuntimeFns>> = Mutex::new(None);
+// The native host uses a process-lifetime trampoline and allocator for all
+// registrations of this image. A different table must never replace them.
+static HOST: OnceLock<RuntimeFns> = OnceLock::new();
+
+fn install_host(host: RuntimeFns) -> bool {
+    let installed = HOST.get_or_init(|| host);
+    installed.action as usize == host.action as usize
+        && installed.free as usize == host.free as usize
+}
 
 enum JobMessage {
     Partial(String),
@@ -181,7 +189,7 @@ fn host_action(
     Ok(value)
 }
 
-/// Fail closed if another registration of this DLL replaced its host context.
+/// Check the invocation bridge against the host-injected tool context.
 fn validate_context(expected: &Value, actual: &Value) -> Result<(), String> {
     if let Some(id) = expected.get("sessionId").and_then(Value::as_str) {
         if actual.get("sessionId").and_then(Value::as_str) == Some(id) {
@@ -365,8 +373,8 @@ rpi_plugin_sdk::execute_handler!(fn execute(tool_call_id, params, free_params) {
         let id = tool_call_id.to_owned();
         let value = serde_json::from_str::<Value>(&text).unwrap_or(Value::Null);
         let expected_context = value.get("__rpi").cloned().unwrap_or(Value::Null);
-        // Capture one registration for the entire worker, including disposal.
-        let host = *HOST.lock().unwrap_or_else(|error| error.into_inner());
+        // The worker uses its invocation handle through disposal.
+        let host = HOST.get().copied();
         let (sender, receiver) = mpsc::channel();
         let cancelled = Arc::new(AtomicBool::new(false));
         let worker = match parse_request(&value) {
@@ -525,22 +533,31 @@ fn delegate_schema_with_budget_policy(policy: BudgetPolicy) -> rpi_plugin_sdk::S
     registered
 }
 
-rpi_plugin_sdk::export_plugin!(|api| {
+fn register_plugin(api: &rpi_plugin_sdk::PluginApi) -> i32 {
     if std::env::var("RPI_SUBAGENT_CHILD").ok().as_deref() == Some("1") {
         return 0;
     }
     let Some(register) = api.register_tool else {
         return 1;
     };
-    *HOST.lock().unwrap_or_else(|error| error.into_inner()) = Some(RuntimeFns {
+    if !install_host(RuntimeFns {
         action: api.runtime_action,
         free: api.free_string,
-    });
+    }) {
+        return 1;
+    }
     let schema = Box::new(delegate_schema());
     let result = register(&*schema, execute, poll, cancel, destroy, plugin_free_string);
     drop(schema);
     result
-});
+}
+
+// Opt in to sharing the library image across native Host registrations.
+#[allow(unsafe_code)] // The marker only exports a symbol.
+#[no_mangle]
+pub extern "C" fn rpi_plugin_shared_sessions_v1() {}
+
+rpi_plugin_sdk::export_plugin!(register_plugin);
 
 #[cfg(test)]
 mod tests;

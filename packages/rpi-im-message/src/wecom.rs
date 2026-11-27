@@ -1143,9 +1143,7 @@ fn handle_incoming(
         incoming.message_type,
         incoming.text.as_deref().map(str::len).unwrap_or(0)
     );
-    let session_store_path = std::env::current_dir()
-        .map(|cwd| cwd.join(".rpi").join("im-sessions.json"))
-        .map_err(|error| error.to_string());
+    let session_store_path = state.workspace.join(".rpi/im-sessions.json");
     // Local slash commands are handled before enqueueing, matching Feishu.
     let command = if profile.auto_reply {
         incoming.text.as_deref().and_then(|text| {
@@ -1153,24 +1151,13 @@ fn handle_incoming(
             if command_text.is_empty() {
                 return None;
             }
-            match &session_store_path {
-                Ok(path) => sessions::command(
-                    path,
-                    &profile.provider,
-                    &profile.name,
-                    &incoming.chat_id,
-                    &command_text,
-                ),
-                Err(error)
-                    if matches!(
-                        command_text.split_whitespace().next(),
-                        Some("/new" | "/sessions" | "/session")
-                    ) =>
-                {
-                    Some(Err(error.clone()))
-                }
-                Err(_) => None,
-            }
+            sessions::command(
+                &session_store_path,
+                &profile.provider,
+                &profile.name,
+                &incoming.chat_id,
+                &command_text,
+            )
         })
     } else {
         None
@@ -1211,9 +1198,12 @@ fn handle_incoming(
         // A bare group mention has no user question to answer.
         return;
     }
-    let selected_session = match session_store_path.and_then(|path| {
-        sessions::selected(&path, &profile.provider, &profile.name, &incoming.chat_id)
-    }) {
+    let selected_session = match sessions::selected(
+        &session_store_path,
+        &profile.provider,
+        &profile.name,
+        &incoming.chat_id,
+    ) {
         Ok(selected) => selected,
         Err(error) => {
             let _ = commands.send(Command::SendAsync {
@@ -1687,6 +1677,8 @@ mod tests {
             let profile = profile.clone();
             move || {
                 super::super::start_server_with_profile(
+                    &Arc::new(super::super::Registration::new(None)),
+                    std::env::current_dir().unwrap(),
                     "test-config.json".into(),
                     profile,
                     Duration::from_millis(100),
@@ -1739,6 +1731,8 @@ mod tests {
             let profile = profile.clone();
             move || {
                 super::super::start_server_with_profile(
+                    &Arc::new(super::super::Registration::new(None)),
+                    std::env::current_dir().unwrap(),
                     "test-config.json".into(),
                     profile,
                     Duration::from_secs(5),

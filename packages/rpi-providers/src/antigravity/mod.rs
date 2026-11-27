@@ -34,7 +34,7 @@ use serde_json::{json, Value};
 use std::{
     ffi::c_void,
     future::Future,
-    sync::{Arc, Mutex, OnceLock},
+    sync::{Arc, Mutex},
     time::Instant,
 };
 use transport::{Live, Net};
@@ -43,23 +43,13 @@ pub const PROVIDER_ID: &str = "antigravity";
 /// The endpoint Pi's stream sends to (`ANTIGRAVITY_ENDPOINT`) when the model has no override.
 const ENDPOINT: &str = "https://daily-cloudcode-pa.googleapis.com";
 
-/// Process state shared by every request. It holds access-token bridges and sessions,
-/// never request headers or API keys.
-struct Shared {
+/// OAuth and stream metadata owned by one plugin registration.
+#[derive(Default)]
+struct State {
     sessions: Mutex<SessionStore>,
     credentials: Mutex<auth::CredentialCache>,
     projects: Arc<ProjectStore>,
-    /// Issued login attempts, keyed by the state their login URL carries.
     logins: Mutex<auth::PendingLogins>,
-}
-fn shared() -> &'static Shared {
-    static SHARED: OnceLock<Shared> = OnceLock::new();
-    SHARED.get_or_init(|| Shared {
-        sessions: Mutex::new(SessionStore::new(String::new())),
-        credentials: Mutex::new(auth::CredentialCache::default()),
-        projects: Arc::new(ProjectStore::default()),
-        logins: Mutex::new(auth::PendingLogins::default()),
-    })
 }
 
 /// The six catalog models, in Pi's order.
@@ -87,10 +77,11 @@ fn endpoints(root: &str) -> Endpoints {
     }
 }
 
-/// Holds the pooled client only. Credentials arrive per request.
+/// Holds a pooled client and this registration’s vendor state.
 pub struct AntigravityProvider {
     client: reqwest::Client,
     models: Vec<Model>,
+    state: Arc<State>,
 }
 
 #[async_trait::async_trait]
@@ -116,6 +107,7 @@ impl Provider for AntigravityProvider {
                 user_agent: transport::default_user_agent(),
             }),
             root,
+            state: self.state.clone(),
             idle: options.stream_idle_timeout(),
         };
         // Pi omits the reasoning option for "off"; only real levels reach the catalog.
@@ -151,31 +143,33 @@ impl Provider for AntigravityProvider {
 fn create(
     context: &ProviderContext,
     model: &Model,
-    _options: &SimpleStreamOptions,
+    state: Arc<State>,
 ) -> Result<Arc<dyn Provider>, String> {
     Ok(Arc::new(AntigravityProvider {
         client: context.client(&root(model))?,
         models: models(),
+        state,
     }))
 }
 
 /// The streaming registration. The macro emits a `register` function, so it gets a module.
 mod streaming {
-    crate::registration::register_provider!(
+    crate::registration::register_scoped_provider!(
         super::PROVIDER_ID,
         super::catalog::BASE_URL,
         super::catalog::API,
         serde_json::json!({"id": super::PROVIDER_ID, "models": super::models(), "requiresAuth": true}),
+        super::State,
         super::create
     );
 }
 
 /// Declares the streaming provider and its OAuth flow. Streaming never depends on OAuth.
 pub(crate) fn register(api: &PluginApi) -> i32 {
-    let result = streaming::register(api);
-    if result != 0 {
-        return result;
-    }
+    let data = match streaming::register(api) {
+        Ok(data) => data,
+        Err(rc) => return rc,
+    };
     // A host without the OAuth slot keeps the provider; login then needs another credential.
     let Some(register_oauth) = api.register_oauth_provider else {
         return 0;
@@ -190,7 +184,7 @@ pub(crate) fn register(api: &PluginApi) -> i32 {
         StbStringRef::from_str(&manifest),
         oauth_request,
         free_string,
-        std::ptr::null_mut::<c_void>(),
+        data,
     )
 }
 
@@ -198,7 +192,7 @@ pub(crate) fn register(api: &PluginApi) -> i32 {
 extern "C" fn oauth_request(
     request: StbStringRef,
     out: *mut StbString,
-    _user_data: *mut c_void,
+    user_data: *mut c_void,
 ) -> i32 {
     if out.is_null() {
         return 2;
@@ -206,7 +200,7 @@ extern "C" fn oauth_request(
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         // SAFETY: the host keeps the request buffer valid until this callback returns.
         let text = unsafe { request.as_str() }.to_owned();
-        oauth_action(&text)
+        oauth_action(streaming::REGISTRATIONS.state(user_data)?, &text)
     }));
     let (status, body) = match result {
         Ok(Ok(value)) => (0, value),
@@ -222,22 +216,22 @@ fn error_envelope(message: &str) -> Value {
     json!({"version": 1, "kind": "error", "payload": {"message": message}})
 }
 
-fn oauth_action(text: &str) -> Result<Value, String> {
+fn oauth_action(state: Arc<State>, text: &str) -> Result<Value, String> {
     let request: Value =
         serde_json::from_str(text).map_err(|_| "invalid OAuth request".to_owned())?;
     let input = &request["input"];
     match request["action"].as_str() {
-        Some("begin") => begin(),
-        Some("exchange") => exchange(input["value"].as_str().unwrap_or_default()),
-        Some("refresh") => refresh(&input["credential"]),
-        Some("revoke") => revoke(&input["credential"]),
+        Some("begin") => begin(&state),
+        Some("exchange") => exchange(state, input["value"].as_str().unwrap_or_default()),
+        Some("refresh") => refresh(state, &input["credential"]),
+        Some("revoke") => revoke(state, &input["credential"]),
         _ => Err("OAuth action must be one of begin, exchange, refresh, revoke".into()),
     }
 }
 
-fn begin() -> Result<Value, String> {
+fn begin(owner: &State) -> Result<Value, String> {
     let auth::Authorization { url, state, login } = auth::authorize(ClientSource::environment())?;
-    shared()
+    owner
         .logins
         .lock()
         .unwrap()
@@ -253,14 +247,14 @@ fn begin() -> Result<Value, String> {
     }))
 }
 
-fn exchange(pasted: &str) -> Result<Value, String> {
+fn exchange(state: Arc<State>, pasted: &str) -> Result<Value, String> {
     let pasted = pasted.to_owned();
     // Redemption runs inside the worker, before any request; a rejected input sends nothing.
     block_on_oauth(move |net| async move {
         exchange_credential(
             &net,
             ClientSource::environment(),
-            &shared().logins,
+            &state,
             &pasted,
             Instant::now(),
         )
@@ -273,11 +267,11 @@ fn exchange(pasted: &str) -> Result<Value, String> {
 async fn exchange_credential(
     net: &Net,
     source: ClientSource,
-    logins: &Mutex<auth::PendingLogins>,
+    state: &State,
     pasted: &str,
     now: Instant,
 ) -> Result<Value, String> {
-    let result = auth::complete(net, source, &net.endpoints, logins, pasted, now).await?;
+    let result = auth::complete(net, source, &net.endpoints, &state.logins, pasted, now).await?;
     if result["type"] != "success" {
         return Err("Antigravity OAuth exchange failed".into());
     }
@@ -287,7 +281,7 @@ async fn exchange_credential(
         return Err("Antigravity OAuth exchange returned no access token".into());
     }
     let project = result["projectId"].as_str().unwrap_or_default();
-    shared()
+    state
         .credentials
         .lock()
         .unwrap()
@@ -299,7 +293,7 @@ async fn exchange_credential(
     ))
 }
 
-fn refresh(credential: &Value) -> Result<Value, String> {
+fn refresh(state: Arc<State>, credential: &Value) -> Result<Value, String> {
     let packed = credential["refresh"]
         .as_str()
         .unwrap_or_default()
@@ -310,7 +304,14 @@ fn refresh(credential: &Value) -> Result<Value, String> {
     }
     let old_token = auth::parse_access(&old_access).0.to_owned();
     block_on_oauth(move |net| async move {
-        refresh_credential(&net, ClientSource::environment(), &old_token, &packed).await
+        refresh_credential(
+            &net,
+            &state,
+            ClientSource::environment(),
+            &old_token,
+            &packed,
+        )
+        .await
     })
 }
 
@@ -318,6 +319,7 @@ fn refresh(credential: &Value) -> Result<Value, String> {
 /// access is stored with the same binding, and a credential stored before the binding gains it.
 async fn refresh_credential(
     net: &Net,
+    state: &State,
     source: ClientSource,
     old_token: &str,
     packed: &str,
@@ -329,7 +331,7 @@ async fn refresh_credential(
         return Err("Antigravity token refresh returned no access token".into());
     }
     {
-        let mut credentials = shared().credentials.lock().unwrap();
+        let mut credentials = state.credentials.lock().unwrap();
         credentials.forget(old_token);
         credentials.remember(&access, &refresh);
     }
@@ -341,22 +343,29 @@ async fn refresh_credential(
     ))
 }
 
-fn revoke(credential: &Value) -> Result<Value, String> {
+fn revoke(state: Arc<State>, credential: &Value) -> Result<Value, String> {
     let packed = credential["refresh"]
         .as_str()
         .unwrap_or_default()
         .to_owned();
     let access = credential["access"].as_str().unwrap_or_default().to_owned();
-    block_on_oauth(move |net| async move { revoke_credential(&net, &packed, &access).await })?;
+    block_on_oauth(
+        move |net| async move { revoke_credential(&net, &state, &packed, &access).await },
+    )?;
     Ok(json!({"version": 1, "kind": "success", "payload": {}}))
 }
 
 /// Revokes the refresh token, or the plain access token when none is stored. A stored access
 /// may carry a project binding, which is never sent.
-async fn revoke_credential(net: &Net, packed: &str, access: &str) -> Result<(), String> {
+async fn revoke_credential(
+    net: &Net,
+    state: &State,
+    packed: &str,
+    access: &str,
+) -> Result<(), String> {
     let token = auth::parse_access(access).0;
     auth::revoke(net, &net.endpoints, packed, token).await?;
-    shared().credentials.lock().unwrap().forget(token);
+    state.credentials.lock().unwrap().forget(token);
     Ok(())
 }
 

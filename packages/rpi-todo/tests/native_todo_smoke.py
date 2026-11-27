@@ -167,7 +167,8 @@ def smoke(rpi, extension):
                 assert rpc.snapshots() == before, "no-op update appended"
             finally:
                 rpc.close()
-            files = list((root / "sessions").rglob("*.jsonl"))
+            files = [path for path in (root / "sessions").rglob("*.jsonl")
+                     if not path.name.endswith(".progress.jsonl")]
             assert len(files) == 1, files
             resume = command + ["--session", str(files[0])]
             rpc = Rpc(resume, env, root)
