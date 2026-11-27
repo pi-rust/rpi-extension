@@ -1044,6 +1044,12 @@ impl EventHandler for MessageHandler {
             let Some(value) = event.event else {
                 return Ok(None);
             };
+            // Feishu marks conversations as "p2p" (direct chat) or "group";
+            // the typed SDK model does not carry chat_type, so read it from
+            // the raw event before the value is consumed by deserialization.
+            let chat_type = value["message"]["chat_type"]
+                .as_str()
+                .map(str::to_owned);
             let message: MessageEvent = match serde_json::from_value(value) {
                 Ok(message) => message,
                 Err(error) => {
@@ -1072,7 +1078,12 @@ impl EventHandler for MessageHandler {
             {
                 return Ok(None);
             }
+            // mention_required applies to group conversations only; direct
+            // (p2p) chats never contain mentions, so exempting them keeps the
+            // bot reachable without a manual @ in one-on-one conversations.
+            let is_p2p_chat = chat_type.as_deref() == Some("p2p");
             if state.profile.mention_required
+                && !is_p2p_chat
                 && message
                     .message
                     .mentions
@@ -2345,6 +2356,63 @@ mod tests {
         assert_eq!(state.status_value("test")["queueLength"], 0);
         handler.handle(feishu_event("om_1", "oc_a")).await.unwrap();
         assert_eq!(state.receive(Duration::ZERO).unwrap()["messageId"], "om_1");
+    }
+
+    #[tokio::test]
+    async fn feishu_mention_required_applies_to_group_chats_only() {
+        let profile = Profile::from_value(
+            "test",
+            &json!({
+                "appId":"test-app", "appSecret":"test-secret", "allowChats":["oc_a"],
+                "mentionRequired":true, "ackReaction":false
+            }),
+        )
+        .unwrap();
+        let state = Arc::new(RuntimeState::new(profile));
+        state.set_status("running", None);
+        let (commands, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+        let handler = MessageHandler {
+            state: state.clone(),
+            commands,
+        };
+        let typed_event = |id: &str, chat_type: Value, mentions: Value| Event {
+            event: Some(json!({
+                "sender":{"sender_type":"user","sender_id":{"open_id":"ou_a"}},
+                "message":{"message_id":id,"chat_id":"oc_a","chat_type":chat_type,
+                    "message_type":"text",
+                    "content":json!({"text":"hello"}).to_string(),
+                    "mentions":mentions}
+            })),
+            ..Default::default()
+        };
+        // A group message without a mention is dropped.
+        handler
+            .handle(typed_event("om_g1", json!("group"), json!([])))
+            .await
+            .unwrap();
+        assert!(receiver.try_recv().is_err());
+        // A group message with a mention is queued.
+        handler
+            .handle(typed_event(
+                "om_g2",
+                json!("group"),
+                json!([{"key":"@_user_1"}]),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(state.receive(Duration::ZERO).unwrap()["messageId"], "om_g2");
+        // A p2p message never carries mentions and is exempt from the check.
+        handler
+            .handle(typed_event("om_p1", json!("p2p"), json!([])))
+            .await
+            .unwrap();
+        assert_eq!(state.receive(Duration::ZERO).unwrap()["messageId"], "om_p1");
+        // Missing chat_type keeps the legacy strict behavior.
+        handler
+            .handle(typed_event("om_g3", Value::Null, json!([])))
+            .await
+            .unwrap();
+        assert!(receiver.try_recv().is_err());
     }
 
     #[test]
