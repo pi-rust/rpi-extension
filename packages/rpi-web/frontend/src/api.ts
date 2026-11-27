@@ -10,8 +10,14 @@ export interface UpdateInfo {
   currentVersion?: string;
   lastCheckedAt?: number;
   checkedAt?: number;
-  host: UpdateEntry;
-  extensions: UpdateEntry[];
+  /**
+   * Present only when the backend answered with a full inventory. The
+   * `unavailable_response` fallback drops `host`, and an older CLI that does
+   * not implement `rpi updates` answers with the model's prose, so neither
+   * field may be treated as always present.
+   */
+  host?: UpdateEntry;
+  extensions?: UpdateEntry[];
   proxy?: string | null;
   proxyConfigured?: boolean;
   error?: string;

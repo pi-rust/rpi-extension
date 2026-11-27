@@ -24,12 +24,20 @@ use crate::server::AppConfig;
 
 const CHECK_CACHE_TTL_MS: u64 = 30 * 60 * 1000;
 const MAX_LOG_CHARS: usize = 8_000;
+/// Finished tasks stay queryable for this long so a page that polls slowly
+/// still observes the outcome, then the map stops growing.
+const TASK_RETENTION_MS: u64 = 10 * 60 * 1000;
+const MAX_TASKS: usize = 32;
 
 #[derive(Clone)]
 pub(crate) struct UpdateState {
     config: Arc<AppConfig>,
     cache: Arc<Mutex<Option<Value>>>,
     tasks: Arc<Mutex<HashMap<String, UpdateTask>>>,
+    /// One install at a time: `rpi update` replaces a running binary and the
+    /// extension installer rewrites the installed cdylib, so a second
+    /// concurrent invocation would race the first on the same files.
+    installing: Arc<Mutex<bool>>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -40,12 +48,29 @@ struct UpdateTask {
     message: String,
     log: String,
     restart_required: bool,
+    /// Unix ms when the task reached a terminal state; `None` while running.
+    #[serde(skip)]
+    finished_at: Option<u64>,
 }
 
 #[derive(Debug, Deserialize)]
 struct CheckQuery {
-    #[serde(default)]
+    /// The Web client sends `?force=1`, while an API caller may send `true`.
+    /// serde's `bool` accepts only `true`/`false`, so both spellings are read
+    /// here instead of rejecting the refresh outright.
+    #[serde(default, deserialize_with = "query_flag")]
     force: bool,
+}
+
+fn query_flag<'de, D>(deserializer: D) -> Result<bool, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw = String::deserialize(deserializer)?;
+    Ok(matches!(
+        raw.trim().to_ascii_lowercase().as_str(),
+        "1" | "true" | "yes" | "on"
+    ))
 }
 
 #[derive(Debug, Deserialize)]
@@ -69,6 +94,7 @@ pub(crate) fn routes(config: Arc<AppConfig>) -> Router {
         config,
         cache: Arc::new(Mutex::new(None)),
         tasks: Arc::new(Mutex::new(HashMap::new())),
+        installing: Arc::new(Mutex::new(false)),
     });
     Router::new()
         .route("/api/v1/updates/check", get(check))
@@ -108,6 +134,7 @@ async fn check(
         }
     };
     let mut response = inventory.unwrap_or_else(|| json!({}));
+    normalize_inventory(&mut response);
     if let Some(object) = response.as_object_mut() {
         object.insert("checkedAt".into(), json!(now_ms()));
         if let Some(message) = error.take() {
@@ -119,6 +146,29 @@ async fn check(
     }
     remember_inventory(&state, &response);
     Json(response)
+}
+
+/// Guarantee the shape the Web client reads.
+///
+/// A CLI that implements only part of the inventory, or any other JSON object
+/// on stdout, would otherwise reach the browser without `host` or
+/// `extensions`, and the settings panel reads both.
+fn normalize_inventory(value: &mut Value) {
+    if !value.is_object() {
+        *value = json!({});
+    }
+    let object = value
+        .as_object_mut()
+        .expect("normalize_inventory guarantees an object");
+    if !object.get("host").is_some_and(Value::is_object) {
+        object.insert(
+            "host".into(),
+            json!({ "name": "rpi", "current": "", "updatable": false }),
+        );
+    }
+    if !object.get("extensions").is_some_and(Value::is_array) {
+        object.insert("extensions".into(), json!([]));
+    }
 }
 
 async fn set_proxy(
@@ -163,9 +213,20 @@ async fn install(
             ))
         }
     };
+    {
+        let mut installing = state.installing.lock().expect("update install gate");
+        if *installing {
+            return Err((
+                axum::http::StatusCode::CONFLICT,
+                Json(json!({ "error": "an update is already running" })),
+            ));
+        }
+        *installing = true;
+    }
     let task_id = Uuid::new_v4().to_string();
     {
         let mut tasks = state.tasks.lock().expect("update task store poisoned");
+        evict_tasks(&mut tasks);
         tasks.insert(
             task_id.clone(),
             UpdateTask {
@@ -174,6 +235,7 @@ async fn install(
                 message: "更新正在运行…".into(),
                 log: String::new(),
                 restart_required: false,
+                finished_at: None,
             },
         );
     }
@@ -205,7 +267,10 @@ async fn install(
             task.message = message;
             task.log = log;
             task.restart_required = state_name == "succeeded";
+            task.finished_at = Some(now_ms());
         }
+        // Release the gate before the next install may start.
+        *runtime.installing.lock().expect("update install gate") = false;
     });
     Ok(Json(json!({ "taskId": task_id })))
 }
@@ -221,11 +286,38 @@ async fn status(
         .get(&query.task_id)
         .cloned();
     match task {
-        Some(task) => Ok(Json(serde_json::to_value(task).unwrap_or_else(|_| json!({})))),
+        Some(task) => Ok(Json(
+            serde_json::to_value(task).unwrap_or_else(|_| json!({})),
+        )),
         None => Err((
             axum::http::StatusCode::NOT_FOUND,
             Json(json!({ "error": "unknown update task" })),
         )),
+    }
+}
+
+/// Bound the task map: drop expired finished tasks, then the oldest finished
+/// ones if an unusual burst still exceeds the cap. Running tasks are never
+/// removed, so a caller that already holds an id keeps its status.
+fn evict_tasks(tasks: &mut HashMap<String, UpdateTask>) {
+    let now = now_ms();
+    tasks.retain(|_, task| match task.finished_at {
+        Some(finished) => now.saturating_sub(finished) < TASK_RETENTION_MS,
+        None => true,
+    });
+    if tasks.len() < MAX_TASKS {
+        return;
+    }
+    let mut finished: Vec<(u64, String)> = tasks
+        .iter()
+        .filter_map(|(id, task)| task.finished_at.map(|at| (at, id.clone())))
+        .collect();
+    finished.sort();
+    for (_, id) in finished
+        .into_iter()
+        .take(tasks.len().saturating_sub(MAX_TASKS) + 1)
+    {
+        tasks.remove(&id);
     }
 }
 
@@ -246,12 +338,8 @@ fn remember_inventory(state: &Arc<UpdateState>, value: &Value) {
 }
 
 fn unavailable_response(stale: Option<Value>, error: String) -> Value {
-    let mut response = stale.unwrap_or_else(|| {
-        json!({
-            "host": { "name": "rpi", "updatable": false, "latest": null },
-            "extensions": []
-        })
-    });
+    let mut response = stale.unwrap_or_else(|| json!({}));
+    normalize_inventory(&mut response);
     if let Some(object) = response.as_object_mut() {
         object.insert("error".into(), json!(error));
         let proxy = saved_proxy();
@@ -261,6 +349,13 @@ fn unavailable_response(stale: Option<Value>, error: String) -> Value {
     response
 }
 
+/// Run an inventory command and require a JSON object.
+///
+/// A native CLI without the `updates` subcommand does not fail: the argument
+/// falls through to the prompt path, which answers with prose and exit 0. An
+/// object check is therefore the only honest support test — anything else is
+/// reported as an unsupported binary instead of surfacing model text as an
+/// update inventory.
 async fn run_cli_json(state: &Arc<UpdateState>, args: &[&str]) -> Result<Value, String> {
     let owned_args: Vec<String> = args.iter().map(|value| (*value).to_owned()).collect();
     let output = run_cli_command(state, &owned_args).await?;
@@ -272,8 +367,19 @@ async fn run_cli_json(state: &Arc<UpdateState>, args: &[&str]) -> Result<Value, 
             stderr
         });
     }
-    serde_json::from_slice(&output.stdout)
-        .map_err(|error| format!("invalid `rpi {}` output: {error}", args.join(" ")))
+    let value: Value = serde_json::from_slice(&output.stdout).map_err(|error| {
+        format!(
+            "`rpi {}` did not return JSON; this rpi build has no update inventory ({error})",
+            args.join(" ")
+        )
+    })?;
+    if !value.is_object() {
+        return Err(format!(
+            "`rpi {}` did not return a JSON object; this rpi build has no update inventory",
+            args.join(" ")
+        ));
+    }
+    Ok(value)
 }
 
 async fn run_cli_command(
@@ -283,7 +389,12 @@ async fn run_cli_command(
     let mut command = tokio::process::Command::new(&state.config.rpi_bin);
     command.args(args).current_dir(&state.config.project);
     if let Some(proxy) = saved_proxy() {
-        command.env("HTTP_PROXY", &proxy).env("HTTPS_PROXY", &proxy);
+        // An explicit shell proxy wins, matching the native CLI's own rule.
+        for key in ["HTTP_PROXY", "HTTPS_PROXY"] {
+            if std::env::var_os(key).is_none() {
+                command.env(key, &proxy);
+            }
+        }
     }
     command
         .output()
@@ -366,8 +477,45 @@ fn write_saved_proxy(proxy: Option<&str>) -> Result<(), String> {
     }
     let bytes = serde_json::to_vec_pretty(&value)
         .map_err(|error| format!("cannot serialize settings: {error}"))?;
-    std::fs::write(&path, bytes)
+    write_atomically(&path, &bytes)
         .map_err(|error| format!("cannot write {}: {error}", path.display()))
+}
+
+/// Replace `path` without ever leaving a truncated settings file.
+///
+/// The native CLI reads this file at startup; a plain `fs::write` that is
+/// interrupted, or that races the CLI's own save, would hand it half a JSON
+/// document. Write a sibling temp file, then rename over the target.
+fn write_atomically(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+    let file_name = path
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "settings.json".into());
+    let temp = path.with_file_name(format!(
+        ".{file_name}.{}.tmp",
+        uuid::Uuid::new_v4().simple()
+    ));
+    {
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            // The native file is private; keep the replacement private too.
+            options.mode(0o600);
+        }
+        let mut file = options.open(&temp)?;
+        use std::io::Write as _;
+        file.write_all(bytes)?;
+        file.sync_all()?;
+    }
+    match std::fs::rename(&temp, path) {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            let _ = std::fs::remove_file(&temp);
+            Err(error)
+        }
+    }
 }
 
 fn validate_proxy(value: &str) -> Result<(), String> {
@@ -380,8 +528,16 @@ fn validate_proxy(value: &str) -> Result<(), String> {
     if rest.is_empty() || rest.starts_with('/') {
         return Err("代理地址缺少主机名".into());
     }
-    if rest.contains('/') {
+    if rest.contains('/') || rest.contains('?') || rest.contains('#') {
         return Err("请填写代理监听地址，不要填写订阅链接".into());
+    }
+    // The native CLI exports this value as HTTP_PROXY/HTTPS_PROXY, so control
+    // characters or whitespace would corrupt the child environment.
+    if rest
+        .chars()
+        .any(|c| c.is_whitespace() || c.is_control() || c == '@' || c == '\\')
+    {
+        return Err("代理地址包含非法字符".into());
     }
     Ok(())
 }
@@ -395,7 +551,8 @@ fn now_ms() -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use super::validate_proxy;
+    use super::{normalize_inventory, validate_proxy, write_atomically};
+    use serde_json::json;
 
     #[test]
     fn proxy_validation_accepts_http_and_https_and_rejects_subscription_urls() {
@@ -404,6 +561,68 @@ mod tests {
         assert!(validate_proxy("socks5://127.0.0.1:1080").is_err());
         assert!(validate_proxy("https://example.com/sub.yaml").is_err());
         assert!(validate_proxy("127.0.0.1:7890").is_err());
+        // A subscription link often carries a query string too.
+        assert!(validate_proxy("https://example.com/api?token=1").is_err());
+        // Credential-bearing URLs and control characters must not reach the
+        // child process environment as HTTP_PROXY.
+        assert!(validate_proxy("http://user:pass@proxy:8080").is_err());
+        assert!(validate_proxy("http://proxy:8080\nHTTPS_PROXY=x").is_err());
+    }
+
+    #[test]
+    fn force_is_parsed_from_the_query_string_the_client_sends() {
+        use axum::extract::Query;
+        // The client asks for a forced refresh with `?force=1`, while a bare
+        // `/updates/check` must stay a cached read.
+        let forced: Query<super::CheckQuery> = Query::try_from_uri(&"/?force=1".parse().unwrap())
+            .expect("the client's force flag must parse");
+        assert!(forced.0.force);
+        let cached: Query<super::CheckQuery> = Query::try_from_uri(&"/".parse().unwrap()).unwrap();
+        assert!(!cached.0.force);
+    }
+
+    #[test]
+    fn a_partial_inventory_still_answers_with_the_fields_the_client_reads() {
+        // An older CLI that answers `{}`, or any JSON object without the
+        // inventory fields, must not reach the panel with a missing `host`.
+        for mut value in [
+            json!({}),
+            json!({"host": null}),
+            json!({"extensions": "no"}),
+        ] {
+            normalize_inventory(&mut value);
+            assert!(value["host"].is_object(), "{value}");
+            assert!(value["extensions"].is_array(), "{value}");
+            assert_eq!(value["host"]["updatable"], false, "{value}");
+        }
+        // A well-formed inventory keeps every value the CLI reported.
+        let mut value = json!({
+            "host": {"name": "rpi", "current": "0.31.0", "latest": "0.32.0", "updatable": true},
+            "extensions": [{"name": "rpi-web", "current": "0.1.95", "updatable": true}]
+        });
+        normalize_inventory(&mut value);
+        assert_eq!(value["host"]["latest"], "0.32.0");
+        assert_eq!(value["extensions"][0]["name"], "rpi-web");
+    }
+
+    #[test]
+    fn atomic_settings_write_replaces_the_target_and_leaves_no_temp_file() {
+        let root =
+            std::env::temp_dir().join(format!("rpi-web-updates-{}", uuid::Uuid::new_v4().simple()));
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("settings.json");
+        std::fs::write(&path, b"{\"theme\":\"dark\"}").unwrap();
+        write_atomically(&path, b"{\"theme\":\"light\"}").unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "{\"theme\":\"light\"}"
+        );
+        let names: Vec<String> = std::fs::read_dir(&root)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, vec!["settings.json".to_string()]);
+        std::fs::remove_dir_all(&root).unwrap();
     }
 
     #[test]
