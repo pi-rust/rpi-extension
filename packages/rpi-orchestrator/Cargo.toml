@@ -1,6 +1,6 @@
 [package]
 name = "rpi-orchestrator"
-version.workspace = true
+version = "0.1.18"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
