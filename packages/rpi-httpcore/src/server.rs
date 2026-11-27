@@ -65,7 +65,27 @@ pub async fn serve_until_with_host_area(
     stop: impl std::future::Future<Output = ()> + Send + 'static,
     area: Option<&str>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let mut config = config;
+    serve_with_native(config, frontend, on_listen, stop, area, None).await
+}
+
+pub async fn serve_until_with_local_host_socket(
+    config: crate::config::AppConfig,
+    frontend: Router,
+    on_listen: impl FnOnce(Listening),
+    stop: impl std::future::Future<Output = ()> + Send + 'static,
+    socket: std::path::PathBuf,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    serve_with_native(config, frontend, on_listen, stop, None, Some(socket)).await
+}
+
+async fn serve_with_native(
+    mut config: crate::config::AppConfig,
+    frontend: Router,
+    on_listen: impl FnOnce(Listening),
+    stop: impl std::future::Future<Output = ()> + Send + 'static,
+    area: Option<&str>,
+    socket: Option<std::path::PathBuf>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let requested = SocketAddr::new(config.bind.parse()?, config.port);
     let listener = tokio::net::TcpListener::bind(requested)
         .await
@@ -77,14 +97,18 @@ pub async fn serve_until_with_host_area(
         })?;
     let address = listener.local_addr()?;
     config.port = address.port();
-    let backend = Service::new(BackendConfig {
+    let backend_config = BackendConfig {
         project: config.project.clone(),
         projects: config.projects.clone(),
         projects_root: config.projects_root.clone(),
         rpi_bin: config.rpi_bin.clone(),
         session_dir: config.session_dir.clone(),
         registry: config.registry.clone(),
-    })?;
+    };
+    let backend = match socket {
+        Some(socket) => Service::with_local_host_socket(backend_config, socket).await?,
+        None => Service::new(backend_config)?,
+    };
     if let Some(area) = area {
         backend
             .attach_host_area(area)
