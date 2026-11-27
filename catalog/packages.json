@@ -406,14 +406,14 @@
     "descriptionZh": "在浏览器中管理项目和会话，查看流式对话、工具交互、文件预览与 Git 差异。",
     "descriptionEn": "Manage projects and sessions in a browser with streamed conversations, tool interactions, file previews and Git diffs.",
     "description": "Manage projects and sessions in a browser with streamed conversations, tool interactions, file previews and Git diffs.",
-    "version": "0.1.86",
+    "version": "0.1.94-preview",
     "type": "extension",
     "tool": null,
     "inspiredBy": "Browser project and session workspace",
     "sourceDownloadsPerMonth": null,
     "install": "rpi install rpi-web --github pi-rust/rpi-extension",
     "repository": "https://github.com/pi-rust/rpi-extension",
-    "prebuilt_manifest": "https://github.com/pi-rust/rpi-extension/releases/download/rpi-web-v0.1.86/rpi-extension.json"
+    "prebuilt_manifest": "https://github.com/pi-rust/rpi-extension/releases/download/rpi-web-v0.1.94-preview/rpi-extension.json"
   },
   {
     "name": "rpi-edit-diagnostics",

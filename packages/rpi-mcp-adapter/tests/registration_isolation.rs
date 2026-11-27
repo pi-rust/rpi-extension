@@ -1,3 +1,4 @@
+use rpi_abi_test_support::{tool_registrar, ToolCallbacks, ToolRegistration, ToolSchema};
 use rpi_mcp_adapter::rpi_plugin_register;
 use rpi_plugin_sdk::{callbacks, *};
 use serde_json::{json, Value};
@@ -37,13 +38,23 @@ thread_local! {
     static REGISTERING: RefCell<Callbacks> = RefCell::default();
 }
 
-rpi_plugin_sdk::tool_schema_handler!(tool, |schema, exec, (poll, cancel, destroy), free| {
-    let name = stb_take!(schema.name, Some(free));
-    stb_drop!(schema.description, Some(free));
-    stb_drop!(schema.parameters, Some(free));
-    REGISTERING.with_borrow_mut(|host| host.tools.insert(name, Tool(exec, poll, cancel, destroy)));
-    0
-});
+struct ToolRegistrar;
+
+impl ToolRegistration for ToolRegistrar {
+    fn register_tool(schema: ToolSchema, callbacks: ToolCallbacks) -> i32 {
+        let ToolCallbacks {
+            execute,
+            poll,
+            cancel,
+            destroy,
+        } = callbacks;
+        REGISTERING.with_borrow_mut(|host| {
+            host.tools
+                .insert(schema.name, Tool(execute, poll, cancel, destroy));
+        });
+        0
+    }
+}
 
 extern "C" fn event(tag: EventTag, callback: EventHandlerFn, cookie: *mut c_void) -> i32 {
     REGISTERING.with_borrow_mut(|host| host.events.push((tag, callback, cookie)));
@@ -100,7 +111,7 @@ impl Host {
                 std::mem::offset_of!(PluginApi, register_streaming_provider) as u32
             },
             free_string: callbacks::free_string,
-            register_tool: Some(tool),
+            register_tool: Some(tool_registrar::<ToolRegistrar>()),
             register_command: None,
             register_shortcut: None,
             register_flag: None,

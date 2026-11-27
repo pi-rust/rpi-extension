@@ -40,9 +40,7 @@ pub mod session;
 mod session_list;
 pub mod zed;
 
-use rpi_plugin_sdk::{
-    EventTag, PluginApi, RuntimeActionId, StablePluginEvent, StbString, StbStringRef,
-};
+use rpi_plugin_sdk::{EventTag, PluginApi, RuntimeActionId, StablePluginEvent, StbStringRef};
 use serde_json::{json, Value};
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -91,14 +89,11 @@ struct Host(PluginApi);
 
 impl Host {
     fn lifecycle(self, op: &str, code: i32) -> bool {
-        let mut out = StbString::empty();
-        let rc = (self.0.runtime_action)(
-            RuntimeActionId::StdioLifecycle as u32,
-            StbStringRef::from_str(&json!({"op": op, "exitCode": code}).to_string()),
-            &mut out,
-            self.0.user_data,
+        let (rc, _) = rpi_plugin_sdk::call_action!(
+            self.0,
+            RuntimeActionId::StdioLifecycle,
+            &json!({"op": op, "exitCode": code}).to_string()
         );
-        rpi_plugin_sdk::stb_drop!(out, Some(self.0.free_string));
         rc == 0
     }
 
@@ -113,18 +108,14 @@ impl Host {
         if self.0.user_data.is_null() {
             return None;
         }
-        let mut out = StbString::empty();
-        let rc = (self.0.runtime_action)(
-            RuntimeActionId::GetCliFlag as u32,
-            StbStringRef::from_str(&json!({"name": name}).to_string()),
-            &mut out,
-            self.0.user_data,
+        let (rc, body) = rpi_plugin_sdk::call_action!(
+            self.0,
+            RuntimeActionId::GetCliFlag,
+            &json!({"name": name}).to_string()
         );
         if rc != 0 {
-            rpi_plugin_sdk::stb_drop!(out, Some(self.0.free_string));
             return None;
         }
-        let body = rpi_plugin_sdk::stb_take!(out, Some(self.0.free_string));
         serde_json::from_str::<Value>(&body)
             .ok()?
             .get("value")

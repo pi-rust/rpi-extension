@@ -1,6 +1,6 @@
 #![forbid(unsafe_code)]
 
-use rpi_plugin_sdk::{EventTag, PluginApi, RuntimeActionId, StbString, StbStringRef};
+use rpi_plugin_sdk::{EventTag, PluginApi, RuntimeActionId, StbStringRef};
 use serde_json::{json, Value};
 use std::{
     collections::{HashMap, VecDeque},
@@ -370,15 +370,8 @@ fn compact(n: u64) -> String {
     }
 }
 fn component_action(runtime: &rpi_plugin_sdk::PluginApi, args: Value) -> bool {
-    let args = args.to_string();
-    let mut out = StbString::empty();
-    let rc = (runtime.runtime_action)(
-        RuntimeActionId::UiComponent as u32,
-        StbStringRef::from_str(&args),
-        &mut out,
-        runtime.user_data,
-    );
-    rpi_plugin_sdk::stb_drop!(out, Some(runtime.free_string));
+    let (rc, _) =
+        rpi_plugin_sdk::call_action!(runtime, RuntimeActionId::UiComponent, &args.to_string());
     rc == 0
 }
 fn publish(runtime: &PluginApi, stats: &mut Stats) {
@@ -623,6 +616,7 @@ fn register(api: &PluginApi, cleanup: Option<lifecycle::Register>) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rpi_plugin_sdk::StbString;
     #[test]
     fn f8_toggles_once_and_modified_or_unrelated_keys_are_not_claimed() {
         use rpi_plugin_sdk::{EVENT_HANDLER_CLAIMED, EVENT_HANDLER_CONTINUE};

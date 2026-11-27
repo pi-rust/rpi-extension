@@ -39,7 +39,8 @@ members = [
     "packages/rpi-http",
     "tools/rpi-package-install",
 ]
-exclude = ["tools/rpi-package-smoke"]
+# The simulated host has its own audited C ABI boundary in tests.
+exclude = ["tools/rpi-package-smoke", "tools/rpi-abi-test-support"]
 resolver = "2"
 
 [workspace.package]
@@ -51,10 +52,9 @@ authors = ["BigFish <bigfish1913@gmail.com>"]
 repository = "https://github.com/pi-rust/rpi-extension"
 
 [workspace.dependencies]
-# Pin the companion SDK revision until these adapters reach crates.io.
-rpi-plugin-sdk = { version = "=0.30.0", git = "https://github.com/bigfish1913/pi-rust", rev = "8d3f184de93ac696ba6cbe8d0798220df69bcf9b" }
-rpi-ai = { version = "=0.30.0", git = "https://github.com/bigfish1913/pi-rust", rev = "8d3f184de93ac696ba6cbe8d0798220df69bcf9b" }
-rpi-extensions = { version = "=0.30.0", git = "https://github.com/bigfish1913/pi-rust", rev = "8d3f184de93ac696ba6cbe8d0798220df69bcf9b" }
+rpi-plugin-sdk = "=0.31.0"
+rpi-ai = "=0.31.0"
+rpi-extensions = "=0.31.0"
 feishu-sdk = { version = "0.1.2", default-features = false, features = ["websocket"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

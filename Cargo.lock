@@ -2505,6 +2505,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "rpi-abi-test-support"
+version = "0.0.0"
+dependencies = [
+ "rpi-plugin-sdk",
+]
+
+[[package]]
 name = "rpi-acp"
 version = "0.2.19"
 dependencies = [
@@ -2518,8 +2525,9 @@ dependencies = [
 
 [[package]]
 name = "rpi-agent"
-version = "0.30.0"
-source = "git+https://github.com/bigfish1913/pi-rust?rev=8d3f184de93ac696ba6cbe8d0798220df69bcf9b#8d3f184de93ac696ba6cbe8d0798220df69bcf9b"
+version = "0.31.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bc7816243e2cb99f94230c80cfc50e59433e45da9f73e969535b2fe50a718504"
 dependencies = [
  "async-trait",
  "futures",
@@ -2536,8 +2544,9 @@ dependencies = [
 
 [[package]]
 name = "rpi-ai"
-version = "0.30.0"
-source = "git+https://github.com/bigfish1913/pi-rust?rev=8d3f184de93ac696ba6cbe8d0798220df69bcf9b#8d3f184de93ac696ba6cbe8d0798220df69bcf9b"
+version = "0.31.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "dbcdcca9a305a7a323cf0a7245a6335e25fc599b956a8b26c40e9bae40fae565"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -2630,18 +2639,21 @@ dependencies = [
 
 [[package]]
 name = "rpi-extensions"
-version = "0.30.0"
-source = "git+https://github.com/bigfish1913/pi-rust?rev=8d3f184de93ac696ba6cbe8d0798220df69bcf9b#8d3f184de93ac696ba6cbe8d0798220df69bcf9b"
+version = "0.31.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e8b513610f12de1570f3f497b56fb6117f8895c2e419aca8dbdd56034ba51b50"
 dependencies = [
  "async-trait",
  "dirs",
  "futures",
+ "libc",
  "libloading",
  "rpi-agent",
  "rpi-ai",
  "rpi-plugin-sdk",
  "serde",
  "serde_json",
+ "tempfile",
  "thiserror 1.0.69",
  "tokio",
  "tokio-util",
@@ -2653,6 +2665,7 @@ dependencies = [
 name = "rpi-goal"
 version = "0.2.5"
 dependencies = [
+ "rpi-abi-test-support",
  "rpi-plugin-sdk",
  "serde",
  "serde_json",
@@ -2739,6 +2752,7 @@ dependencies = [
 name = "rpi-mcp-adapter"
 version = "0.2.11"
 dependencies = [
+ "rpi-abi-test-support",
  "rpi-mcp-core",
  "rpi-plugin-sdk",
  "serde_json",
@@ -2802,6 +2816,7 @@ name = "rpi-office"
 version = "0.1.1"
 dependencies = [
  "futures-util",
+ "rpi-abi-test-support",
  "rpi-plugin-sdk",
  "serde",
  "serde_json",
@@ -2824,6 +2839,7 @@ dependencies = [
 name = "rpi-orchestrator"
 version = "0.1.17"
 dependencies = [
+ "rpi-abi-test-support",
  "rpi-plugin-sdk",
  "rustix",
  "serde_json",
@@ -2867,8 +2883,9 @@ dependencies = [
 
 [[package]]
 name = "rpi-plugin-sdk"
-version = "0.30.0"
-source = "git+https://github.com/bigfish1913/pi-rust?rev=8d3f184de93ac696ba6cbe8d0798220df69bcf9b#8d3f184de93ac696ba6cbe8d0798220df69bcf9b"
+version = "0.31.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b35b3739064c10c9ae982542b842a789805c5ddb70444fa4701fa01d09146638"
 dependencies = [
  "libc",
  "reqwest 0.12.28",
@@ -2939,8 +2956,9 @@ dependencies = [
 
 [[package]]
 name = "rpi-telemetry"
-version = "0.30.0"
-source = "git+https://github.com/bigfish1913/pi-rust?rev=8d3f184de93ac696ba6cbe8d0798220df69bcf9b#8d3f184de93ac696ba6cbe8d0798220df69bcf9b"
+version = "0.31.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fb44ab9507606ff456931895a84c8e1b98bd20804581f186f607cb4796415714"
 dependencies = [
  "async-trait",
  "serde",

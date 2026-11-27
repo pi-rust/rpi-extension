@@ -54,11 +54,10 @@ fn get_cli_flag(runtime: &HostRuntime, name: &str) -> Option<Value> {
         &mut out,
         runtime.owner,
     );
+    let text = rpi_plugin_sdk::stb_take!(out, Some(runtime.functions.free));
     if rc != 0 {
-        rpi_plugin_sdk::stb_drop!(out, Some(runtime.functions.free));
         return None;
     }
-    let text = rpi_plugin_sdk::stb_take!(out, Some(runtime.functions.free));
     let value: Value = serde_json::from_str(&text).ok()?;
     value.get("value").cloned()
 }
@@ -365,7 +364,7 @@ mod tests {
             let event = StablePluginEvent::tool_call(EventTag::ToolCall, id, tool, params);
             let actual = on_tool_call(event, owner as *mut std::ffi::c_void);
             for value in [id, tool, params] {
-                rpi_plugin_sdk::stb_drop!(value, Some(free));
+                let _ = rpi_plugin_sdk::stb_take!(value, Some(free));
             }
             assert_eq!(actual, expected);
         }

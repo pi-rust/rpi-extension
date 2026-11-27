@@ -65,11 +65,10 @@ fn get_cli_flag(name: &str) -> Option<Value> {
     // The host may have produced `out` even on an error path; reclaim it via the
     // host's free so we don't leak the host allocation.
     let free = HOST_FREE_STRING.get().copied();
+    let result_str = rpi_plugin_sdk::stb_take!(out, free);
     if rc != 0 {
-        rpi_plugin_sdk::stb_drop!(out, free);
         return None;
     }
-    let result_str = rpi_plugin_sdk::stb_take!(out, free);
     let result: Value = serde_json::from_str(&result_str).ok()?;
     result.get("value").cloned()
 }
@@ -1059,9 +1058,9 @@ mod tests {
             }
         }
         for schema in schemas {
-            rpi_plugin_sdk::stb_drop!(schema.name, Some(free_string));
-            rpi_plugin_sdk::stb_drop!(schema.description, Some(free_string));
-            rpi_plugin_sdk::stb_drop!(schema.parameters, Some(free_string));
+            let _ = rpi_plugin_sdk::stb_take!(schema.name, Some(free_string));
+            let _ = rpi_plugin_sdk::stb_take!(schema.description, Some(free_string));
+            let _ = rpi_plugin_sdk::stb_take!(schema.parameters, Some(free_string));
         }
     }
 
@@ -1089,9 +1088,9 @@ mod tests {
             json!(["off", "minimal", "low", "medium", "high", "xhigh", "max"])
         );
         for schema in [server, client] {
-            rpi_plugin_sdk::stb_drop!(schema.name, Some(free_string));
-            rpi_plugin_sdk::stb_drop!(schema.description, Some(free_string));
-            rpi_plugin_sdk::stb_drop!(schema.parameters, Some(free_string));
+            let _ = rpi_plugin_sdk::stb_take!(schema.name, Some(free_string));
+            let _ = rpi_plugin_sdk::stb_take!(schema.description, Some(free_string));
+            let _ = rpi_plugin_sdk::stb_take!(schema.parameters, Some(free_string));
         }
     }
 

@@ -6,9 +6,10 @@
 //! deterministic.
 #![allow(dead_code)]
 
+use rpi_abi_test_support::{tool_registrar, ToolCallbacks, ToolRegistration, ToolSchema};
 use rpi_plugin_sdk::{
     CommandHandlerFn, EventHandlerFn, EventTag, PluginApi, StablePluginEvent, StbString,
-    StbStringRef, ToolCancelFn, ToolDestroyFn, ToolExecuteFn, ToolPollFn,
+    StbStringRef,
 };
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
@@ -32,7 +33,7 @@ static ACTIVE_TOOLS: Mutex<Option<Vec<String>>> = Mutex::new(None);
 static ABORT_SUPPORTED: Mutex<bool> = Mutex::new(true);
 static HANDLERS: Mutex<Vec<(EventTag, EventHandlerFn)>> = Mutex::new(Vec::new());
 static COMMAND: Mutex<Option<CommandHandlerFn>> = Mutex::new(None);
-static TOOLS: Mutex<BTreeMap<String, ToolFns>> = Mutex::new(BTreeMap::new());
+static TOOLS: Mutex<BTreeMap<String, ToolCallbacks>> = Mutex::new(BTreeMap::new());
 static SERVED: OnceLock<()> = OnceLock::new();
 /// Model the host's deferred commit: `AppendEntry` succeeds but the entry only
 /// reaches the branch when the test commits it.
@@ -43,14 +44,6 @@ static STAGED: Mutex<Option<Value>> = Mutex::new(None);
 static SEND_BLOCKS: Mutex<bool> = Mutex::new(false);
 static SEND_RELEASED: Mutex<bool> = Mutex::new(false);
 static SEND_CV: Condvar = Condvar::new();
-
-#[derive(Clone, Copy)]
-struct ToolFns {
-    execute: ToolExecuteFn,
-    poll: ToolPollFn,
-    cancel: ToolCancelFn,
-    destroy: ToolDestroyFn,
-}
 
 /// Serialize tests that share the fake host and the extension's process-wide
 /// worker.
@@ -234,24 +227,17 @@ extern "C" fn register_event(tag: EventTag, handler: EventHandlerFn, _: *mut c_v
     0
 }
 
-rpi_plugin_sdk::tool_schema_handler!(
-    register_tool,
-    |schema, execute, (poll, cancel, destroy), free| {
-        let name = rpi_plugin_sdk::stb_take!(schema.name, Some(free));
-        rpi_plugin_sdk::stb_drop!(schema.description, Some(free));
-        rpi_plugin_sdk::stb_drop!(schema.parameters, Some(free));
-        TOOLS.lock().unwrap_or_else(|p| p.into_inner()).insert(
-            name,
-            ToolFns {
-                execute,
-                poll,
-                cancel,
-                destroy,
-            },
-        );
+struct ToolRegistrar;
+
+impl ToolRegistration for ToolRegistrar {
+    fn register_tool(schema: ToolSchema, callbacks: ToolCallbacks) -> i32 {
+        TOOLS
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .insert(schema.name, callbacks);
         0
     }
-);
+}
 
 rpi_plugin_sdk::string_handler! {
 fn runtime_action(action, args, out, _user_data) {
@@ -362,7 +348,7 @@ pub fn api() -> PluginApi {
         free_string: rpi_plugin_sdk::callbacks::free_string,
         user_data: std::ptr::null_mut(),
         register_command: Some(register_command),
-        register_tool: Some(register_tool),
+        register_tool: Some(tool_registrar::<ToolRegistrar>()),
         register_shortcut: None,
         register_flag: None,
         register_provider: None,
@@ -427,7 +413,10 @@ pub fn fire_message(tag: EventTag, payload: &str) {
         handler(event, std::ptr::null_mut());
     }
     // The host frees one payload allocation after the fan-out.
-    rpi_plugin_sdk::stb_drop!(owned, Some(rpi_plugin_sdk::callbacks::free_string));
+    drop(rpi_plugin_sdk::stb_take!(
+        owned,
+        Some(rpi_plugin_sdk::callbacks::free_string)
+    ));
 }
 
 pub fn fire_settled() {

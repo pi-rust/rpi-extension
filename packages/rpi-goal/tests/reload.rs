@@ -6,6 +6,7 @@
 
 mod support;
 
+use rpi_abi_test_support::{tool_registrar, ToolCallbacks, ToolRegistration, ToolSchema};
 use rpi_plugin_sdk::{
     CommandHandlerFn, EventHandlerFn, EventTag, PluginApi, StablePluginEvent, StbString,
     StbStringRef,
@@ -29,13 +30,14 @@ extern "C" fn event(tag: EventTag, handler: EventHandlerFn, _: *mut c_void) -> i
     0
 }
 
-rpi_plugin_sdk::tool_schema_handler!(tool, |schema, _execute, _, free| {
-    let name = rpi_plugin_sdk::stb_take!(schema.name, Some(free));
-    rpi_plugin_sdk::stb_drop!(schema.description, Some(free));
-    rpi_plugin_sdk::stb_drop!(schema.parameters, Some(free));
-    TOOLS.lock().unwrap().push(name);
-    0
-});
+struct ToolRegistrar;
+
+impl ToolRegistration for ToolRegistrar {
+    fn register_tool(schema: ToolSchema, _: ToolCallbacks) -> i32 {
+        TOOLS.lock().unwrap().push(schema.name);
+        0
+    }
+}
 
 rpi_plugin_sdk::string_handler! {
 fn action(_action, _args, out, user_data) {
@@ -53,7 +55,7 @@ fn api(owner: usize) -> PluginApi {
         free_string: rpi_plugin_sdk::callbacks::free_string,
         user_data: owner as *mut c_void,
         register_command: Some(command),
-        register_tool: Some(tool),
+        register_tool: Some(tool_registrar::<ToolRegistrar>()),
         register_shortcut: None,
         register_flag: None,
         register_provider: None,

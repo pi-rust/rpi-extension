@@ -5,11 +5,11 @@
 //! invoke the registered callbacks with their original host or plugin context.
 #![allow(dead_code)]
 
+use rpi_abi_test_support::{tool_registrar, ToolCallbacks, ToolRegistration, ToolSchema};
 use rpi_plugin_sdk::{
     AutocompleteProviderFn, BeforeAgentStartFn, CommandArgumentCompletionFn, CommandHandlerFn,
     EventHandlerFn, EventTag, FreeStringFn, PluginApi, PluginBeginShutdownFn,
     PluginFinishShutdownFn, RuntimeActionId, StablePluginEvent, StbString, StbStringRef,
-    ToolCancelFn, ToolDestroyFn, ToolExecuteFn, ToolPollFn,
 };
 use serde_json::{json, Value};
 use std::cell::Cell;
@@ -20,13 +20,7 @@ use std::sync::Mutex;
 pub const ABI: u32 = rpi_plugin_sdk::RPI_PLUGIN_ABI_VERSION_UNIFIED;
 
 /// A registered tool and its ABI callbacks.
-#[derive(Clone, Copy)]
-pub struct RegisteredTool {
-    pub execute: ToolExecuteFn,
-    pub poll: ToolPollFn,
-    pub cancel: ToolCancelFn,
-    pub destroy: ToolDestroyFn,
-}
+pub type RegisteredTool = ToolCallbacks;
 
 type Lifecycle = (PluginBeginShutdownFn, PluginFinishShutdownFn, usize);
 type Tool = (String, String, Value, RegisteredTool);
@@ -72,32 +66,24 @@ fn host<R>(f: impl FnOnce(&mut Host) -> R) -> R {
     host_for(OWNER.get(), f)
 }
 
-rpi_plugin_sdk::tool_schema_handler!(
-    register_tool,
-    |schema, execute, (poll, cancel, destroy), free| {
-        let name = rpi_plugin_sdk::stb_take!(schema.name, Some(free));
-        let description = rpi_plugin_sdk::stb_take!(schema.description, Some(free));
-        let parameters: Value =
-            serde_json::from_str(&rpi_plugin_sdk::stb_take!(schema.parameters, Some(free)))
-                .expect("valid tool schema");
+struct ToolRegistrar;
+
+impl ToolRegistration for ToolRegistrar {
+    fn register_tool(schema: ToolSchema, callbacks: ToolCallbacks) -> i32 {
+        let ToolSchema {
+            name,
+            description,
+            parameters,
+        } = schema;
+        let parameters = serde_json::from_str(&parameters).expect("valid tool schema");
         host(|host| {
             // A real host activates every registered tool by default.
             host.active.push(name.clone());
-            host.tools.push((
-                name.clone(),
-                description,
-                parameters,
-                RegisteredTool {
-                    execute,
-                    poll,
-                    cancel,
-                    destroy,
-                },
-            ));
+            host.tools.push((name, description, parameters, callbacks));
         });
         0
     }
-);
+}
 
 extern "C" fn register_event(
     tag: EventTag,
@@ -227,7 +213,7 @@ pub fn api() -> PluginApi {
         abi_version: ABI,
         struct_size: std::mem::size_of::<PluginApi>() as u32,
         free_string: rpi_plugin_sdk::callbacks::free_string,
-        register_tool: Some(register_tool),
+        register_tool: Some(tool_registrar::<ToolRegistrar>()),
         register_command: Some(register_command),
         register_shortcut: None,
         register_flag: Some(register_flag),

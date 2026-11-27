@@ -999,9 +999,9 @@ mod tests {
             assert_eq!(option["properties"]["description"]["type"], "string");
         }
         assert_inline_schema(&params);
-        rpi_plugin_sdk::stb_drop!(schema.name, Some(free_string));
-        rpi_plugin_sdk::stb_drop!(schema.description, Some(free_string));
-        rpi_plugin_sdk::stb_drop!(schema.parameters, Some(free_string));
+        let _ = rpi_plugin_sdk::stb_take!(schema.name, Some(free_string));
+        let _ = rpi_plugin_sdk::stb_take!(schema.description, Some(free_string));
+        let _ = rpi_plugin_sdk::stb_take!(schema.parameters, Some(free_string));
     }
 
     #[test]
@@ -1009,9 +1009,9 @@ mod tests {
         let schema = tool_schema();
         let params: Value =
             serde_json::from_str(&rpi_plugin_sdk::stb_text!(schema.parameters)).unwrap();
-        rpi_plugin_sdk::stb_drop!(schema.name, Some(free_string));
-        rpi_plugin_sdk::stb_drop!(schema.description, Some(free_string));
-        rpi_plugin_sdk::stb_drop!(schema.parameters, Some(free_string));
+        let _ = rpi_plugin_sdk::stb_take!(schema.name, Some(free_string));
+        let _ = rpi_plugin_sdk::stb_take!(schema.description, Some(free_string));
+        let _ = rpi_plugin_sdk::stb_take!(schema.parameters, Some(free_string));
         let validator = jsonschema::JSONSchema::compile(&params).unwrap();
 
         for field in ["title", "label", "text", "value", "name"] {

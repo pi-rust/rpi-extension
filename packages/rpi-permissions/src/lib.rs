@@ -379,9 +379,9 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("UTF-8 bytes"));
-        rpi_plugin_sdk::stb_drop!(schema.name, Some(free_string));
-        rpi_plugin_sdk::stb_drop!(schema.description, Some(free_string));
-        rpi_plugin_sdk::stb_drop!(schema.parameters, Some(free_string));
+        let _ = rpi_plugin_sdk::stb_take!(schema.name, Some(free_string));
+        let _ = rpi_plugin_sdk::stb_take!(schema.description, Some(free_string));
+        let _ = rpi_plugin_sdk::stb_take!(schema.parameters, Some(free_string));
     }
 
     #[test]

@@ -29,5 +29,8 @@ rpi-plugin-sdk = { workspace = true }
 serde = { version = "1", features = ["derive"] }
 serde_json = { workspace = true }
 
+[dev-dependencies]
+rpi-abi-test-support = { path = "../../tools/rpi-abi-test-support" }
+
 [lints]
 workspace = true

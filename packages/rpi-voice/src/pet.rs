@@ -597,15 +597,14 @@ mod tests {
             registration::with_test_callback(owner, || {
                 let input = json!({"args": args}).to_string();
                 let mut out = StbString::empty();
-                assert_eq!(
-                    command(
-                        StbStringRef::from_str(&input),
-                        &mut out,
-                        owner.api.user_data
-                    ),
-                    0
+                let rc = command(
+                    StbStringRef::from_str(&input),
+                    &mut out,
+                    owner.api.user_data,
                 );
-                rpi_plugin_sdk::stb_drop!(out, Some(rpi_plugin_sdk::callbacks::free_string));
+                let _ =
+                    rpi_plugin_sdk::stb_take!(out, Some(rpi_plugin_sdk::callbacks::free_string));
+                assert_eq!(rc, 0);
             });
         }
 

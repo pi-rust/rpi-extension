@@ -1,5 +1,6 @@
 use super::*;
 use crate::lifecycle;
+use rpi_abi_test_support::{tool_registrar, ToolCallbacks, ToolRegistration, ToolSchema};
 use rpi_plugin_sdk::{callbacks::Step, PluginApi};
 use serde_json::json;
 use std::cell::RefCell;
@@ -33,19 +34,20 @@ extern "C" fn lifecycle(
     0
 }
 
-rpi_plugin_sdk::tool_schema_handler!(register_tool, |schema, _execute, _, free| {
-    rpi_plugin_sdk::stb_drop!(schema.name, Some(free));
-    rpi_plugin_sdk::stb_drop!(schema.description, Some(free));
-    rpi_plugin_sdk::stb_drop!(schema.parameters, Some(free));
-    LOADER.with_borrow_mut(|loader| {
-        loader.tool_count += 1;
-        if loader.reject_tool == Some(loader.tool_count) {
-            17
-        } else {
-            0
-        }
-    })
-});
+struct ToolRegistrar;
+
+impl ToolRegistration for ToolRegistrar {
+    fn register_tool(_: ToolSchema, _: ToolCallbacks) -> i32 {
+        LOADER.with_borrow_mut(|loader| {
+            loader.tool_count += 1;
+            if loader.reject_tool == Some(loader.tool_count) {
+                17
+            } else {
+                0
+            }
+        })
+    }
+}
 
 extern "C" fn runtime_action(_: u32, _: StbStringRef, _: *mut StbString, data: *mut c_void) -> i32 {
     INVOCATION.store(data as usize, Ordering::Release);
@@ -63,7 +65,7 @@ fn load(owner: usize, reject_tool: Option<usize>) -> (i32, Hooks) {
         abi_version: rpi_plugin_sdk::RPI_PLUGIN_ABI_VERSION_UNIFIED,
         struct_size: std::mem::size_of::<PluginApi>() as u32,
         free_string: plugin_free_string,
-        register_tool: Some(register_tool),
+        register_tool: Some(tool_registrar::<ToolRegistrar>()),
         register_command: None,
         register_shortcut: None,
         register_flag: None,

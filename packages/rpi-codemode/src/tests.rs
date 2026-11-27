@@ -33,12 +33,12 @@ fn registration_schema_is_canonical_and_allows_host_injection() {
         &json!({"action":"list","__rpi":{"runtimeHandle":1,"runtimeKey":"key"},"unknown":true})
     )
     .is_ok());
-    rpi_plugin_sdk::stb_drop!(schema.name, Some(rpi_plugin_sdk::callbacks::free_string));
-    rpi_plugin_sdk::stb_drop!(
+    let _ = rpi_plugin_sdk::stb_take!(schema.name, Some(rpi_plugin_sdk::callbacks::free_string));
+    let _ = rpi_plugin_sdk::stb_take!(
         schema.description,
         Some(rpi_plugin_sdk::callbacks::free_string)
     );
-    rpi_plugin_sdk::stb_drop!(
+    let _ = rpi_plugin_sdk::stb_take!(
         schema.parameters,
         Some(rpi_plugin_sdk::callbacks::free_string)
     );

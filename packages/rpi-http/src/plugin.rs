@@ -5,9 +5,7 @@
 //! `rpi-extcore::service::Service` in its own runtime; that service does not
 //! share live sessions with the Agent session that loaded the plugin.
 use rpi_httpcore::config::{self, Launch};
-use rpi_plugin_sdk::{
-    EventTag, PluginApi, RuntimeActionId, StablePluginEvent, StbString, StbStringRef,
-};
+use rpi_plugin_sdk::{EventTag, PluginApi, RuntimeActionId, StablePluginEvent, StbStringRef};
 use serde_json::{json, Value};
 use std::ffi::c_void;
 use std::io::Write;
@@ -37,18 +35,10 @@ struct Host(PluginApi);
 
 impl Host {
     fn action(self, id: RuntimeActionId, args: Value) -> Option<Value> {
-        let mut out = StbString::empty();
-        let code = (self.0.runtime_action)(
-            id as u32,
-            StbStringRef::from_str(&args.to_string()),
-            &mut out,
-            self.0.user_data,
-        );
+        let (code, body) = rpi_plugin_sdk::call_action!(self.0, id, &args.to_string());
         if code == 0 {
-            let body = rpi_plugin_sdk::stb_take!(out, Some(self.0.free_string));
             serde_json::from_str(&body).ok()
         } else {
-            rpi_plugin_sdk::stb_drop!(out, Some(self.0.free_string));
             None
         }
     }

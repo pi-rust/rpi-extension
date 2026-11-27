@@ -556,8 +556,7 @@ thread_local! {
 }
 
 extern "C" fn collect_progress(partial: StbString, _: *mut std::ffi::c_void) {
-    let text = rpi_plugin_sdk::stb_text!(partial);
-    rpi_plugin_sdk::stb_drop!(partial, Some(plugin_free_string));
+    let text = rpi_plugin_sdk::stb_take!(partial, Some(plugin_free_string));
     PROGRESS.with(|progress| progress.borrow_mut().push(text));
 }
 

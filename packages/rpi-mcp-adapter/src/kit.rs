@@ -1,7 +1,7 @@
 //! Nonblocking tool ABI bridge. Workers are cancelled and joined before destroy.
 use crate::control::Control;
 use rpi_plugin_sdk::handles::ToolHandles;
-use rpi_plugin_sdk::{FreeStringFn, StbString, StepHandle, StepResult, ToolPartialCb};
+use rpi_plugin_sdk::{StbString, StepHandle, StepResult, ToolPartialCb};
 use serde_json::{json, Value};
 use std::ffi::c_void;
 use std::sync::{
@@ -65,12 +65,10 @@ impl Workers {
 }
 
 pub fn execute(
-    params: StbString,
-    free_params: Option<FreeStringFn>,
+    text: String,
     workers: &Workers,
     builder: impl FnOnce(&Value, &Control) -> Result<Value, String> + Send + 'static,
 ) -> StepHandle {
-    let text = rpi_plugin_sdk::stb_take!(params, free_params);
     let mut set = workers.0.lock().unwrap_or_else(|p| p.into_inner());
     if set.stopping {
         return std::ptr::null_mut();
@@ -188,12 +186,7 @@ mod tests {
                 std::thread::sleep(Duration::from_millis(5));
             }
         }
-        let handle = execute(
-            StbString::from_string("{}".into()),
-            Some(plugin_free_string),
-            &Workers::default(),
-            wait,
-        );
+        let handle = execute("{}".into(), &Workers::default(), wait);
         let start = Instant::now();
         let result = poll(handle, None, std::ptr::null_mut());
         assert_eq!(result.tag, rpi_plugin_sdk::StepResultTag::Pending);

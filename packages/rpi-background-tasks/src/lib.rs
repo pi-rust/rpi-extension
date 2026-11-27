@@ -2411,9 +2411,8 @@ mod tests {
             &mut output,
             std::ptr::null_mut(),
         );
+        let text = rpi_plugin_sdk::stb_take!(output, Some(free_string));
         assert_eq!(rc, 0, "/jobs handler failed for {args:?}");
-        let text = rpi_plugin_sdk::stb_text!(output);
-        rpi_plugin_sdk::stb_drop!(output, Some(free_string));
         let parsed: Value = serde_json::from_str(&text).expect("/jobs returned non-JSON");
         parsed["text"]
             .as_str()
