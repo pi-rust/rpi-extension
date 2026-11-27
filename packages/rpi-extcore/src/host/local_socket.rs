@@ -68,7 +68,12 @@ pub(super) async fn open(
             "resource_transition": resource_path("--resource-transition"),
             "trust_override": null,
             "no_session": false,
-            "native_durable": false,
+            // The stdio child inherits the native CLI default, which enables
+            // native durable execution. A socket open must request the same
+            // mode explicitly: the daemon's `Request` field is a plain bool
+            // with no default, so omitting the parity here would silently
+            // downgrade every socket-backed session to the legacy runtime.
+            "native_durable": true,
             "snapshots": false,
             "permission_gate": options.permission_gate && !options.bypass,
             "bypass": options.bypass,
@@ -158,6 +163,10 @@ mod tests {
             let request: Value = serde_json::from_str(&frame).unwrap();
             assert_eq!(request["version"], 1);
             assert_eq!(request["rpc"]["session_id"], id);
+            // A socket session must request the same execution mode the stdio
+            // child gets from the native CLI default, otherwise every
+            // socket-backed session silently runs the legacy runtime.
+            assert_eq!(request["rpc"]["native_durable"], true);
             let opened = json!({"type":"opened", "host_pid":std::process::id(),
                 "agent_id":uuid::Uuid::new_v4().to_string(), "session_id":id});
             socket
