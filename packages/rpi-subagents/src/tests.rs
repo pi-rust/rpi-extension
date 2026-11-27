@@ -227,11 +227,14 @@ fn resolved_operator_budgets_reach_the_native_start_and_final_report() {
         },
     )
     .unwrap();
-    let (action, calls) = scripted(vec![Ok(json!({"childId":"child-policy"})), Ok(completed())]);
+    // The merged host protocol starts an independent run, so the start reply is
+    // keyed by runId; the resolved policy must survive that hop unchanged.
+    let (action, calls) = scripted(vec![Ok(json!({"runId":"child-policy"})), Ok(completed())]);
     let (tx, rx) = mpsc::channel();
     run_request(
         request,
         "policy-call".into(),
+        &[],
         &*action,
         tx,
         Arc::new(AtomicBool::new(false)),
@@ -252,9 +255,10 @@ fn resolved_operator_budgets_reach_the_native_start_and_final_report() {
     assert_eq!(result["maxTurns"], 0);
     assert_eq!(result["timeoutSeconds"], 900);
     let calls = calls.lock().unwrap();
-    assert_eq!(calls[0]["maxTurns"], 0);
-    assert_eq!(calls[0]["timeoutSeconds"], 900);
-    assert_eq!(calls.last().unwrap()["op"], "dispose");
+    assert_eq!(calls[0]["actionId"], INDEPENDENT_RUN);
+    assert_eq!(calls[0]["args"]["maxTurns"], 0);
+    assert_eq!(calls[0]["args"]["timeoutSeconds"], 900);
+    assert_eq!(calls.last().unwrap()["args"]["op"], "dispose");
 }
 
 #[test]
