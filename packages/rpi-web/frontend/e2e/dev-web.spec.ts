@@ -10846,11 +10846,16 @@ test.describe("run timing regressions", () => {
         "title",
         "Recorded work time plus the current run",
       );
-      const before = Number.parseInt(await metric.innerText(), 10);
-      expect(before).toBeGreaterThanOrEqual(22);
+      const elapsedSeconds = async () => {
+        const text = await metric.innerText();
+        const part = (unit: string) =>
+          Number(text.match(new RegExp(`(\\d+)${unit}`))?.[1] ?? 0);
+        return part("h") * 3600 + part("m") * 60 + part("s");
+      };
+      await expect.poll(elapsedSeconds).toBeGreaterThanOrEqual(22);
+      const before = await elapsedSeconds();
       await page.clock.runFor(2500);
-      const after = Number.parseInt(await metric.innerText(), 10);
-      expect(after).toBeGreaterThanOrEqual(before + 2);
+      await expect.poll(elapsedSeconds).toBeGreaterThanOrEqual(before + 2);
       settled = true;
       completion.release();
       await expect(metric).toHaveText("38s");
