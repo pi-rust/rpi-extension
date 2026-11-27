@@ -1,0 +1,309 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>rpi-web 会话控制键动画 Demo</title>
+    <style>
+      :root {
+        --bg: #1c1c1e;
+        --surface: #2c2c2e;
+        --soft: #252527;
+        --hover: #38383c;
+        --text: #f2f2f4;
+        --muted: #aeafb8;
+        --line: #3a3a3e;
+        --blue: #3093ff;
+        --blue-text: #74b6ff;
+        --danger: #ff8c84;
+        --green: #6fd297;
+        font-family:
+          -apple-system, BlinkMacSystemFont, "Segoe UI", "Microsoft YaHei",
+          sans-serif;
+        color-scheme: dark;
+      }
+      * { box-sizing: border-box; }
+      body {
+        margin: 0;
+        min-height: 100vh;
+        background: var(--bg);
+        color: var(--text);
+        padding: 32px 20px 60px;
+      }
+      .wrap { max-width: 900px; margin: 0 auto; }
+      h1 { font-size: 22px; margin: 0 0 6px; }
+      .hint { color: var(--muted); font-size: 13px; line-height: 1.7; margin-bottom: 28px; }
+      .cards { display: grid; gap: 18px; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); }
+      .card {
+        background: var(--surface);
+        border: 1px solid var(--line);
+        border-radius: 14px;
+        padding: 20px;
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        gap: 16px;
+      }
+      .card h2 { font-size: 15px; margin: 0; }
+      .card .caption { font-size: 12px; color: var(--muted); text-align: center; min-height: 34px; line-height: 1.5; }
+      .card .status-line { font-size: 11px; font-family: monospace; color: var(--blue-text); min-height: 16px; }
+
+      /* --- The actual three-in-one button styles, copied from rpi-web --- */
+      .send-button {
+        width: 32px;
+        height: 32px;
+        min-height: 32px;
+        border-radius: 9px;
+        padding: 0;
+        background: var(--blue);
+        color: #fff;
+        border: 0;
+        display: grid;
+        place-items: center;
+        cursor: pointer;
+        transition: background 0.15s ease;
+      }
+      .send-button:hover:not(:disabled) { background: #267cc4; }
+      .send-button:disabled { background: var(--hover); color: var(--muted); cursor: not-allowed; }
+      .send-button.composer-action-stop {
+        border-radius: 50%;
+        background: transparent;
+        color: var(--danger);
+      }
+      .send-button.composer-action-stop:hover:not(:disabled) { background: var(--soft); }
+      .send-button.composer-action-continue { border-radius: 50%; background: var(--soft); color: var(--text); }
+      .stop-indicator {
+        display: block;
+        width: 10px;
+        height: 10px;
+        flex: 0 0 10px;
+        background: var(--danger);
+        animation: stop-indicator-pulse 1.6s ease-in-out infinite;
+      }
+      @keyframes stop-indicator-pulse {
+        0%, 100% { opacity: 1; }
+        50% { opacity: 0.45; }
+      }
+      /* Progress ring (identical to desktop.css) */
+      .send-button.composer-action-pending {
+        border-radius: 50%;
+        background: var(--soft);
+        color: var(--blue-text);
+      }
+      .send-button.composer-action-pending.composer-action-stop { color: var(--danger); }
+      .composer-action-progress {
+        position: relative;
+        display: grid;
+        place-items: center;
+        width: 100%;
+        height: 100%;
+        border-radius: 50%;
+      }
+      .composer-action-progress::before {
+        content: "";
+        position: absolute;
+        inset: 0;
+        border-radius: 50%;
+        background: conic-gradient(
+          currentColor 0deg,
+          currentColor 120deg,
+          transparent 120deg,
+          transparent 360deg
+        );
+        -webkit-mask: radial-gradient(farthest-side, transparent calc(100% - 2px), #000 calc(100% - 2px));
+        mask: radial-gradient(farthest-side, transparent calc(100% - 2px), #000 calc(100% - 2px));
+        animation: composer-action-spin 0.9s linear infinite;
+      }
+      .composer-action-progress > * { position: relative; z-index: 1; }
+      .composer-action-progress .stop-indicator {
+        background: currentColor;
+        width: 8px;
+        height: 8px;
+        flex-basis: 8px;
+      }
+      @keyframes composer-action-spin { to { transform: rotate(360deg); } }
+
+      /* Enlarged preview of the button (so the ring is easy to see) */
+      .zoom { transform: scale(4); margin: 40px 0; }
+
+      /* Simulated composer shell */
+      .composer {
+        background: var(--soft);
+        border: 1px solid var(--line);
+        border-radius: 12px;
+        padding: 12px;
+        width: 100%;
+        max-width: 320px;
+      }
+      .composer-row { display: flex; align-items: flex-end; justify-content: space-between; gap: 10px; }
+      .composer textarea {
+        flex: 1;
+        min-height: 40px;
+        max-height: 80px;
+        resize: vertical;
+        background: transparent;
+        color: var(--text);
+        border: 0;
+        outline: none;
+        font: inherit;
+        font-size: 13px;
+      }
+      .composer textarea::placeholder { color: var(--muted); }
+      button.action { background: var(--blue); color: #fff; border: 0; border-radius: 8px; padding: 7px 12px; font: inherit; font-size: 12px; cursor: pointer; }
+      button.action:hover { background: #267cc4; }
+      .legend { margin-top: 34px; font-size: 12px; color: var(--muted); line-height: 1.8; }
+      .legend code { background: var(--soft); padding: 1px 5px; border-radius: 4px; color: var(--text); }
+    </style>
+  </head>
+  <body>
+    <div class="wrap">
+      <h1>rpi-web 三合一会话控制键 · 进度圈动画 Demo</h1>
+      <p class="hint">
+        点击每个卡片中的按钮，模拟对应事件：进度圈从点击开始旋转，直到模拟的服务端响应返回后才停止并切换到下一状态。
+        下方还有一个放大 4 倍的按钮，方便观察圆环细节。
+      </p>
+
+      <div class="cards">
+        <div class="card">
+          <h2>① 发送消息</h2>
+          <div id="btn-send"></div>
+          <div class="status-line" id="status-send"></div>
+          <div class="caption">点击后「发送消息」进度圈旋转，直到消息发出并显示后停止</div>
+        </div>
+        <div class="card">
+          <h2>② 暂停（停止）</h2>
+          <div id="btn-stop"></div>
+          <div class="status-line" id="status-stop"></div>
+          <div class="caption">会话运行中点击暂停，进度圈旋转，直到会话停止后停下</div>
+        </div>
+        <div class="card">
+          <h2>③ 继续运行</h2>
+          <div id="btn-continue"></div>
+          <div class="status-line" id="status-continue"></div>
+          <div class="caption">点击继续后进度圈旋转，直到会话真正恢复运行后停止</div>
+        </div>
+      </div>
+
+      <div class="card" style="margin-top: 24px">
+        <h2>放大预览（4×）</h2>
+        <div class="zoom" id="btn-zoom"></div>
+        <button class="action" onclick="startZoom()">播放放大动画</button>
+        <div class="status-line" id="status-zoom"></div>
+      </div>
+
+      <div class="legend">
+        <strong>核验要点：</strong><br />
+        · 点击按钮后立即出现旋转的浅色圆盘 + 圆环，表示"点击已生效，正在处理"<br />
+        · 圆环颜色：发送/继续=蓝色，停止=红色<br />
+        · 模拟请求返回后圆环消失，按钮切换为下一状态（发送→停止，停止→继续，继续→停止）<br />
+        · 对应代码：<code>App.tsx</code> 的 <code>composerActionPending</code>，<code>desktop.css</code> 的 <code>.composer-action-progress</code>
+      </div>
+    </div>
+
+    <script>
+      // Icons inline (matching lucide-react ArrowUp / Play / Square)
+      const ICONS = {
+        send: '<svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 19V5"/><path d="m5 12 7-7 7 7"/></svg>',
+        sendSmall: '<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 19V5"/><path d="m5 12 7-7 7 7"/></svg>',
+        play: '<svg width="17" height="17" viewBox="0 0 24 24" fill="currentColor" stroke="none"><path d="M8 5v14l11-7z"/></svg>',
+        playSmall: '<svg width="15" height="15" viewBox="0 0 24 24" fill="currentColor" stroke="none"><path d="M8 5v14l11-7z"/></svg>',
+        stop: '<span class="stop-indicator"></span>',
+      };
+
+      // A tiny renderer that mirrors App.tsx's button JSX.
+      function renderButton(el, { action, pending }) {
+        let cls = "send-button";
+        if (action === "stop") cls += " composer-action-stop";
+        if (action === "continue") cls += " composer-action-continue";
+        if (pending) cls += " composer-action-pending";
+
+        let inner;
+        if (pending) {
+          inner = `<span class="composer-action-progress">${
+            pending === "stop" ? ICONS.stop
+            : pending === "continue" ? ICONS.playSmall
+            : ICONS.sendSmall
+          }</span>`;
+        } else {
+          inner = action === "stop" ? ICONS.stop
+            : action === "continue" ? ICONS.play
+            : ICONS.send;
+        }
+        const labels = { send: "发送消息", stop: "暂停", continue: "继续" };
+        el.innerHTML = `<button class="${cls}" aria-busy="${!!pending}" title="${labels[action]}" aria-label="${labels[action]}">${inner}</button>`;
+      }
+
+      const delay = (ms) => new Promise((r) => setTimeout(r, ms));
+
+      // --- Send demo: idle -> pending (1.2s) -> running (stop) ---
+      async function demoSend() {
+        const box = document.getElementById("btn-send");
+        const status = document.getElementById("status-send");
+        renderButton(box, { action: "send", pending: "send" });
+        status.textContent = "pending: 正在发送消息…";
+        await delay(1400); // simulate server ack
+        renderButton(box, { action: "stop", pending: null });
+        status.textContent = "sent: 消息已发出，按钮变为「暂停」";
+        await delay(2200);
+        renderButton(box, { action: "send", pending: null });
+        status.textContent = "ready: 可再次发送";
+      }
+      document.getElementById("btn-send").addEventListener("click", demoSend);
+
+      // --- Stop demo: running -> pending (1.4s) -> stopped (continue) ---
+      async function demoStop() {
+        const box = document.getElementById("btn-stop");
+        const status = document.getElementById("status-stop");
+        renderButton(box, { action: "stop", pending: "stop" });
+        status.textContent = "pending: 正在停止会话…";
+        await delay(1600);
+        renderButton(box, { action: "continue", pending: null });
+        status.textContent = "stopped: 会话已停止，按钮变为「继续」";
+        await delay(2200);
+        renderButton(box, { action: "stop", pending: null });
+        status.textContent = "running: 会话运行中，点击可暂停";
+      }
+      document.getElementById("btn-stop").addEventListener("click", demoStop);
+
+      // --- Continue demo: interrupted -> pending (1.2s) -> running (stop) ---
+      async function demoContinue() {
+        const box = document.getElementById("btn-continue");
+        const status = document.getElementById("status-continue");
+        renderButton(box, { action: "continue", pending: "continue" });
+        status.textContent = "pending: 正在恢复会话…";
+        await delay(1400);
+        renderButton(box, { action: "stop", pending: null });
+        status.textContent = "resumed: 会话已继续，按钮变为「暂停」";
+        await delay(2200);
+        renderButton(box, { action: "continue", pending: null });
+        status.textContent = "idle: 可再次继续";
+      }
+      document.getElementById("btn-continue").addEventListener("click", demoContinue);
+
+      // --- Zoom preview cycles through all three states ---
+      window.startZoom = async function () {
+        const box = document.getElementById("btn-zoom");
+        const status = document.getElementById("status-zoom");
+        for (const action of ["send", "stop", "continue"]) {
+          renderButton(box, { action, pending: action });
+          status.textContent = `${action} · 进度圈旋转中…`;
+          await delay(1600);
+          renderButton(box, { action, pending: null });
+          status.textContent = `${action} · 已确认`;
+          await delay(500);
+        }
+        renderButton(box, { action: "send", pending: null });
+        status.textContent = "演示结束";
+      };
+
+      // Initial states
+      renderButton(document.getElementById("btn-send"), { action: "send" });
+      document.getElementById("status-send").textContent = "ready: 点击发送";
+      renderButton(document.getElementById("btn-stop"), { action: "stop" });
+      document.getElementById("status-stop").textContent = "running: 点击暂停";
+      renderButton(document.getElementById("btn-continue"), { action: "continue" });
+      document.getElementById("status-continue").textContent = "idle: 点击继续";
+      renderButton(document.getElementById("btn-zoom"), { action: "send" });
+    </script>
+  </body>
+</html>

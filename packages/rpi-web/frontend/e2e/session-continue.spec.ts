@@ -1347,3 +1347,121 @@ test("a rejected fallback continuation cannot clear a newer authoritative runnin
     { type: "prompt", message: instruction },
   ]);
 });
+
+// --- Composer action progress ring ----------------------------------------
+// The three-in-one Send / Stop / Continue button must show a spinning ring
+// from the moment it is clicked until the host acknowledges the action.
+
+const progress = (page: Page) =>
+  controls(page).locator(".composer-action-progress");
+const pendingButton = (page: Page) =>
+  controls(page).locator(".send-button.composer-action-pending");
+
+test("Send shows a spinning progress ring until the prompt command settles", async ({
+  page,
+  host,
+}) => {
+  await open(page, host);
+  await ready(page, host);
+  await input(page).fill("Watch the ring while sending");
+  const ticket = host.expectCommand(
+    A,
+    "prompt",
+    { json: envelope("prompt", {}) },
+    true,
+  );
+  await sendButton(page).click();
+  await ticket.arrived;
+  // Ring is visible while the command is still in flight. The optimistic
+  // running state switches the button to Stop, but the ring stays on the
+  // same control until the prompt command is acknowledged.
+  await expect(progress(page)).toHaveCount(1);
+  await expect(pendingButton(page)).toHaveAttribute("aria-busy", "true");
+  // The ring keeps the original Send icon while the prompt settles.
+  await expect(progress(page).locator("svg.lucide-arrow-up")).toBeVisible();
+  ticket.release();
+  await ticket.finished;
+  // Ring clears once the host acknowledges.
+  await expect(progress(page)).toHaveCount(0);
+  await expect(pendingButton(page)).toHaveCount(0);
+});
+
+test("Stop shows a spinning progress ring until the stop command settles", async ({
+  page,
+  host,
+}) => {
+  host.snapshots[A] = snapshot(A, { status: "running" });
+  await open(page, host);
+  await ready(page, host);
+  const ticket = host.expectCommand(
+    A,
+    "stop_run",
+    { json: envelope("stop_run", {}) },
+    true,
+  );
+  await stopButton(page).click();
+  await ticket.arrived;
+  await expect(progress(page)).toHaveCount(1);
+  await expect(stopButton(page)).toHaveAttribute("aria-busy", "true");
+  await expect(progress(page).locator(".stop-indicator")).toBeVisible();
+  ticket.release();
+  await ticket.finished;
+  await expect(progress(page)).toHaveCount(0);
+  await expect(stopButton(page)).toHaveAttribute("aria-busy", "false");
+});
+
+test("Continue shows a spinning progress ring until resume settles", async ({
+  page,
+  host,
+}) => {
+  host.snapshots[A] = snapshot(A, { pendingResume: true });
+  await open(page, host);
+  await ready(page, host);
+  const ticket = host.expectCommand(
+    A,
+    "resume_pending",
+    { json: envelope("resume_pending", { resumed: true }) },
+    true,
+  );
+  await continueButton(page).click();
+  await ticket.arrived;
+  await expect(progress(page)).toHaveCount(1);
+  await expect(
+    controls(page).getByRole("button", { name: "Abort", exact: true }),
+  ).toHaveAttribute("aria-busy", "true");
+  ticket.release();
+  await ticket.finished;
+  await expect(progress(page)).toHaveCount(0);
+});
+
+test("a session switch during a gated prompt does not strand the progress ring", async ({
+  page,
+  host,
+}) => {
+  await open(page, host);
+  await ready(page, host);
+  await input(page).fill("Navigate away while this is in flight");
+  const ticket = host.expectCommand(
+    A,
+    "prompt",
+    { json: envelope("prompt", {}) },
+    true,
+  );
+  await sendButton(page).click();
+  await ticket.arrived;
+  await expect(progress(page)).toHaveCount(1);
+
+  // Leaving the session invalidates the in-flight action's finalizer, so the
+  // ring must be cleared by the session reset instead of the abandoned call.
+  await select(page, B);
+  ticket.release();
+  await ticket.finished;
+  await rendered(page);
+
+  await expect(progress(page)).toHaveCount(0);
+  await expect(pendingButton(page)).toHaveCount(0);
+  await expect(controls(page).locator(".send-button")).toHaveAttribute(
+    "aria-busy",
+    "false",
+  );
+});
