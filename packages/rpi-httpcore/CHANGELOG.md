@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.26](https://github.com/pi-rust/rpi-extension/compare/rpi-httpcore-v0.1.25...rpi-httpcore-v0.1.26) - 2026-11-27
+
+### Added
+
+- *(web)* share a native Host across Web sessions ([#105](https://github.com/pi-rust/rpi-extension/pull/105))
+
+### Other
+
+- *(release)* prepare workspace-wide SDK 0.31.0 release ([#124](https://github.com/pi-rust/rpi-extension/pull/124))
+
 ### Fixed
 
 - *(web)* add a bounded batch session metadata endpoint for multi-session archive

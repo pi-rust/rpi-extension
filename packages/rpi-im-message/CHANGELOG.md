@@ -17,6 +17,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Exempt confirmed Feishu `p2p` conversations from `mentionRequired` so direct
   messages can arrive without a mention.
 
+## [0.1.18](https://github.com/pi-rust/rpi-extension/compare/rpi-im-message-v0.1.17...rpi-im-message-v0.1.18) - 2026-11-27
+
+### Other
+
+- *(release)* prepare workspace-wide SDK 0.31.0 release ([#124](https://github.com/pi-rust/rpi-extension/pull/124))
+
 ## [0.1.16](https://github.com/pi-rust/rpi-extension/compare/rpi-im-message-v0.1.15...rpi-im-message-v0.1.16) - 2026-11-25
 
 ### Added

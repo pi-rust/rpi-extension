@@ -2,6 +2,23 @@
 
 ## [Unreleased]
 
+## [0.1.97](https://github.com/pi-rust/rpi-extension/compare/rpi-web-v0.1.96...rpi-web-v0.1.97) - 2026-11-27
+
+### Added
+
+- *(web)* add automatic update settings ([#116](https://github.com/pi-rust/rpi-extension/pull/116))
+- *(web)* share a native Host across Web sessions ([#105](https://github.com/pi-rust/rpi-extension/pull/105))
+
+### Fixed
+
+- *(web)* open local Host sessions in the native default execution mode ([#123](https://github.com/pi-rust/rpi-extension/pull/123))
+- *(web)* show compacting status during context compaction ([#110](https://github.com/pi-rust/rpi-extension/pull/110))
+- *(web)* update session work time during active runs ([#122](https://github.com/pi-rust/rpi-extension/pull/122))
+
+### Other
+
+- *(release)* prepare workspace-wide SDK 0.31.0 release ([#124](https://github.com/pi-rust/rpi-extension/pull/124))
+
 ## [0.1.95](https://github.com/pi-rust/rpi-extension/compare/rpi-web-v0.1.86...rpi-web-v0.1.95) - 2026-11-27
 
 First stable Web release after the 0.1.87–0.1.95 preview series, built from `main`
