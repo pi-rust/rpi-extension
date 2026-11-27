@@ -38,6 +38,9 @@ pub(crate) struct UpdateState {
     /// extension installer rewrites the installed cdylib, so a second
     /// concurrent invocation would race the first on the same files.
     installing: Arc<Mutex<bool>>,
+    /// One check at a time. Two tabs opening together, or a "Check now" during
+    /// the startup check, would otherwise each spawn a network-bound CLI.
+    checking: Arc<tokio::sync::Mutex<()>>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -95,6 +98,7 @@ pub(crate) fn routes(config: Arc<AppConfig>) -> Router {
         cache: Arc::new(Mutex::new(None)),
         tasks: Arc::new(Mutex::new(HashMap::new())),
         installing: Arc::new(Mutex::new(false)),
+        checking: Arc::new(tokio::sync::Mutex::new(())),
     });
     Router::new()
         .route("/api/v1/updates/check", get(check))
@@ -112,6 +116,13 @@ async fn check(
         if let Some(cached) = cached_inventory(&state) {
             return Json(cached);
         }
+    }
+    // Serialize checks, then re-read the cache: a concurrent request that just
+    // finished populates it, so the second caller reuses that answer instead of
+    // spawning another CLI.
+    let _checking = state.checking.clone().lock_owned().await;
+    if let Some(cached) = cached_inventory(&state) {
+        return Json(cached);
     }
     let refresh = run_cli_json(&state, &["updates", "refresh", "--json"]).await;
     let (inventory, mut error) = match refresh {

@@ -6,7 +6,13 @@ export interface AutoUpdatePreference {
 }
 
 const STORAGE_KEY = "rpi-auto-update";
-const DEFAULT_PREFERENCE: AutoUpdatePreference = { enabled: true };
+/**
+ * Opt-in. Checking on open spawns the native CLI (`rpi updates refresh`), which
+ * reaches the network, so a page load would otherwise start that work on every
+ * tab and every fixture that only meant to paint a transcript. The manual
+ * "Check now" button stays available either way.
+ */
+const DEFAULT_PREFERENCE: AutoUpdatePreference = { enabled: false };
 
 let fallback: AutoUpdatePreference | null = null;
 let unpersisted = false;

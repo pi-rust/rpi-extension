@@ -138,8 +138,10 @@ test("automatic update settings are available from the sidebar", async ({
   });
 
   await page.goto("/");
-  await expect.poll(() => checks).toBeGreaterThan(0);
-  await expect(page.locator(".update-badge")).toBeVisible();
+  // Opt-in: opening the page must not spawn the native CLI by itself.
+  await page.waitForTimeout(1_000);
+  expect(checks).toBe(0);
+  await expect(page.locator(".update-badge")).toHaveCount(0);
 
   const dialog = await openSettings(page);
   const section = dialog.locator(".auto-update-settings");
@@ -148,7 +150,12 @@ test("automatic update settings are available from the sidebar", async ({
   ).toBeVisible();
   await expect(
     section.getByLabel("Check for new versions on open"),
-  ).toBeChecked();
+  ).not.toBeChecked();
+
+  // Turning it on is what triggers the check, through the same opt-in path.
+  await section.getByLabel("Check for new versions on open").check();
+  await expect.poll(() => checks).toBeGreaterThan(0);
+  await expect(page.locator(".update-badge")).toBeVisible();
   await expect(
     section.getByRole("button", { name: "Update host" }),
   ).toBeEnabled();

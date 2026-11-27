@@ -6325,8 +6325,8 @@ export default function App() {
               </label>
               <p className="form-hint">
                 {language === "zh"
-                  ? "仅检查并提示，不会自动安装；安装后需重启 rpi 宿主生效。"
-                  : "Checks and notifies only; updates are installed manually and require restarting the rpi host."}
+                  ? "仅检查并提示，不会自动安装；安装后需重启 rpi 宿主生效。开启后每次打开页面会调用一次原生 rpi 检查更新。"
+                  : "Checks and notifies only; updates are installed manually and require restarting the rpi host. When enabled, each page open runs one native rpi check."}
               </p>
               <div className="update-targets">
                 <div className="update-target">
