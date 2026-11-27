@@ -40,7 +40,7 @@ use std::ffi::c_void;
 use std::fs;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Mutex;
+use std::sync::{Mutex, TryLockError};
 
 /// Session custom-entry type holding one whole message.
 const ENTRY_TYPE: &str = "optchat-entry";
@@ -137,7 +137,16 @@ struct State {
     last: Option<(Kind, String, i64)>,
 }
 
-static STATE: Mutex<Option<State>> = Mutex::new(None);
+struct StateCache {
+    state: Option<State>,
+    /// Changes when the cached branch or its newest entry changes.
+    revision: u64,
+}
+
+static STATE: Mutex<StateCache> = Mutex::new(StateCache {
+    state: None,
+    revision: 0,
+});
 /// Serialize local append preparation, host persistence, and local commit so
 /// two callbacks cannot persist the same message index or reorder the log.
 static APPEND_GATE: Mutex<()> = Mutex::new(());
@@ -327,41 +336,34 @@ fn branch_mark() -> Result<Option<u64>, String> {
         .and_then(Value::as_u64))
 }
 
-/// Whether a cached state still describes the branch it was loaded from: the
-/// newest message in the branch must be the newest one this state holds. A
-/// branch switch inside one session keeps `RPI_SESSION_ID`, so identity — not a
-/// timestamp or a session name — decides whether the cache is still valid.
-fn state_is_current(session: &str, state: &State) -> bool {
-    if state.session != session {
-        return false;
-    }
-    let expected = if state.memory.len() == 0 {
-        None
-    } else {
-        Some(state.memory.end() - 1)
-    };
-    match branch_mark() {
-        Ok(actual) => actual == expected,
-        // A failed identity probe must not destroy a working cache: the next
-        // capture still appends, and a later probe repairs the view.
-        Err(_) => true,
-    }
-}
-
-/// Run `f` against the state of the session this process is serving, reloading
-/// the log when the host switched sessions or moved to another branch. Both the
-/// hydration and the identity probe call the host, which must never happen while
-/// `STATE` is held: a host call can re-enter a callback.
+/// Run `f` against the current session's branch cache. Host calls run outside
+/// `STATE` because they can re-enter a callback. Retry when another callback
+/// resets, replaces, or appends to the cache during either host query.
 fn with_state<T>(f: impl FnOnce(&mut State) -> T) -> Result<T, String> {
     let session = current_session();
-    let stale = {
-        let guard = STATE.lock().unwrap_or_else(|error| error.into_inner());
-        match guard.as_ref() {
-            Some(state) => !state_is_current(&session, state),
-            None => true,
+    loop {
+        let (revision, expected) = {
+            let cache = STATE.lock().unwrap_or_else(|error| error.into_inner());
+            let expected = cache
+                .state
+                .as_ref()
+                .filter(|state| state.session == session)
+                .map(|state| (state.memory.len() > 0).then(|| state.memory.end() - 1));
+            (cache.revision, expected)
+        };
+        // Keep a working cache when the identity probe fails transiently.
+        let current = expected
+            .is_some_and(|expected| branch_mark().map_or(true, |actual| actual == expected));
+        {
+            let mut cache = STATE.lock().unwrap_or_else(|error| error.into_inner());
+            if cache.revision != revision {
+                continue;
+            }
+            if let Some(state) = cache.state.as_mut().filter(|_| current) {
+                return Ok(f(state));
+            }
         }
-    };
-    if stale {
+
         let Hydrated {
             memory,
             compact,
@@ -370,32 +372,27 @@ fn with_state<T>(f: impl FnOnce(&mut State) -> T) -> Result<T, String> {
         if compact {
             compact::bind_session(&call_action);
         }
-        let mut guard = STATE.lock().unwrap_or_else(|error| error.into_inner());
-        let still_stale = match guard.as_ref() {
-            Some(state) => !state_is_current(&session, state),
-            None => true,
-        };
-        if still_stale {
-            *guard = Some(State {
-                session,
-                memory,
-                compact,
-                profile,
-                last: None,
-            });
+        let mut cache = STATE.lock().unwrap_or_else(|error| error.into_inner());
+        if cache.revision != revision {
+            continue;
         }
+        cache.revision += 1;
+        let state = cache.state.insert(State {
+            session,
+            memory,
+            compact,
+            profile,
+            last: None,
+        });
+        return Ok(f(state));
     }
-    let mut guard = STATE.lock().unwrap_or_else(|error| error.into_inner());
-    let state = guard
-        .as_mut()
-        .ok_or("OptChat memory state is unavailable")?;
-    Ok(f(state))
 }
 
 /// Drop the cached log: the session or its branch changed.
 fn reset_state() {
-    let mut guard = STATE.lock().unwrap_or_else(|error| error.into_inner());
-    *guard = None;
+    let mut cache = STATE.lock().unwrap_or_else(|error| error.into_inner());
+    cache.state = None;
+    cache.revision += 1;
 }
 
 fn with_memory<T>(f: impl FnOnce(&mut Memory) -> T) -> Result<T, String> {
@@ -539,26 +536,26 @@ fn persist_then_commit(
     // Commit into the state this entry was prepared from, without the branch
     // identity probe `with_state` runs: the probe would see the entry this call
     // just appended as a foreign change and reload the log underneath it.
-    let mut guard = STATE.lock().unwrap_or_else(|error| error.into_inner());
-    (|| {
-        let state = guard
-            .as_mut()
-            .ok_or("OptChat memory state is unavailable")?;
-        if state.session != session {
-            return Err("OptChat session changed while persisting an entry".to_string());
-        }
-        let committed = state.memory.append_prepared(entry)?;
-        // Retaining a window, not a prefix: past the cap the oldest messages
-        // fall out instead of new ones being dropped. Trimming in batches keeps
-        // the tree rebuild off the per-message path.
-        if state.memory.len() > MAX_ENTRIES {
-            state.memory.trim_to(MAX_ENTRIES - TRIM_SLACK);
-        }
-        if let Some(last) = last {
-            state.last = Some(last);
-        }
-        Ok(committed.i)
-    })()
+    let mut cache = STATE.lock().unwrap_or_else(|error| error.into_inner());
+    let state = cache
+        .state
+        .as_mut()
+        .ok_or("OptChat memory state is unavailable")?;
+    if state.session != session {
+        return Err("OptChat session changed while persisting an entry".to_string());
+    }
+    let committed = state.memory.append_prepared(entry)?;
+    // Retaining a window, not a prefix: past the cap the oldest messages
+    // fall out instead of new ones being dropped. Trimming in batches keeps
+    // the tree rebuild off the per-message path.
+    if state.memory.len() > MAX_ENTRIES {
+        state.memory.trim_to(MAX_ENTRIES - TRIM_SLACK);
+    }
+    if let Some(last) = last {
+        state.last = Some(last);
+    }
+    cache.revision += 1;
+    Ok(committed.i)
 }
 
 /// Log one message, then store it as a session custom entry. The entry is only
@@ -574,12 +571,19 @@ fn capture(
     if is_subagent() || text.trim().is_empty() {
         return Ok(());
     }
+    // The writer may be waiting for a host action that re-enters an observer.
+    // An automatic capture is best effort and must not wait on that writer.
+    let _gate = match APPEND_GATE.try_lock() {
+        Ok(guard) => guard,
+        Err(TryLockError::Poisoned(error)) => error.into_inner(),
+        Err(TryLockError::WouldBlock) => {
+            debug("skipped automatic capture while an OptChat append was in progress");
+            return Ok(());
+        }
+    };
     let millis = stamp.unwrap_or_else(now_ms);
     let date = iso8601(millis);
     let dedupe_text = text.clone();
-    let _gate = APPEND_GATE
-        .lock()
-        .unwrap_or_else(|error| error.into_inner());
     let session = current_session();
     let candidate = with_state(|state| {
         let duplicate = state

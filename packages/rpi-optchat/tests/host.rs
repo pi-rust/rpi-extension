@@ -31,11 +31,15 @@ static APPENDED: Mutex<Vec<Value>> = Mutex::new(Vec::new());
 static STATUS: Mutex<Vec<Value>> = Mutex::new(Vec::new());
 /// When set, `AppendEntry` fails, which must never lose or duplicate a message.
 static APPEND_FAILS: Mutex<bool> = Mutex::new(false);
+/// Deliver a message-end callback from inside the next append.
+static MESSAGE_DURING_APPEND: Mutex<Option<&str>> = Mutex::new(None);
 /// When false, the host answers `GetSessionBranch` without `filtered`, the way
 /// a host that ignores the query would.
 static HONORS_FILTER: Mutex<bool> = Mutex::new(true);
 /// Every `GetSessionBranch` query, so the shape a test relies on is asserted.
 static QUERIES: Mutex<Vec<Value>> = Mutex::new(Vec::new());
+/// Switch branches from inside the next query with this order.
+static SWITCH_ON_QUERY: Mutex<Option<&str>> = Mutex::new(None);
 
 fn lock() -> MutexGuard<'static, ()> {
     let guard = LOCK.lock().unwrap_or_else(|error| error.into_inner());
@@ -44,7 +48,9 @@ fn lock() -> MutexGuard<'static, ()> {
     *STATUS.lock().unwrap() = Vec::new();
     *QUERIES.lock().unwrap() = Vec::new();
     *APPEND_FAILS.lock().unwrap() = false;
+    *MESSAGE_DURING_APPEND.lock().unwrap() = None;
     *HONORS_FILTER.lock().unwrap() = true;
+    *SWITCH_ON_QUERY.lock().unwrap() = None;
     guard
 }
 
@@ -77,13 +83,31 @@ fn runtime_action(action, args, out, _user_data) {
     let id = RuntimeActionId::try_from(action).expect("plugin called an undeclared action");
     match id {
         RuntimeActionId::GetSessionBranch => {
-            out.write(get_session_branch(&args).to_string());
+            let snapshot = get_session_branch(&args);
+            let switch = {
+                let mut pending = SWITCH_ON_QUERY.lock().unwrap();
+                let matches = pending.is_some_and(|order| Some(order) == args["order"].as_str());
+                if matches {
+                    *pending = None;
+                }
+                matches
+            };
+            if switch {
+                BRANCH.lock().unwrap().clear();
+                seed(&[(0, "user", "new branch")]);
+                emit(EventTag::SessionTree, StablePluginEvent::empty(EventTag::SessionTree));
+            }
+            out.write(snapshot.to_string());
         }
         RuntimeActionId::AppendEntry => {
             if *APPEND_FAILS.lock().unwrap() {
                 // A rejecting host answers with a non-zero rc, not with a JSON error.
                 out.write(json!({"error": "the host refused the entry"}).to_string());
                 return 1;
+            }
+            let message = MESSAGE_DURING_APPEND.lock().unwrap().take();
+            if let Some(message) = message {
+                emit_assistant_message(message);
             }
             out.write(append_entry(&args).to_string());
         }
@@ -342,6 +366,29 @@ fn a_new_message_on_the_branch_reloads_the_log_instead_of_appending_past_it() {
 }
 
 #[test]
+fn a_tree_move_during_the_cached_branch_probe_reloads_the_new_branch() {
+    let _guard = start();
+    seed(&[(0, "user", "old branch")]);
+    assert!(text("view 5").contains("old branch"));
+    *SWITCH_ON_QUERY.lock().unwrap() = Some("newestFirst");
+
+    let view = text("view 5");
+    assert!(view.contains("new branch"), "{view}");
+    assert!(!view.contains("old branch"), "{view}");
+}
+
+#[test]
+fn a_tree_move_during_hydration_discards_the_stale_snapshot() {
+    let _guard = start();
+    seed(&[(0, "user", "old branch")]);
+    *SWITCH_ON_QUERY.lock().unwrap() = Some("oldestFirst");
+
+    let view = text("view 5");
+    assert!(view.contains("new branch"), "{view}");
+    assert!(!view.contains("old branch"), "{view}");
+}
+
+#[test]
 fn a_note_is_persisted_before_it_is_committed_and_keeps_its_id() {
     let _guard = start();
     let answer = text("note remember the bounded window");
@@ -410,6 +457,31 @@ fn a_message_end_is_captured_once_per_distinct_message() {
     );
     assert_eq!(APPENDED.lock().unwrap().len(), 2);
     assert!(text("status").contains("2 messages"));
+}
+
+fn emit_assistant_message(text: &str) {
+    let message = json!({"kind": "assistant", "content": text});
+    emit(
+        EventTag::MessageEnd,
+        StablePluginEvent::message(
+            EventTag::MessageEnd,
+            StbString::from_string(message.to_string()),
+        ),
+    );
+}
+
+#[test]
+fn a_capture_reentered_during_append_does_not_block_the_host() {
+    let _guard = start();
+    *MESSAGE_DURING_APPEND.lock().unwrap() = Some("reentered callback");
+    emit_assistant_message("first capture");
+    emit_assistant_message("later capture");
+
+    let appended = APPENDED.lock().unwrap();
+    assert_eq!(appended.len(), 2);
+    assert_eq!(appended[0]["data"]["text"], "first capture");
+    assert_eq!(appended[1]["data"]["text"], "later capture");
+    assert_eq!(appended[1]["data"]["i"], 1);
 }
 
 #[test]
