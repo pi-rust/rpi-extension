@@ -1,4 +1,4 @@
-#![forbid(unsafe_code)]
+#![deny(unsafe_code)]
 
 use feishu_sdk::core::{noop_logger, Config, FEISHU_BASE_URL, LARK_BASE_URL};
 use feishu_sdk::event::models::MessageEvent;
@@ -7,7 +7,9 @@ use feishu_sdk::event::{
 };
 use feishu_sdk::ws::{StreamClient, StreamConfig};
 use feishu_sdk::Client;
+use registration::{Registration, Worker};
 use rpi_plugin_sdk::handles::ToolHandles;
+use rpi_plugin_sdk::process::ProcessTree;
 use rpi_plugin_sdk::{
     EventTag, FreeStringFn, PluginApi, RuntimeActionId, StablePluginEvent, StableToolSchema,
     StbString, StbStringRef, StepHandle, StepResult, ToolPartialCb,
@@ -16,20 +18,24 @@ use serde_json::{json, Map, Value};
 use std::collections::{HashMap, VecDeque};
 use std::env;
 use std::io::{BufRead, BufReader, Read};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Command as ProcessCommand, Stdio};
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 use std::sync::mpsc::{self, Sender};
-use std::sync::{Arc, Condvar, Mutex, OnceLock};
+use std::sync::{Arc, Condvar, Mutex, OnceLock, Weak};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 #[cfg(test)]
 mod cardkit;
+mod lifecycle;
 mod progress;
+mod registration;
 mod sessions;
 mod wecom;
+
+pub use lifecycle::rpi_plugin_register;
 
 const EVENT_TYPE_MESSAGE: &str = "im.message.receive_v1";
 const MAX_MESSAGE_BYTES: usize = 1_048_576;
@@ -118,10 +124,8 @@ Channel output rules:
 // Reuse the SDK's host-context lifetime and thread-safety contract.
 type StartupContext = PluginApi;
 
-static HOST_RUNTIME: OnceLock<StartupContext> = OnceLock::new();
+// Child replies can resolve to the same on-disk session in different registrations.
 static PRINT_PROCESS_LOCK: Mutex<()> = Mutex::new(());
-static AUTO_REPLY_LOCK: Mutex<()> = Mutex::new(());
-static ACTIVE_PROGRESS: Mutex<Option<Arc<ReplyProgress>>> = Mutex::new(None);
 
 struct ReplyProgress {
     run_id: u64,
@@ -150,42 +154,51 @@ impl ReplyProgress {
     }
 }
 
-struct ProgressScope;
-
-impl ProgressScope {
-    fn enter(progress: Arc<ReplyProgress>) -> Self {
-        if let Ok(mut active) = ACTIVE_PROGRESS.lock() {
-            *active = Some(progress);
-        }
-        Self
-    }
-}
+struct ProgressScope(Arc<ReplyProgress>);
 
 impl Drop for ProgressScope {
     fn drop(&mut self) {
-        if let Ok(mut active) = ACTIVE_PROGRESS.lock() {
-            if let Some(progress) = active.take() {
-                if let Ok(mut state) = progress.state.lock() {
-                    for update in state.finish() {
-                        let _ = progress.commands.send(Command::Progress {
-                            run_id: progress.run_id,
-                            conversation_id: progress.conversation_id.clone(),
-                            tool_call_id: update.tool_call_id,
-                            text: update.text,
-                        });
-                    }
-                }
-                let _ = progress.commands.send(Command::ProgressDone {
+        let progress = &self.0;
+        if let Ok(mut state) = progress.state.lock() {
+            for update in state.finish() {
+                let _ = progress.commands.send(Command::Progress {
                     run_id: progress.run_id,
+                    conversation_id: progress.conversation_id.clone(),
+                    tool_call_id: update.tool_call_id,
+                    text: update.text,
                 });
             }
+        }
+        let _ = progress.commands.send(Command::ProgressDone {
+            run_id: progress.run_id,
+        });
+    }
+}
+
+struct ActiveReply<'a>(&'a Registration);
+
+impl<'a> ActiveReply<'a> {
+    fn enter(registration: &'a Registration, progress: Arc<ReplyProgress>) -> Self {
+        if let Ok(mut active) = registration.active_progress.lock() {
+            *active = Some(progress);
+        }
+        Self(registration)
+    }
+}
+
+impl Drop for ActiveReply<'_> {
+    fn drop(&mut self) {
+        if let Ok(mut active) = self.0.active_progress.lock() {
+            *active = None;
         }
     }
 }
 
 rpi_plugin_sdk::event_handler! {
-fn on_tool_progress(event, _user_data) {
-    let active = ACTIVE_PROGRESS
+fn on_tool_progress(event, user_data) {
+    let Some(registration) = registration::callback(user_data) else { return 0; };
+    if registration.is_stopping() { return 0; }
+    let active = registration.active_progress
         .lock()
         .ok()
         .and_then(|active| active.clone());
@@ -213,27 +226,6 @@ fn on_tool_progress(event, _user_data) {
 }
 }
 static ACK_REACTION_COUNTER: AtomicU64 = AtomicU64::new(0);
-static ACTIVE_CHANNEL_PROMPT: Mutex<Option<&'static str>> = Mutex::new(None);
-
-struct ChannelPromptScope;
-
-impl ChannelPromptScope {
-    fn enter(prompt: &'static str) -> Self {
-        if let Ok(mut active) = ACTIVE_CHANNEL_PROMPT.lock() {
-            *active = Some(prompt);
-        }
-        Self
-    }
-}
-
-impl Drop for ChannelPromptScope {
-    fn drop(&mut self) {
-        if let Ok(mut active) = ACTIVE_CHANNEL_PROMPT.lock() {
-            *active = None;
-        }
-    }
-}
-
 const ACK_REACTIONS: [(&str, &str); 3] = [("了解", "OK"), ("敲键盘", "Typing"), ("冲！", "JIAYI")];
 
 #[derive(Clone, Debug)]
@@ -489,7 +481,7 @@ fn home_dir() -> Option<PathBuf> {
         .map(PathBuf::from)
 }
 
-fn config_path() -> Result<PathBuf, String> {
+fn config_path(workspace: &Path) -> Result<PathBuf, String> {
     if let Some(path) = env::var_os("RPI_IM_CONFIG") {
         let path = PathBuf::from(path);
         if !path.is_absolute() {
@@ -497,10 +489,7 @@ fn config_path() -> Result<PathBuf, String> {
         }
         return Ok(path);
     }
-    let project = env::current_dir()
-        .map_err(|error| format!("failed to resolve current directory: {error}"))?
-        .join(".rpi")
-        .join("im.json");
+    let project = workspace.join(".rpi/im.json");
     if project.is_file() {
         return Ok(project);
     }
@@ -509,8 +498,8 @@ fn config_path() -> Result<PathBuf, String> {
         .ok_or_else(|| "cannot resolve home directory for ~/.rpi/agent/im.json".into())
 }
 
-fn load_profile(requested: Option<&str>) -> Result<(PathBuf, Profile), String> {
-    let path = config_path()?;
+fn load_profile(workspace: &Path, requested: Option<&str>) -> Result<(PathBuf, Profile), String> {
+    let path = config_path(workspace)?;
     let text = std::fs::read_to_string(&path)
         .map_err(|error| format!("could not read IM config {}: {error}", path.display()))?;
     if text.len() > MAX_MESSAGE_BYTES {
@@ -536,11 +525,12 @@ fn load_profile(requested: Option<&str>) -> Result<(PathBuf, Profile), String> {
 
 struct RuntimeState {
     profile: Profile,
+    workspace: PathBuf,
     queue: Mutex<VecDeque<Value>>,
     queue_ready: Condvar,
     status: Mutex<ServerStatus>,
     recent_messages: Mutex<VecDeque<String>>,
-    host_runtime: Option<StartupContext>,
+    registration: Weak<Registration>,
 }
 
 const MAX_RECENT_MESSAGES: usize = 1024;
@@ -553,9 +543,19 @@ struct ServerStatus {
 }
 
 impl RuntimeState {
+    #[cfg(test)]
     fn new(profile: Profile) -> Self {
+        Self::with_registration(profile, env::current_dir().unwrap(), Weak::new())
+    }
+
+    fn with_registration(
+        profile: Profile,
+        workspace: PathBuf,
+        registration: Weak<Registration>,
+    ) -> Self {
         Self {
             profile,
+            workspace,
             queue: Mutex::new(VecDeque::new()),
             queue_ready: Condvar::new(),
             status: Mutex::new(ServerStatus {
@@ -564,7 +564,7 @@ impl RuntimeState {
                 dropped: 0,
             }),
             recent_messages: Mutex::new(VecDeque::new()),
-            host_runtime: HOST_RUNTIME.get().copied(),
+            registration,
         }
     }
 
@@ -676,8 +676,12 @@ impl RuntimeState {
 }
 
 rpi_plugin_sdk::string_handler! {
-fn on_before_agent_start(event_json, out, _user_data) {
-    let channel_prompt = ACTIVE_CHANNEL_PROMPT.lock().ok().and_then(|active| *active);
+fn on_before_agent_start(event_json, out, user_data) {
+    let channel_prompt = registration::callback(user_data)
+        .filter(|registration| !registration.is_stopping())
+        .and_then(|registration| {
+            registration.active_progress.lock().ok()?.as_ref().map(|reply| reply.system_prompt)
+        });
     let Some(channel_prompt) = channel_prompt else {
         if out.is_available() {
             out.write("{}".into());
@@ -808,7 +812,24 @@ fn validate_feishu_response(label: &str, status: u16, body: &[u8]) -> Result<Val
     }
 }
 
+const PRINT_POLL_INTERVAL: Duration = Duration::from_millis(20);
+
+fn wait_for_print(registration: &Registration, duration: Duration) -> Result<(), String> {
+    let deadline = Instant::now() + duration;
+    while !registration.is_stopping() {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Ok(());
+        }
+        thread::sleep(remaining.min(PRINT_POLL_INTERVAL));
+    }
+    Err("rpi print process cancelled".into())
+}
+
+#[allow(clippy::too_many_arguments)]
 fn invoke_print_process(
+    registration: &Registration,
+    workspace: &Path,
     prompt: &str,
     provider: &str,
     conversation_id: &str,
@@ -817,9 +838,20 @@ fn invoke_print_process(
     timeout: Duration,
     progress: Arc<ReplyProgress>,
 ) -> Result<Value, String> {
-    let _guard = PRINT_PROCESS_LOCK
-        .lock()
-        .map_err(|_| "rpi print process lock is poisoned".to_string())?;
+    // Selected IM sessions can be used by multiple registrations. Serialize
+    // the subprocess writer, but let a closing owner leave the queue promptly.
+    let _guard = loop {
+        wait_for_print(registration, Duration::ZERO)?;
+        match PRINT_PROCESS_LOCK.try_lock() {
+            Ok(guard) => break guard,
+            Err(std::sync::TryLockError::WouldBlock) => {
+                wait_for_print(registration, PRINT_POLL_INTERVAL)?;
+            }
+            Err(std::sync::TryLockError::Poisoned(_)) => {
+                return Err("rpi print process lock is poisoned".into());
+            }
+        }
+    };
     let session_id = selected_session
         .map(str::to_owned)
         .unwrap_or_else(|| conversation_session_id(provider, conversation_id));
@@ -840,12 +872,24 @@ fn invoke_print_process(
         &env::args().skip(1).collect::<Vec<_>>(),
     ));
     args.push(prompt.to_owned());
-    let mut child = ProcessCommand::new("rpi")
+    let mut command = ProcessCommand::new("rpi");
+    command
         .args(&args)
+        .current_dir(workspace)
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+        .stderr(Stdio::piped());
+    ProcessTree::prepare(&mut command);
+    let mut child = command
         .spawn()
         .map_err(|error| format!("failed to start rpi print process: {error}"))?;
+    let tree = match ProcessTree::attach(&child) {
+        Ok(tree) => tree,
+        Err(error) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(error);
+        }
+    };
     let stdout = child.stdout.take().ok_or("rpi stdout pipe is missing")?;
     let mut stderr = child.stderr.take().ok_or("rpi stderr pipe is missing")?;
     // Drain both pipes while the process runs: waiting before reading can fill
@@ -857,30 +901,38 @@ fn invoke_print_process(
         let mut text = String::new();
         stderr.read_to_string(&mut text).map(|_| text)
     });
-    let status = match wait_timeout::ChildExt::wait_timeout(&mut child, timeout) {
-        Ok(Some(status)) => Ok(status),
-        Ok(None) => {
-            let _ = child.kill();
-            let _ = child.wait();
-            Err(format!(
+    let deadline = Instant::now() + timeout;
+    let status = loop {
+        if registration.is_stopping() {
+            break Err("rpi print process cancelled".into());
+        }
+        match child.try_wait() {
+            Ok(Some(status)) => break Ok(status),
+            Ok(None) => {}
+            Err(error) => break Err(format!("failed waiting for rpi print process: {error}")),
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            break Err(format!(
                 "rpi print process timed out after {} seconds",
                 timeout.as_secs()
-            ))
+            ));
         }
-        Err(error) => {
-            let _ = child.kill();
-            let _ = child.wait();
-            Err(format!("failed waiting for rpi print process: {error}"))
-        }
+        thread::sleep(remaining.min(PRINT_POLL_INTERVAL));
     };
-    let output = output_reader
-        .join()
-        .map_err(|_| "rpi stdout reader panicked")??;
-    let stderr = error_reader
-        .join()
+    // Close inherited pipes even if a child process outlived the direct rpi process.
+    tree.kill();
+    if status.is_err() {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+    let output = output_reader.join();
+    let stderr = error_reader.join();
+    let status = status?;
+    let output = output.map_err(|_| "rpi stdout reader panicked")??;
+    let stderr = stderr
         .map_err(|_| "rpi stderr reader panicked")?
         .map_err(|error| error.to_string())?;
-    let status = status?;
     if !status.success() {
         return Err(if stderr.trim().is_empty() {
             output
@@ -978,7 +1030,10 @@ fn auto_reply_content(text: &str) -> Value {
     json!({"type": if markdown.is_match(text) { "markdown" } else { "text" }, "text": text})
 }
 
+#[allow(clippy::too_many_arguments)]
 fn invoke_print_with_retry(
+    registration: &Registration,
+    workspace: &Path,
     prompt: &str,
     provider: &str,
     conversation_id: &str,
@@ -990,6 +1045,8 @@ fn invoke_print_with_retry(
     let mut last_error = None;
     for attempt in 0..3 {
         match invoke_print_process(
+            registration,
+            workspace,
             prompt,
             provider,
             conversation_id,
@@ -1007,7 +1064,7 @@ fn invoke_print_with_retry(
                     error,
                     delay.as_secs()
                 );
-                thread::sleep(delay);
+                wait_for_print(registration, delay)?;
                 last_error = Some(error);
             }
             Err(error) => return Err(error),
@@ -1117,9 +1174,7 @@ impl EventHandler for MessageHandler {
                     .or_else(|| id.user_id.clone())
                     .or_else(|| id.union_id.clone())
             });
-            let session_store_path = env::current_dir()
-                .map(|cwd| cwd.join(".rpi").join("im-sessions.json"))
-                .map_err(|error| error.to_string());
+            let session_store_path = state.workspace.join(".rpi/im-sessions.json");
             let mention_keys = message
                 .message
                 .mentions
@@ -1130,24 +1185,13 @@ impl EventHandler for MessageHandler {
                 .collect::<Vec<_>>();
             let command_text = session_command_text(&text, &mention_keys);
             if auto_reply_text {
-                let command = match &session_store_path {
-                    Ok(path) => sessions::command(
-                        path,
-                        &state.profile.provider,
-                        &state.profile.name,
-                        &chat_id,
-                        &command_text,
-                    ),
-                    Err(error)
-                        if matches!(
-                            command_text.split_whitespace().next(),
-                            Some("/new" | "/sessions" | "/session")
-                        ) =>
-                    {
-                        Some(Err(error.clone()))
-                    }
-                    Err(_) => None,
-                };
+                let command = sessions::command(
+                    &session_store_path,
+                    &state.profile.provider,
+                    &state.profile.name,
+                    &chat_id,
+                    &command_text,
+                );
                 if let Some(result) = command {
                     let reply = result.unwrap_or_else(|error| format!("会话指令失败：{error}"));
                     let _ = commands.send(Command::SendAsync {
@@ -1174,14 +1218,12 @@ impl EventHandler for MessageHandler {
             }));
 
             if auto_reply_text && !command_text.is_empty() {
-                let selected_session = match session_store_path.and_then(|path| {
-                    sessions::selected(
-                        &path,
-                        &state.profile.provider,
-                        &state.profile.name,
-                        &chat_id,
-                    )
-                }) {
+                let selected_session = match sessions::selected(
+                    &session_store_path,
+                    &state.profile.provider,
+                    &state.profile.name,
+                    &chat_id,
+                ) {
                     Ok(selected) => selected,
                     Err(error) => {
                         let _ = commands.send(Command::SendAsync {
@@ -1217,13 +1259,21 @@ fn schedule_auto_reply(
     reply_to: Option<String>,
 ) {
     let message_id = message_id.to_owned();
-    let Some(runtime) = state.host_runtime else {
+    let Some((registration, runtime)) = state
+        .registration
+        .upgrade()
+        .and_then(|registration| Some((registration.clone(), registration.host?)))
+    else {
         eprintln!("rpi-im-message: autoReply is enabled but the rpi runtime bridge is unavailable");
         return;
     };
+    if registration.is_stopping() {
+        return;
+    }
     let prompt = text.to_owned();
     let conversation_id = chat_id.to_owned();
     let process_conversation_id = chat_id.to_owned();
+    let workspace = state.workspace.clone();
     let process_provider = state.profile.provider.clone();
     let process_model = state.profile.auto_reply_model.clone();
     let process_timeout = state.profile.auto_reply_timeout;
@@ -1242,30 +1292,40 @@ fn schedule_auto_reply(
     );
     tokio::spawn(async move {
         let generated = tokio::task::spawn_blocking(move || {
-            let _reply_lock = AUTO_REPLY_LOCK.lock().map_err(|_| "auto reply lock is poisoned".to_owned())?;
-            let _progress_scope = ProgressScope::enter(progress.clone());
-            let _prompt_scope = ChannelPromptScope::enter(progress.system_prompt);
+            let _reply_lock = registration.reply_lock.lock().map_err(|_| "auto reply lock is poisoned".to_owned())?;
+            if registration.is_stopping() {
+                return Err("IM message registration is shutting down".into());
+            }
+            let _progress_scope = ProgressScope(progress.clone());
             // Explicit IM session selection uses its own child process
             // even when the host has a harness, avoiding a hot-switch
             // of the user's interactive host session.
             if selected_session.is_some() {
                 return invoke_print_with_retry(
+                    &registration,
+                    &workspace,
                     &prompt, &process_provider, &process_conversation_id, selected_session.as_deref(),
                     process_model.as_deref(), process_timeout, progress,
                 );
             }
-            match invoke_runtime_action(
-                &runtime,
-                RuntimeActionId::SendUserMessage,
-                &json!({"text": prompt.clone()}),
-            ) {
+            let result = {
+                let _active_reply = ActiveReply::enter(&registration, progress.clone());
+                invoke_runtime_action(
+                    &runtime,
+                    RuntimeActionId::SendUserMessage,
+                    &json!({"text": prompt.clone()}),
+                )
+            };
+            match result {
                 Ok(result) => Ok(result),
-                Err(error) if error.contains("before harness was built") => {
+                Err(error) if !registration.is_stopping() && error.contains("before harness was built") => {
                     eprintln!(
                         "rpi-im-message: host harness is not ready; using rpi print fallback model={}"
                         , process_model.as_deref().unwrap_or("<rpi default>")
                     );
                     invoke_print_with_retry(
+                        &registration,
+                        &workspace,
                         &prompt,
                         &process_provider,
                         &process_conversation_id,
@@ -1383,12 +1443,11 @@ struct Server {
     id: String,
     state: Arc<RuntimeState>,
     commands: tokio::sync::mpsc::UnboundedSender<Command>,
-    join: Mutex<Option<thread::JoinHandle<()>>>,
+    worker: Option<Arc<Worker>>,
     // Keep the reservation while registered, even if the connection exits.
     _bot_reservation: Option<Arc<WecomBotReservation>>,
 }
 
-static SERVERS: OnceLock<Mutex<HashMap<String, Arc<Server>>>> = OnceLock::new();
 static WECOM_BOTS: OnceLock<Mutex<HashMap<String, String>>> = OnceLock::new();
 
 struct WecomBotReservation {
@@ -1434,21 +1493,30 @@ fn reserve_wecom_bot(
 }
 static NEXT_SERVER_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
-fn servers() -> &'static Mutex<HashMap<String, Arc<Server>>> {
-    SERVERS.get_or_init(|| Mutex::new(HashMap::new()))
-}
-
-fn start_server(params: &Value) -> Result<Value, String> {
+fn start_server(registration: &Arc<Registration>, params: &Value) -> Result<Value, String> {
     let profile_name = match params.get("profile") {
         None => None,
         Some(Value::String(value)) if !value.trim().is_empty() => Some(value.as_str()),
         Some(_) => return Err("profile must be a non-empty string".into()),
     };
-    let (config_file, profile) = load_profile(profile_name)?;
-    start_server_with_profile(config_file, profile, Duration::from_secs(10))
+    let workspace = match params[rpi_plugin_sdk::HOST_CONTEXT_KEY]["cwd"].as_str() {
+        Some(cwd) if Path::new(cwd).is_absolute() => PathBuf::from(cwd),
+        _ => env::current_dir()
+            .map_err(|error| format!("failed to resolve current directory: {error}"))?,
+    };
+    let (config_file, profile) = load_profile(&workspace, profile_name)?;
+    start_server_with_profile(
+        registration,
+        workspace,
+        config_file,
+        profile,
+        Duration::from_secs(10),
+    )
 }
 
 fn start_server_with_profile(
+    registration: &Arc<Registration>,
+    workspace: PathBuf,
     config_file: PathBuf,
     profile: Profile,
     startup_timeout: Duration,
@@ -1458,13 +1526,17 @@ fn start_server_with_profile(
     // worker own a lease, so a timeout cannot release it while work is alive.
     let bot_reservation = reserve_wecom_bot(&profile, &id)?;
     let worker_reservation = bot_reservation.clone();
-    let state = Arc::new(RuntimeState::new(profile.clone()));
+    let state = Arc::new(RuntimeState::with_registration(
+        profile.clone(),
+        workspace,
+        Arc::downgrade(registration),
+    ));
     let (commands, command_rx) = tokio::sync::mpsc::unbounded_channel();
     let command_sender_for_runtime = commands.clone();
     let (ready_tx, ready_rx) = mpsc::sync_channel(1);
     let thread_state = Arc::clone(&state);
     let thread_id = id.clone();
-    let join = thread::spawn(move || {
+    let worker = registration.spawn(commands.clone(), move || {
         let _bot_reservation = worker_reservation;
         let runtime = match tokio::runtime::Builder::new_multi_thread()
             .enable_all()
@@ -1487,20 +1559,18 @@ fn start_server_with_profile(
             command_sender_for_runtime,
             ready_tx,
         ));
-        // run_server already asked its tasks to stop; do not let a leaked
-        // spawn_blocking auto-reply task keep the server thread (and stop)
-        // waiting for the full model/process timeout. Remaining blocking work
-        // may outlive the server, but it can no longer delay shutdown.
-        shutdown_runtime(runtime, RUNTIME_SHUTDOWN_TIMEOUT);
+        // Only the worker waits for all Tokio work. Tool stop has a bounded
+        // wait; lifecycle cleanup keeps this join handle as evidence of exit.
+        drop(runtime);
         if let Err(error) = result {
             eprintln!("rpi-im-message server stopped: {error}");
         }
-    });
+    })?;
 
     match ready_rx.recv_timeout(startup_timeout) {
         Ok(Ok(())) => {}
         Ok(Err(error)) => {
-            let _ = join.join();
+            worker.join_until(Instant::now() + RUNTIME_SHUTDOWN_TIMEOUT);
             return Err(error);
         }
         Err(_) => {
@@ -1516,7 +1586,7 @@ fn start_server_with_profile(
         id: id.clone(),
         state,
         commands,
-        join: Mutex::new(Some(join)),
+        worker: Some(worker),
         _bot_reservation: bot_reservation,
     });
     let response = json!({
@@ -1528,23 +1598,18 @@ fn start_server_with_profile(
         "transport": "long_connection",
         "autoReply": server.state.profile.auto_reply
     });
-    let registry = servers().lock();
+    let registry = registration.servers.lock();
     match registry {
-        Ok(mut registry) => {
+        Ok(mut registry) if !registration.is_stopping() => {
             registry.insert(server.id.clone(), server);
         }
+        Ok(_) => return Err("IM message registration is shutting down".into()),
         Err(_) => {
-            // Do not leave an untracked worker running just because the
-            // process-wide registry is poisoned.
             let _ = stop_server(server);
             return Err("IM server registry is poisoned".into());
         }
     }
     Ok(response)
-}
-
-fn shutdown_runtime(runtime: tokio::runtime::Runtime, timeout: Duration) {
-    runtime.shutdown_timeout(timeout);
 }
 
 async fn run_server(
@@ -1881,8 +1946,9 @@ fn string_param(params: &Value, key: &str) -> Result<String, String> {
         .ok_or_else(|| format!("{key} is required"))
 }
 
-fn server_by_id(id: &str) -> Result<Arc<Server>, String> {
-    servers()
+fn server_by_id(registration: &Registration, id: &str) -> Result<Arc<Server>, String> {
+    registration
+        .servers
         .lock()
         .map_err(|_| "IM server registry is poisoned")?
         .get(id)
@@ -1905,15 +1971,16 @@ fn stop_server(server: Arc<Server>) -> Result<(), String> {
             Err(mpsc::RecvTimeoutError::Disconnected) => {}
         }
     }
-    if let Ok(mut join) = server.join.lock() {
-        if let Some(handle) = join.take() {
-            let _ = handle.join();
-        }
+    if let Some(worker) = &server.worker {
+        worker.join_until(Instant::now() + RUNTIME_SHUTDOWN_TIMEOUT);
     }
     Ok(())
 }
 
-fn im_message_server(params: &Value) -> Result<Value, String> {
+fn im_message_server(registration: &Arc<Registration>, params: &Value) -> Result<Value, String> {
+    if registration.is_stopping() {
+        return Err("IM message registration is shutting down".into());
+    }
     if !params.is_object() {
         return Err("IM message tool parameters must be a JSON object".into());
     }
@@ -1923,9 +1990,10 @@ fn im_message_server(params: &Value) -> Result<Value, String> {
         Some(_) => return Err("action must be a non-empty string".into()),
     };
     match action {
-        "start" => start_server(params),
+        "start" => start_server(registration, params),
         "list" => {
-            let values = servers()
+            let values = registration
+                .servers
                 .lock()
                 .map_err(|_| "IM server registry is poisoned")?
                 .values()
@@ -1935,17 +2003,17 @@ fn im_message_server(params: &Value) -> Result<Value, String> {
         }
         "status" => {
             let id = string_param(params, "serverId")?;
-            let server = server_by_id(&id)?;
+            let server = server_by_id(registration, &id)?;
             Ok(server.state.status_value(&id))
         }
         "receive" => {
             let id = string_param(params, "serverId")?;
-            let server = server_by_id(&id)?;
+            let server = server_by_id(registration, &id)?;
             server.state.receive(timeout_seconds(params)?)
         }
         "send" => {
             let id = string_param(params, "serverId")?;
-            let server = server_by_id(&id)?;
+            let server = server_by_id(registration, &id)?;
             let conversation_id = match params.get("conversationId") {
                 None => server.state.profile.default_conversation_id.clone(),
                 Some(Value::String(value)) if value.trim().is_empty() => {
@@ -1985,7 +2053,8 @@ fn im_message_server(params: &Value) -> Result<Value, String> {
         }
         "stop" => {
             let id = string_param(params, "serverId")?;
-            let server = servers()
+            let server = registration
+                .servers
                 .lock()
                 .map_err(|_| "IM server registry is poisoned")?
                 .remove(&id)
@@ -1994,19 +2063,6 @@ fn im_message_server(params: &Value) -> Result<Value, String> {
             Ok(json!({"id": id, "state": "stopped"}))
         }
         _ => Err("action must be one of: start, status, list, receive, send, stop".into()),
-    }
-}
-
-fn stop_all_servers() {
-    let servers = match servers().lock() {
-        Ok(mut registry) => registry
-            .drain()
-            .map(|(_, server)| server)
-            .collect::<Vec<_>>(),
-        Err(_) => return,
-    };
-    for server in servers {
-        let _ = stop_server(server);
     }
 }
 
@@ -2041,7 +2097,7 @@ fn cli_flag_enabled(value: &Value) -> bool {
     }
 }
 
-fn auto_start_from_cli(context: &StartupContext) -> ! {
+fn auto_start_from_cli(registration: &Arc<Registration>, context: &StartupContext) -> ! {
     let enabled = match cli_flag_value(context, SERVER_FLAG) {
         Ok(value) => cli_flag_enabled(&value),
         Err(error) => {
@@ -2071,7 +2127,7 @@ fn auto_start_from_cli(context: &StartupContext) -> ! {
     if let Some(profile) = profile {
         params["profile"] = Value::String(profile);
     }
-    match start_server(&params) {
+    match start_server(registration, &params) {
         Ok(response) => {
             eprintln!("rpi-im-message: server started: {response}");
             eprintln!("rpi-im-message: headless mode is running; press Ctrl+C to stop");
@@ -2087,9 +2143,11 @@ fn auto_start_from_cli(context: &StartupContext) -> ! {
     }
 }
 
-extern "C" fn on_session_shutdown(event: StablePluginEvent, _: *mut std::ffi::c_void) -> i32 {
+extern "C" fn on_session_shutdown(event: StablePluginEvent, owner: *mut std::ffi::c_void) -> i32 {
     if event.tag == EventTag::SessionShutdown {
-        stop_all_servers();
+        if let Some(registration) = registration::callback(owner) {
+            registration.shutdown(RUNTIME_SHUTDOWN_TIMEOUT);
+        }
     }
     0
 }
@@ -2097,11 +2155,12 @@ extern "C" fn on_session_shutdown(event: StablePluginEvent, _: *mut std::ffi::c_
 static HANDLES: ToolHandles<Drive> = ToolHandles::new();
 
 struct Drive {
+    registration: Option<Arc<Registration>>,
     params: Value,
     done: bool,
 }
 
-extern "C" fn execute(
+extern "C" fn execute<const SLOT: usize>(
     _: StbStringRef,
     params: StbString,
     free: Option<FreeStringFn>,
@@ -2109,6 +2168,7 @@ extern "C" fn execute(
     let text = params.to_string_lossy();
     params.free_with(free);
     HANDLES.insert(Drive {
+        registration: registration::tool(SLOT),
         params: serde_json::from_str(&text).unwrap_or(Value::Null),
         done: false,
     })
@@ -2139,7 +2199,12 @@ extern "C" fn poll(
         ));
     }
     drive.done = true;
-    match im_message_server(&drive.params) {
+    let Some(registration) = &drive.registration else {
+        return StepResult::err(StbString::from_string(
+            "IM message registration is unavailable".into(),
+        ));
+    };
+    match im_message_server(registration, &drive.params) {
         Ok(value) => StepResult::done(StbString::from_string(
             json!({"content":[{"type":"text","text":value.to_string()}],"details":value})
                 .to_string(),
@@ -2157,54 +2222,108 @@ extern "C" fn destroy(handle: StepHandle) {
 }
 
 use rpi_plugin_sdk::callbacks::free_string;
-rpi_plugin_sdk::export_plugin!(|api| {
-    // This workspace also contains reqwest/tokio-rustls users that enable the
-    // `ring` provider. Feishu's SDK enables `aws-lc-rs`, so rustls cannot infer
-    // a process-wide provider once both are present. Install the provider used
-    // by this extension before the SDK creates any TLS client.
+
+// Managed servers, reply progress and join handles are owned by the registration.
+#[allow(unsafe_code)] // Export the shared-session marker symbol.
+#[no_mangle]
+pub extern "C" fn rpi_plugin_shared_sessions_v1() {}
+
+fn register(api: &PluginApi, lifecycle: Option<lifecycle::Register>) -> i32 {
+    // Feishu uses aws-lc-rs. Install it before either provider creates TLS clients.
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+    let registration = Arc::new(Registration::new(Some(*api)));
+    let slot = match registration::install(registration.clone(), lifecycle) {
+        Ok(slot) => slot,
+        Err(code) => return code,
+    };
+    let table: [rpi_plugin_sdk::ToolExecuteFn; registration::SLOTS] =
+        lifecycle::execute_table!(execute);
+    let execute = table
+        .get(slot)
+        .copied()
+        .unwrap_or(execute::<{ registration::SLOTS }>);
+    let result = register_callbacks(api, registration::token(&registration), execute);
+    if result != 0 {
+        registration::discard_failed_legacy(slot);
+        return result;
+    }
+    if api.register_flag.is_some()
+        && cli_flag_value(api, SERVER_FLAG)
+            .as_ref()
+            .is_ok_and(cli_flag_enabled)
+    {
+        if lifecycle.is_some() {
+            // The process-attached entrypoint parks and may exit the process.
+            // Shared Host and conflicting stdio owners reject this claim.
+            let result = api.declare.map_or(1, |declare| {
+                declare(StbStringRef::from_str(r#"{"ownsStdio":true}"#))
+            });
+            if result != 0 {
+                return result;
+            }
+        }
+        auto_start_from_cli(&registration, api);
+    }
+    0
+}
+
+fn register_callbacks(
+    api: &PluginApi,
+    owner: *mut std::ffi::c_void,
+    execute: rpi_plugin_sdk::ToolExecuteFn,
+) -> i32 {
     let Some(register_tool) = api.register_tool else {
         return 1;
     };
     let schema = Box::new(tool_schema());
     let result = register_tool(&*schema, execute, poll, cancel, destroy, free_string);
     drop(schema);
-    // Headless startup parks forever, so register progress handlers first.
-    if let Some(register_event) = api.register_event_handler {
-        for tag in [EventTag::ToolExecutionStart, EventTag::ToolExecutionEnd] {
-            let _ = register_event(tag, on_tool_progress, std::ptr::null_mut());
-        }
+    if result != 0 {
+        return result;
     }
-    if let Some(register_flag) = api.register_flag {
-        let _ = register_flag(
-            StbStringRef::from_str(SERVER_FLAG),
-            StbStringRef::from_str("Start the Feishu/Lark message server without opening the TUI"),
-        );
-        let _ = register_flag(
-            StbStringRef::from_str(PROFILE_FLAG),
-            StbStringRef::from_str("Select the rpi-im-message profile for headless startup"),
-        );
-        let context = Box::new(*api);
-        let _ = HOST_RUNTIME.set(*context);
-        let context = Box::leak(context);
-        if let Ok(value) = cli_flag_value(context, SERVER_FLAG) {
-            if cli_flag_enabled(&value) {
-                auto_start_from_cli(context);
+    if let Some(register_event) = api.register_event_handler {
+        for (tag, callback) in [
+            (
+                EventTag::ToolExecutionStart,
+                on_tool_progress as rpi_plugin_sdk::EventHandlerFn,
+            ),
+            (EventTag::ToolExecutionEnd, on_tool_progress),
+            (EventTag::SessionShutdown, on_session_shutdown),
+        ] {
+            let code = register_event(tag, callback, owner);
+            if code != 0 {
+                return code;
             }
         }
     }
-    if let Some(register_event) = api.register_event_handler {
-        let _ = register_event(
-            EventTag::SessionShutdown,
-            on_session_shutdown,
-            std::ptr::null_mut(),
-        );
-    }
     if let Some(register_prompt) = api.register_before_agent_start {
-        let _ = register_prompt(on_before_agent_start, free_string, api.user_data);
+        let code = register_prompt(on_before_agent_start, free_string, owner);
+        if code != 0 {
+            return code;
+        }
     }
-    result
-});
+    if let Some(register_flag) = api.register_flag {
+        for (name, description) in [
+            (
+                SERVER_FLAG,
+                "Start the Feishu/Lark message server without opening the TUI",
+            ),
+            (
+                PROFILE_FLAG,
+                "Select the rpi-im-message profile for headless startup",
+            ),
+        ] {
+            let code = register_flag(
+                StbStringRef::from_str(name),
+                StbStringRef::from_str(description),
+            );
+            if code != 0 {
+                return code;
+            }
+        }
+    }
+    0
+}
 
 #[cfg(test)]
 mod tests {
@@ -2349,6 +2468,7 @@ mod tests {
 
     #[test]
     fn send_rejects_non_string_conversation_id_before_enqueue() {
+        let registration = Arc::new(Registration::new(None));
         let id = "rpi-im-bad-conversation-test";
         let (commands, mut receiver) = tokio::sync::mpsc::unbounded_channel();
         let mut profile = feishu_test_state(false).profile.clone();
@@ -2357,14 +2477,21 @@ mod tests {
             id: id.into(),
             state: Arc::new(RuntimeState::new(profile)),
             commands,
-            join: Mutex::new(None),
+            worker: None,
             _bot_reservation: None,
         });
-        servers().lock().unwrap().insert(id.into(), server);
-        let error = im_message_server(&json!({"action":"send","serverId":id,
-            "conversationId":42,"content":{"type":"text","text":"must not send"}}))
+        registration
+            .servers
+            .lock()
+            .unwrap()
+            .insert(id.into(), server);
+        let error = im_message_server(
+            &registration,
+            &json!({"action":"send","serverId":id,
+            "conversationId":42,"content":{"type":"text","text":"must not send"}}),
+        )
         .unwrap_err();
-        servers().lock().unwrap().remove(id);
+        registration.servers.lock().unwrap().remove(id);
         assert_eq!(error, "conversationId must be a string");
         assert!(
             receiver.try_recv().is_err(),
@@ -2374,27 +2501,33 @@ mod tests {
 
     #[test]
     fn invalid_send_timeout_never_enqueues_a_message() {
+        let registration = Arc::new(Registration::new(None));
         let id = "rpi-im-invalid-timeout-test";
         let (commands, mut receiver) = tokio::sync::mpsc::unbounded_channel();
         let server = Arc::new(Server {
             id: id.into(),
             state: feishu_test_state(false),
             commands,
-            join: Mutex::new(None),
+            worker: None,
             _bot_reservation: None,
         });
-        servers().lock().unwrap().insert(id.into(), server);
+        registration
+            .servers
+            .lock()
+            .unwrap()
+            .insert(id.into(), server);
         let errors: Vec<_> = [0, 301]
             .into_iter()
             .map(|timeout| {
                 im_message_server(
+                    &registration,
                     &json!({"action":"send","serverId":id,"conversationId":"oc_a",
                 "content":{"type":"text","text":"must not send"},"timeoutSeconds":timeout}),
                 )
                 .unwrap_err()
             })
             .collect();
-        servers().lock().unwrap().remove(id);
+        registration.servers.lock().unwrap().remove(id);
         assert!(errors.iter().all(|error| error.contains("timeoutSeconds")));
         assert!(
             receiver.try_recv().is_err(),
@@ -2778,6 +2911,7 @@ mod tests {
 
     #[test]
     fn action_parameters_keep_runtime_defaults_and_missing_id_errors() {
+        let registration = Arc::new(Registration::new(None));
         for invalid in [
             Value::Null,
             json!([]),
@@ -2785,10 +2919,14 @@ mod tests {
             json!({"action":123}),
             json!({"action":"  "}),
         ] {
-            assert!(im_message_server(&invalid).is_err(), "accepted {invalid}");
+            assert!(
+                im_message_server(&registration, &invalid).is_err(),
+                "accepted {invalid}"
+            );
         }
         assert_eq!(
-            im_message_server(&json!({"action":"start","profile":false})).unwrap_err(),
+            im_message_server(&registration, &json!({"action":"start","profile":false}))
+                .unwrap_err(),
             "profile must be a non-empty string"
         );
         assert_eq!(
@@ -2806,16 +2944,19 @@ mod tests {
         }
         for action in ["status", "receive", "send", "stop"] {
             assert_eq!(
-                im_message_server(&json!({"action":action})).unwrap_err(),
+                im_message_server(&registration, &json!({"action":action})).unwrap_err(),
                 "serverId is required"
             );
             assert_eq!(
-                im_message_server(&json!({"action":action,"serverId":"  ","__rpi":{}}))
-                    .unwrap_err(),
+                im_message_server(
+                    &registration,
+                    &json!({"action":action,"serverId":"  ","__rpi":{}})
+                )
+                .unwrap_err(),
                 "serverId is required"
             );
         }
-        assert!(im_message_server(&json!({"action":"unknown"})).is_err());
+        assert!(im_message_server(&registration, &json!({"action":"unknown"})).is_err());
     }
 
     #[test]
@@ -3107,29 +3248,6 @@ mod tests {
     }
 
     #[test]
-    fn runtime_shutdown_does_not_wait_for_blocking_work() {
-        let runtime = tokio::runtime::Builder::new_multi_thread()
-            .enable_all()
-            .worker_threads(1)
-            .build()
-            .unwrap();
-        let (started_tx, started_rx) = mpsc::channel();
-        runtime.spawn_blocking(move || {
-            let _ = started_tx.send(());
-            thread::sleep(Duration::from_secs(10));
-        });
-        started_rx
-            .recv_timeout(Duration::from_secs(1))
-            .expect("blocking task did not start");
-        let start = Instant::now();
-        shutdown_runtime(runtime, Duration::from_millis(50));
-        assert!(
-            start.elapsed() < Duration::from_secs(1),
-            "runtime shutdown waited for blocking work"
-        );
-    }
-
-    #[test]
     fn stopping_an_already_finished_server_succeeds() {
         let profile = Profile::from_value(
             "test",
@@ -3141,8 +3259,8 @@ mod tests {
         let server = Arc::new(Server {
             id: "rpi-im-1".into(),
             state: Arc::new(RuntimeState::new(profile)),
-            commands,
-            join: Mutex::new(Some(thread::spawn(|| {}))),
+            commands: commands.clone(),
+            worker: Some(Registration::new(None).spawn(commands, || {}).unwrap()),
             _bot_reservation: None,
         });
         assert!(stop_server(server).is_ok());
@@ -3156,21 +3274,24 @@ mod tests {
         )
         .unwrap();
         let (commands, mut receiver) = tokio::sync::mpsc::unbounded_channel::<Command>();
-        let worker = thread::spawn(move || {
-            let queued = receiver.blocking_recv().unwrap();
-            assert!(matches!(queued, Command::Stop { .. }));
-            // Simulate a connection failure that exits without acknowledging Stop.
-            drop(queued);
-        });
+        let registration = Registration::new(None);
+        let worker = registration
+            .spawn(commands.clone(), move || {
+                let queued = receiver.blocking_recv().unwrap();
+                assert!(matches!(queued, Command::Stop { .. }));
+                // Simulate a connection failure that exits without acknowledging Stop.
+                drop(queued);
+            })
+            .unwrap();
         let server = Arc::new(Server {
             id: "rpi-im-stop-race".into(),
             state: Arc::new(RuntimeState::new(profile)),
             commands,
-            join: Mutex::new(Some(worker)),
+            worker: Some(worker.clone()),
             _bot_reservation: None,
         });
         assert!(stop_server(server.clone()).is_ok());
-        assert!(server.join.lock().unwrap().is_none());
+        assert!(worker.join_until(Instant::now()));
     }
 
     #[test]

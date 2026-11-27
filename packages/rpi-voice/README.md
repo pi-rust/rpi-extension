@@ -181,8 +181,8 @@ export OPENAI_API_KEY=sk-xxx
 ## Build
 
 ```bash
-# API-only (default; no native STT deps)
-cargo build -p rpi-voice --release
+# API-only (no native STT deps)
+cargo build -p rpi-voice --release --no-default-features
 
 # with embedded offline STT (see "Embedded offline model" above for env vars)
 cargo build -p rpi-voice --release --features local-stt
@@ -198,6 +198,10 @@ The official musl prebuilt is not currently published for this crate. `rpi-voice
 remains available on GNU Linux, while its ALSA, native-tls/OpenSSL and bundled
 sherpa-onnx native dependencies are qualified for musl. The musl release CI
 skips this crate rather than publishing an incomplete or incompatible archive.
+
+## Shared Unix Host
+
+API-only builds on GNU/Linux (`--no-default-features`) opt in to shared plugin images. Voice settings, callbacks, and workers belong to each registration. Registrations in a shared image take turns using the microphone and speakers. The default `local-stt` build and other targets use private images while native audio and recognizer teardown are qualified.
 
 ## Push-to-talk
 

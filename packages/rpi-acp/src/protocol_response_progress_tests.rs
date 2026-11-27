@@ -71,7 +71,8 @@ async fn dispatcher_resolves_committed_write_before_unrelated_opener_finishes() 
             let entered_b = entered_b.clone();
             let release_b = release_b.clone();
             let b_finished = b_finished.clone();
-            move |id, _cwd, servers| {
+            move |id, _cwd, saved, servers| {
+                assert!(saved.is_none());
                 assert!(servers.is_empty());
                 let index = opens.fetch_add(1, Ordering::SeqCst);
                 let workers = workers.clone();

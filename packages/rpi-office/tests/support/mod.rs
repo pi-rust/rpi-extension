@@ -2,9 +2,7 @@
 //!
 //! Provides a `PluginApi` whose registrars record what the plugin registers, a
 //! runtime-action double for the actions this extension uses, and helpers to
-//! invoke the registered command/event/prompt callbacks. Each test binary gets
-//! its own copy (and therefore its own statics), which is what keeps the
-//! plugin's process-wide state isolated between test binaries.
+//! invoke the registered callbacks with their original host or plugin context.
 #![allow(dead_code)]
 
 use rpi_plugin_sdk::{
@@ -14,7 +12,9 @@ use rpi_plugin_sdk::{
     StbStringRef, ToolCancelFn, ToolDestroyFn, ToolExecuteFn, ToolPollFn,
 };
 use serde_json::{json, Value};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::cell::Cell;
+use std::collections::HashMap;
+use std::ffi::c_void;
 use std::sync::Mutex;
 
 pub const ABI: u32 = rpi_plugin_sdk::RPI_PLUGIN_ABI_VERSION_UNIFIED;
@@ -28,24 +28,48 @@ pub struct RegisteredTool {
     pub destroy: ToolDestroyFn,
 }
 
-static TOOLS: Mutex<Vec<(String, String, Value, RegisteredTool)>> = Mutex::new(Vec::new());
-static EVENTS: Mutex<Vec<(EventTag, EventHandlerFn)>> = Mutex::new(Vec::new());
-static COMMANDS: Mutex<Vec<(String, CommandHandlerFn)>> = Mutex::new(Vec::new());
-static FLAGS: Mutex<Vec<String>> = Mutex::new(Vec::new());
-static PROMPT: Mutex<Option<BeforeAgentStartFn>> = Mutex::new(None);
-static ACTIVE: Mutex<Vec<String>> = Mutex::new(Vec::new());
-static STATUS: Mutex<Option<String>> = Mutex::new(None);
-static SENT: Mutex<Vec<String>> = Mutex::new(Vec::new());
-static PROMPTS: Mutex<Vec<(String, Value)>> = Mutex::new(Vec::new());
-static LIFECYCLE: Mutex<Option<(PluginBeginShutdownFn, PluginFinishShutdownFn)>> = Mutex::new(None);
-static ABORTS: AtomicU64 = AtomicU64::new(0);
-static AUTOCOMPLETE: Mutex<Option<AutocompleteProviderFn>> = Mutex::new(None);
-static COMMAND_COMPLETIONS: Mutex<Vec<(String, CommandArgumentCompletionFn)>> =
-    Mutex::new(Vec::new());
+type Lifecycle = (PluginBeginShutdownFn, PluginFinishShutdownFn, usize);
+type Tool = (String, String, Value, RegisteredTool);
 
-/// Copy a host-owned string lent to a registration callback.
-fn borrowed_text(value: &StbString) -> String {
-    rpi_plugin_sdk::stb_text!(*value)
+#[derive(Default)]
+struct Host {
+    tools: Vec<Tool>,
+    events: Vec<(EventTag, EventHandlerFn, usize)>,
+    commands: Vec<(String, CommandHandlerFn)>,
+    flags: Vec<String>,
+    prompt: Option<(BeforeAgentStartFn, usize)>,
+    active: Vec<String>,
+    status: Option<String>,
+    prompts: Vec<(String, Value)>,
+    lifecycle: Option<Lifecycle>,
+    aborts: u64,
+    autocomplete: Option<(AutocompleteProviderFn, usize)>,
+    command_completions: Vec<(String, CommandArgumentCompletionFn, usize)>,
+}
+
+static HOSTS: Mutex<Option<HashMap<usize, Host>>> = Mutex::new(None);
+static SENT: Mutex<Vec<(usize, String)>> = Mutex::new(Vec::new());
+
+thread_local! {
+    // Registration APIs such as register_tool have no owner argument. Native
+    // supplies their context on the registration thread as this harness does.
+    static OWNER: Cell<usize> = const { Cell::new(0) };
+}
+
+pub fn select_host(owner: usize) {
+    OWNER.set(owner);
+}
+
+fn host_for<R>(owner: usize, f: impl FnOnce(&mut Host) -> R) -> R {
+    let mut hosts = HOSTS.lock().unwrap();
+    f(hosts
+        .get_or_insert_with(HashMap::new)
+        .entry(owner)
+        .or_default())
+}
+
+fn host<R>(f: impl FnOnce(&mut Host) -> R) -> R {
+    host_for(OWNER.get(), f)
 }
 
 #[allow(unsafe_code)] // the host is the side that dereferences the schema
@@ -55,38 +79,41 @@ extern "C" fn register_tool(
     poll: ToolPollFn,
     cancel: ToolCancelFn,
     destroy: ToolDestroyFn,
-    _free: FreeStringFn,
+    free: FreeStringFn,
 ) -> i32 {
     // SAFETY: this test harness plays the host, so it dereferences the schema
     // pointer the plugin just handed over. Nothing else here needs `unsafe`:
     // the strings are copied out with the SDK's own reading macro.
     let schema = unsafe { &*schema };
-    let name = borrowed_text(&schema.name);
-    let description = borrowed_text(&schema.description);
+    let name = rpi_plugin_sdk::stb_take!(schema.name, Some(free));
+    let description = rpi_plugin_sdk::stb_take!(schema.description, Some(free));
     let parameters: Value =
-        serde_json::from_str(&borrowed_text(&schema.parameters)).expect("valid tool schema");
-    TOOLS.lock().unwrap().push((
-        name.clone(),
-        description,
-        parameters,
-        RegisteredTool {
-            execute,
-            poll,
-            cancel,
-            destroy,
-        },
-    ));
-    // A real host activates every registered tool by default.
-    ACTIVE.lock().unwrap().push(name);
+        serde_json::from_str(&rpi_plugin_sdk::stb_take!(schema.parameters, Some(free)))
+            .expect("valid tool schema");
+    host(|host| {
+        // A real host activates every registered tool by default.
+        host.active.push(name.clone());
+        host.tools.push((
+            name.clone(),
+            description,
+            parameters,
+            RegisteredTool {
+                execute,
+                poll,
+                cancel,
+                destroy,
+            },
+        ));
+    });
     0
 }
 
 extern "C" fn register_event(
     tag: EventTag,
     handler: EventHandlerFn,
-    _user_data: *mut std::ffi::c_void,
+    user_data: *mut c_void,
 ) -> i32 {
-    EVENTS.lock().unwrap().push((tag, handler));
+    host(|host| host.events.push((tag, handler, user_data as usize)));
     0
 }
 
@@ -96,13 +123,13 @@ extern "C" fn register_command(
     handler: CommandHandlerFn,
 ) -> i32 {
     let name = rpi_plugin_sdk::stb_text!(name);
-    COMMANDS.lock().unwrap().push((name, handler));
+    host(|host| host.commands.push((name, handler)));
     0
 }
 
 extern "C" fn register_flag(name: StbStringRef, _description: StbStringRef) -> i32 {
     let name = rpi_plugin_sdk::stb_text!(name);
-    FLAGS.lock().unwrap().push(name);
+    host(|host| host.flags.push(name));
     0
 }
 
@@ -110,25 +137,25 @@ extern "C" fn register_tool_prompt(name: StbStringRef, metadata: StbStringRef) -
     let name = rpi_plugin_sdk::stb_text!(name);
     let metadata: Value = serde_json::from_str(&rpi_plugin_sdk::stb_text!(metadata))
         .expect("prompt metadata is JSON");
-    PROMPTS.lock().unwrap().push((name, metadata));
+    host(|host| host.prompts.push((name, metadata)));
     0
 }
 
 extern "C" fn register_plugin_lifecycle(
     begin: PluginBeginShutdownFn,
     finish: PluginFinishShutdownFn,
-    _user_data: *mut std::ffi::c_void,
+    user_data: *mut c_void,
 ) -> i32 {
-    *LIFECYCLE.lock().unwrap() = Some((begin, finish));
+    host(|host| host.lifecycle = Some((begin, finish, user_data as usize)));
     0
 }
 
 extern "C" fn register_autocomplete_provider(
     handler: AutocompleteProviderFn,
     _free: FreeStringFn,
-    _user_data: *mut std::ffi::c_void,
+    user_data: *mut c_void,
 ) -> i32 {
-    *AUTOCOMPLETE.lock().unwrap() = Some(handler);
+    host(|host| host.autocomplete = Some((handler, user_data as usize)));
     0
 }
 
@@ -136,24 +163,27 @@ extern "C" fn register_command_completions(
     name: StbStringRef,
     handler: CommandArgumentCompletionFn,
     _free: FreeStringFn,
-    _user_data: *mut std::ffi::c_void,
+    user_data: *mut c_void,
 ) -> i32 {
     let name = rpi_plugin_sdk::stb_text!(name);
-    COMMAND_COMPLETIONS.lock().unwrap().push((name, handler));
+    host(|host| {
+        host.command_completions
+            .push((name, handler, user_data as usize))
+    });
     0
 }
 
 extern "C" fn register_before_agent_start(
     handler: BeforeAgentStartFn,
     _free: FreeStringFn,
-    _user_data: *mut std::ffi::c_void,
+    user_data: *mut c_void,
 ) -> i32 {
-    *PROMPT.lock().unwrap() = Some(handler);
+    host(|host| host.prompt = Some((handler, user_data as usize)));
     0
 }
 
 rpi_plugin_sdk::string_handler! {
-fn runtime_action(action, args, out, _user_data) {
+fn runtime_action(action, args, out, user_data) {
     let args: Value = serde_json::from_str(args).unwrap_or(Value::Null);
     let id = RuntimeActionId::try_from(action).expect("known runtime action");
     match id {
@@ -161,7 +191,7 @@ fn runtime_action(action, args, out, _user_data) {
             out.write(json!({"value": Value::Null}).to_string());
         }
         RuntimeActionId::GetActiveTools => {
-            let tools = ACTIVE.lock().unwrap().clone();
+            let tools = host_for(user_data as usize, |host| host.active.clone());
             out.write(json!({"tools": tools}).to_string());
         }
         RuntimeActionId::SetActiveTools => {
@@ -171,15 +201,17 @@ fn runtime_action(action, args, out, _user_data) {
                 .iter()
                 .map(|value| value.as_str().unwrap().to_string())
                 .collect();
-            *ACTIVE.lock().unwrap() = tools;
+            host_for(user_data as usize, |host| host.active = tools);
             out.write(json!({"ok": true}).to_string());
         }
         RuntimeActionId::SetStatus => {
-            *STATUS.lock().unwrap() = args.get("value").and_then(Value::as_str).map(str::to_owned);
+            host_for(user_data as usize, |host| {
+                host.status = args.get("value").and_then(Value::as_str).map(str::to_owned);
+            });
             out.write(json!({"ok": true}).to_string());
         }
         RuntimeActionId::Abort => {
-            ABORTS.fetch_add(1, Ordering::SeqCst);
+            host_for(user_data as usize, |host| host.aborts += 1);
             out.write(
                 json!({"aborted": true, "runId": "run-test", "steer": [], "followUp": []})
                     .to_string(),
@@ -189,7 +221,7 @@ fn runtime_action(action, args, out, _user_data) {
             SENT
                 .lock()
                 .unwrap()
-                .push(args["text"].as_str().unwrap_or_default().to_string());
+                .push((user_data as usize, args["text"].as_str().unwrap_or_default().to_string()));
             out.write(json!({"status": "queued"}).to_string());
         }
         other => panic!("unexpected runtime action: {other:?}"),
@@ -234,68 +266,77 @@ pub fn api() -> PluginApi {
 
 /// Register the plugin against the fake host.
 pub fn register_plugin() {
-    assert_eq!(rpi_office::rpi_plugin_register(&api()), 0);
+    register_plugin_for(0);
+}
+
+pub fn register_plugin_for(owner: usize) {
+    select_host(owner);
+    let mut api = api();
+    api.user_data = owner as *mut c_void;
+    assert_eq!(rpi_office::rpi_plugin_register(&api), 0);
 }
 
 /// `(name, description, parameters, callbacks)` for every registered tool.
 pub fn tools() -> Vec<(String, String, Value, RegisteredTool)> {
-    TOOLS.lock().unwrap().clone()
+    host(|host| host.tools.clone())
 }
 
 pub fn tool(name: &str) -> Option<(String, Value, RegisteredTool)> {
-    TOOLS
-        .lock()
-        .unwrap()
-        .iter()
-        .find(|(registered, _, _, _)| registered == name)
-        .map(|(_, description, parameters, callbacks)| {
-            (description.clone(), parameters.clone(), *callbacks)
-        })
+    host(|host| {
+        host.tools
+            .iter()
+            .find(|(registered, _, _, _)| registered == name)
+            .map(|(_, description, parameters, callbacks)| {
+                (description.clone(), parameters.clone(), *callbacks)
+            })
+    })
 }
 
 /// Registered `(name, handler)` command pairs.
 pub fn commands() -> Vec<(String, CommandHandlerFn)> {
-    COMMANDS.lock().unwrap().clone()
+    host(|host| host.commands.clone())
 }
 
 pub fn flags() -> Vec<String> {
-    FLAGS.lock().unwrap().clone()
+    host(|host| host.flags.clone())
 }
 
 pub fn active_tools() -> Vec<String> {
-    ACTIVE.lock().unwrap().clone()
+    host(|host| host.active.clone())
 }
 
 pub fn status() -> Option<String> {
-    STATUS.lock().unwrap().clone()
+    host(|host| host.status.clone())
 }
 
 /// `(tool name, metadata)` pairs registered through `register_tool_prompt`.
 pub fn prompts() -> Vec<(String, Value)> {
-    PROMPTS.lock().unwrap().clone()
+    host(|host| host.prompts.clone())
 }
 
-pub fn lifecycle_hooks() -> Option<(PluginBeginShutdownFn, PluginFinishShutdownFn)> {
-    *LIFECYCLE.lock().unwrap()
+pub fn lifecycle_hooks() -> Option<Lifecycle> {
+    host(|host| host.lifecycle)
 }
 
 /// Whether an autocomplete provider was registered.
 pub fn autocomplete_registered() -> bool {
-    AUTOCOMPLETE.lock().unwrap().is_some()
+    host(|host| host.autocomplete.is_some())
 }
 
 /// Registered `(command name, handler)` argument-completion pairs.
 pub fn command_completions() -> Vec<(String, CommandArgumentCompletionFn)> {
-    COMMAND_COMPLETIONS.lock().unwrap().clone()
+    host(|host| {
+        host.command_completions
+            .iter()
+            .map(|(name, f, _)| (name.clone(), *f))
+            .collect()
+    })
 }
 
 /// Invoke the autocomplete provider with a fake editor query; returns `None`
 /// when the provider declined (return code 1 / empty output).
 pub fn run_autocomplete(text: &str, line_prefix: &str) -> Option<Value> {
-    let handler = AUTOCOMPLETE
-        .lock()
-        .unwrap()
-        .expect("autocomplete registered");
+    let (handler, cookie) = host(|host| host.autocomplete).expect("autocomplete registered");
     let query = json!({
         "text": text,
         "cursor": line_prefix.len(),
@@ -307,7 +348,7 @@ pub fn run_autocomplete(text: &str, line_prefix: &str) -> Option<Value> {
     let rc = handler(
         StbStringRef::from_str(&query),
         &mut out,
-        std::ptr::null_mut(),
+        cookie as *mut c_void,
     );
     // SAFETY: the provider produced `out`; read then free it exactly once.
     let text = rpi_plugin_sdk::stb_take!(
@@ -322,19 +363,19 @@ pub fn run_autocomplete(text: &str, line_prefix: &str) -> Option<Value> {
 
 /// Invoke a command's argument completions; returns `None` when it declines.
 pub fn run_command_completions(command: &str, prefix: &str) -> Option<Value> {
-    let handler = COMMAND_COMPLETIONS
-        .lock()
-        .unwrap()
-        .iter()
-        .find(|(name, _)| name == command)
-        .map(|(_, handler)| *handler)
-        .unwrap_or_else(|| panic!("no argument completions for /{command}"));
+    let (handler, cookie) = host(|host| {
+        host.command_completions
+            .iter()
+            .find(|(name, _, _)| name == command)
+            .map(|(_, handler, cookie)| (*handler, *cookie))
+    })
+    .unwrap_or_else(|| panic!("no argument completions for /{command}"));
     let args = json!({"argumentPrefix": prefix}).to_string();
     let mut out = StbString::empty();
     let rc = handler(
         StbStringRef::from_str(&args),
         &mut out,
-        std::ptr::null_mut(),
+        cookie as *mut c_void,
     );
     // SAFETY: the handler produced `out`; read then free it exactly once.
     let text = rpi_plugin_sdk::stb_take!(
@@ -349,41 +390,53 @@ pub fn run_command_completions(command: &str, prefix: &str) -> Option<Value> {
 
 /// How many `RuntimeActionId::Abort` calls the plugin made.
 pub fn abort_count() -> u64 {
-    ABORTS.load(Ordering::SeqCst)
+    host(|host| host.aborts)
 }
 
 /// Invoke the registered `begin_shutdown` hook (non-blocking half).
 pub fn run_begin_shutdown() {
-    let (begin, _) = lifecycle_hooks().expect("lifecycle hooks registered");
-    begin(std::ptr::null_mut());
+    let (begin, _, context) = lifecycle_hooks().expect("lifecycle hooks registered");
+    begin(context as *mut std::ffi::c_void);
 }
 
 /// Invoke the registered `finish_shutdown` hook and return its status.
 pub fn run_finish_shutdown() -> i32 {
-    let (_, finish) = lifecycle_hooks().expect("lifecycle hooks registered");
-    finish(std::ptr::null_mut())
+    let (_, finish, context) = lifecycle_hooks().expect("lifecycle hooks registered");
+    finish(context as *mut std::ffi::c_void)
 }
 
 /// Texts injected into the session via `SendMessage`/`SendUserMessage`.
 pub fn sent_messages() -> Vec<String> {
-    SENT.lock().unwrap().clone()
+    SENT.lock()
+        .unwrap()
+        .iter()
+        .map(|(_, text)| text.clone())
+        .collect()
+}
+
+pub fn sent_message_owners() -> Vec<usize> {
+    SENT.lock()
+        .unwrap()
+        .iter()
+        .map(|(owner, _)| *owner)
+        .collect()
 }
 
 /// Invoke a registered slash command and return its JSON response.
 pub fn run_command(name: &str, args: &str) -> Value {
-    let handler = COMMANDS
-        .lock()
-        .unwrap()
-        .iter()
-        .find(|(registered, _)| registered == name)
-        .map(|(_, handler)| *handler)
-        .unwrap_or_else(|| panic!("command /{name} is not registered"));
+    let handler = host(|host| {
+        host.commands
+            .iter()
+            .find(|(registered, _)| registered == name)
+            .map(|(_, handler)| *handler)
+    })
+    .unwrap_or_else(|| panic!("command /{name} is not registered"));
     let input = json!({"command": name, "args": args}).to_string();
     let mut out = StbString::empty();
     let rc = handler(
         StbStringRef::from_str(&input),
         &mut out,
-        std::ptr::null_mut(),
+        OWNER.get() as *mut c_void,
     );
     // SAFETY: the host produced `out`; read then free it exactly once.
     let text = rpi_plugin_sdk::stb_take!(
@@ -396,14 +449,14 @@ pub fn run_command(name: &str, args: &str) -> Value {
 
 /// Dispatch an event to the handler registered for `tag`.
 pub fn run_event(tag: EventTag, event: StablePluginEvent) -> i32 {
-    let handler = EVENTS
-        .lock()
-        .unwrap()
-        .iter()
-        .find(|(registered, _)| *registered == tag)
-        .map(|(_, handler)| *handler)
-        .unwrap_or_else(|| panic!("no handler for {tag:?}"));
-    handler(event, std::ptr::null_mut())
+    let (handler, cookie) = host(|host| {
+        host.events
+            .iter()
+            .find(|(registered, _, _)| *registered == tag)
+            .map(|(_, handler, cookie)| (*handler, *cookie))
+    })
+    .unwrap_or_else(|| panic!("no handler for {tag:?}"));
+    handler(event, cookie as *mut c_void)
 }
 
 /// Dispatch an empty-payload event (SessionStart, AgentSettled, …).
@@ -422,16 +475,13 @@ pub fn run_message_event(tag: EventTag, payload: Value) {
 
 /// Run the registered `before_agent_start` transformer.
 pub fn run_before_agent_start(system_prompt: &str) -> Option<String> {
-    let handler = PROMPT
-        .lock()
-        .unwrap()
-        .expect("prompt transformer registered");
+    let (handler, cookie) = host(|host| host.prompt).expect("prompt transformer registered");
     let input = json!({"systemPrompt": system_prompt, "imageCount": 0}).to_string();
     let mut out = StbString::empty();
     let rc = handler(
         StbStringRef::from_str(&input),
         &mut out,
-        std::ptr::null_mut(),
+        cookie as *mut c_void,
     );
     // SAFETY: the host produced `out`; read then free it exactly once.
     let text = rpi_plugin_sdk::stb_take!(

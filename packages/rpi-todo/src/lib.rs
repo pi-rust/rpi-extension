@@ -1,7 +1,11 @@
-#![forbid(unsafe_code)]
-// The SDK's safe export macro owns the raw-pointer ABI boundary.
+#![deny(unsafe_code)]
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
+mod lifecycle;
+
+pub use lifecycle::rpi_plugin_register;
+
+use rpi_plugin_sdk::callbacks::{free_string, Output};
 use rpi_plugin_sdk::handles::ToolHandles;
 use rpi_plugin_sdk::{
     EventHandlerFn, EventTag, FreeStringFn, PluginApi, RuntimeActionId, StableToolSchema,
@@ -9,19 +13,41 @@ use rpi_plugin_sdk::{
 };
 use serde_json::{json, Value};
 use std::ffi::c_void;
-use std::sync::{Mutex, OnceLock};
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc, Mutex, MutexGuard,
+};
 
 const TOOL: &str = "todo";
 const TODO_ENTRY: &str = "todo-state";
 
-// Reuse the SDK's host-context lifetime and thread-safety contract.
-type Runtime = PluginApi;
+struct Registration {
+    runtime: PluginApi,
+    store: Mutex<Store>,
+    // Serialize restore and persistence without holding the store during host
+    // calls. Only an explicit session reload can clear blocked recovery.
+    commit_gate: Mutex<()>,
+    stopping: AtomicBool,
+}
 
-static RUNTIME: OnceLock<Runtime> = OnceLock::new();
-static TODOS: OnceLock<Mutex<Store>> = OnceLock::new();
-// Serialize branch recovery and candidate commits, without holding the state
-// mutex during host calls. Only explicit session reloads may clear a blocked store.
-static COMMIT_GATE: Mutex<()> = Mutex::new(());
+impl Registration {
+    fn new(runtime: PluginApi) -> Self {
+        Self {
+            runtime,
+            store: Mutex::new(Store::default()),
+            commit_gate: Mutex::new(()),
+            stopping: AtomicBool::new(false),
+        }
+    }
+
+    fn enter(&self) -> Result<MutexGuard<'_, ()>, String> {
+        let gate = self.commit_gate.lock().unwrap_or_else(|p| p.into_inner());
+        if self.stopping.load(Ordering::Acquire) {
+            return Err("todo registration is shutting down".into());
+        }
+        Ok(gate)
+    }
+}
 
 #[derive(Default)]
 struct Store {
@@ -51,10 +77,6 @@ struct Todo {
     in_progress: bool,
 }
 
-fn state() -> &'static Mutex<Store> {
-    TODOS.get_or_init(|| Mutex::new(Store::default()))
-}
-
 #[derive(Debug)]
 enum RuntimeFailure {
     Rejected(String),
@@ -66,31 +88,6 @@ impl RuntimeFailure {
         match self {
             Self::Rejected(message) | Self::InvalidResponse(message) => message,
         }
-    }
-}
-
-fn call_runtime(id: RuntimeActionId, args: Value) -> Result<Value, RuntimeFailure> {
-    let runtime = *RUNTIME
-        .get()
-        .ok_or_else(|| RuntimeFailure::Rejected("todo runtime is unavailable".into()))?;
-    let mut out = StbString::empty();
-    let input_json = args.to_string();
-    let input = StbStringRef::from_str(&input_json);
-    let rc = (runtime.runtime_action)(id.into(), input, &mut out, runtime.user_data);
-    let text = out.to_string_lossy();
-    (runtime.free_string)(out);
-    if rc != 0 {
-        return Err(RuntimeFailure::Rejected(if text.is_empty() {
-            "runtime action failed".into()
-        } else {
-            text
-        }));
-    }
-    if text.trim().is_empty() {
-        Ok(Value::Null)
-    } else {
-        serde_json::from_str(&text)
-            .map_err(|e| RuntimeFailure::InvalidResponse(format!("invalid runtime response: {e}")))
     }
 }
 
@@ -122,83 +119,169 @@ fn state_json(state: &TodoState) -> Value {
     json!({"todos": state.todos.iter().map(|todo| json!({"id":todo.id,"text":todo.text,"done":todo.done,"status":if todo.done {"completed"} else if todo.in_progress {"in_progress"} else {"pending"}})).collect::<Vec<_>>(), "nextId": state.next_id})
 }
 
-// Caller holds COMMIT_GATE. A failed restore must not expose state from the
-// previous branch or allow an implicit retry on the next tool invocation.
-fn restore_from_branch() -> Result<(), String> {
-    let restored = (|| {
-        let value = call_runtime(
-            RuntimeActionId::GetSessionBranch,
-            json!({"customTypes": [TODO_ENTRY], "order": "newestFirst", "limit": 1}),
-        )
-        .map_err(RuntimeFailure::message)?;
-        if value.get("filtered").and_then(Value::as_bool) != Some(true) {
-            return Err("branch response did not confirm filtered: true".to_string());
+impl Registration {
+    fn call_runtime(&self, id: RuntimeActionId, args: Value) -> Result<Value, RuntimeFailure> {
+        let runtime = &self.runtime;
+        let mut out = StbString::empty();
+        let input_json = args.to_string();
+        let input = StbStringRef::from_str(&input_json);
+        let rc = (runtime.runtime_action)(id.into(), input, &mut out, runtime.user_data);
+        let text = out.to_string_lossy();
+        (runtime.free_string)(out);
+        if rc != 0 {
+            return Err(RuntimeFailure::Rejected(if text.is_empty() {
+                "runtime action failed".into()
+            } else {
+                text
+            }));
         }
-        let entries = value
-            .get("entries")
-            .and_then(Value::as_array)
-            .ok_or("branch response has no entries array")?;
-        if entries.len() > 1 {
-            return Err("branch response exceeded snapshot limit".to_string());
-        }
-        let Some(entry) = entries.first() else {
-            return Ok(TodoState::default());
-        };
-        if entry.get("type").and_then(Value::as_str) != Some("custom")
-            || entry.get("customType").and_then(Value::as_str) != Some(TODO_ENTRY)
-        {
-            return Err("branch response contains an unexpected entry".to_string());
-        }
-        parse_todos(entry.get("data").unwrap_or(&Value::Null))
-            .ok_or_else(|| "invalid todo-state snapshot".to_string())
-    })();
-    let mut store = state().lock().unwrap_or_else(|p| p.into_inner());
-    match restored {
-        Ok(restored) => {
-            store.committed = restored;
-            store.recovery = Recovery::Ready;
-            Ok(())
-        }
-        Err(error) => {
-            let error = format!(
-                "todo restore failed: {error}; explicitly reload the session before retrying"
-            );
-            store.recovery = Recovery::Blocked(error.clone());
-            Err(error)
+        if text.trim().is_empty() {
+            Ok(Value::Null)
+        } else {
+            serde_json::from_str(&text).map_err(|e| {
+                RuntimeFailure::InvalidResponse(format!("invalid runtime response: {e}"))
+            })
         }
     }
-}
 
-// Caller holds COMMIT_GATE. Navigation need not dispatch SessionTree, so every
-// unblocked use reads the latest self-contained snapshot on the current branch.
-fn current_state() -> Result<TodoState, String> {
-    {
-        let store = state().lock().unwrap_or_else(|p| p.into_inner());
-        if let Recovery::Blocked(error) = &store.recovery {
-            return Err(error.clone());
+    // Caller holds the commit gate. A failed restore must not expose state from the
+    // previous branch or allow an implicit retry on the next tool invocation.
+    fn restore_from_branch(&self) -> Result<(), String> {
+        let restored = (|| {
+            let value = self
+                .call_runtime(
+                    RuntimeActionId::GetSessionBranch,
+                    json!({"customTypes": [TODO_ENTRY], "order": "newestFirst", "limit": 1}),
+                )
+                .map_err(RuntimeFailure::message)?;
+            if value.get("filtered").and_then(Value::as_bool) != Some(true) {
+                return Err("branch response did not confirm filtered: true".to_string());
+            }
+            let entries = value
+                .get("entries")
+                .and_then(Value::as_array)
+                .ok_or("branch response has no entries array")?;
+            if entries.len() > 1 {
+                return Err("branch response exceeded snapshot limit".to_string());
+            }
+            let Some(entry) = entries.first() else {
+                return Ok(TodoState::default());
+            };
+            if entry.get("type").and_then(Value::as_str) != Some("custom")
+                || entry.get("customType").and_then(Value::as_str) != Some(TODO_ENTRY)
+            {
+                return Err("branch response contains an unexpected entry".to_string());
+            }
+            parse_todos(entry.get("data").unwrap_or(&Value::Null))
+                .ok_or_else(|| "invalid todo-state snapshot".to_string())
+        })();
+        let mut store = self.store.lock().unwrap_or_else(|p| p.into_inner());
+        match restored {
+            Ok(restored) => {
+                store.committed = restored;
+                store.recovery = Recovery::Ready;
+                Ok(())
+            }
+            Err(error) => {
+                let error = format!(
+                    "todo restore failed: {error}; explicitly reload the session before retrying"
+                );
+                store.recovery = Recovery::Blocked(error.clone());
+                Err(error)
+            }
         }
     }
-    restore_from_branch()?;
-    Ok(state()
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .committed
-        .clone())
+
+    // Caller holds the commit gate. Navigation need not dispatch SessionTree, so every
+    // unblocked use reads the latest self-contained snapshot on the current branch.
+    fn current_state(&self) -> Result<TodoState, String> {
+        {
+            let store = self.store.lock().unwrap_or_else(|p| p.into_inner());
+            if let Recovery::Blocked(error) = &store.recovery {
+                return Err(error.clone());
+            }
+        }
+        self.restore_from_branch()?;
+        Ok(self
+            .store
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .committed
+            .clone())
+    }
+
+    fn todo(&self, params: &Value) -> Result<String, String> {
+        let _gate = self.enter()?;
+        let committed = self.current_state()?;
+        let mut next = committed.clone();
+        let response = candidate(params, &mut next)?;
+        if next == committed {
+            return Ok(response);
+        }
+        let acknowledgement = self.call_runtime(
+            RuntimeActionId::AppendEntry,
+            json!({"customType": TODO_ENTRY, "data": state_json(&next)}),
+        );
+        match acknowledgement {
+            Ok(value)
+                if value
+                    .get("entryId")
+                    .and_then(Value::as_str)
+                    .is_some_and(|id| !id.trim().is_empty()) => {}
+            // A nonzero host return is a rejected append, not a commit. Keep the
+            // previously committed state readable and do not consume an ID.
+            Err(RuntimeFailure::Rejected(error)) => {
+                return Err(format!("todo persistence failed: {error}"));
+            }
+            // A successful host call with no usable identity may already have
+            // appended. Block reads and writes until an explicit branch reload.
+            unknown => {
+                let reason = match unknown {
+                    Err(error) => error.message(),
+                    Ok(_) => "AppendEntry returned no usable entryId".into(),
+                };
+                let error = format!("todo append acknowledgement is unknown: {reason}; explicitly reload the session before retrying");
+                self.store
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .recovery = Recovery::Blocked(error.clone());
+                return Err(error);
+            }
+        }
+        self.store
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .committed = next;
+        Ok(response)
+    }
 }
 
 rpi_plugin_sdk::event_handler! {
-fn handle_event(event, _user_data) {
-    match event.tag() {
-        EventTag::SessionStart | EventTag::SessionTree => {
-            let _gate = COMMIT_GATE.lock().unwrap_or_else(|p| p.into_inner());
-            if restore_from_branch().is_err() {
-                return 1;
-            }
+fn handle_event(event, owner) {
+    restore_for_event(event.tag(), lifecycle::callback(owner))
+}
+}
+
+rpi_plugin_sdk::event_handler! {
+fn handle_legacy_event(event, owner) {
+    let registration = lifecycle::legacy();
+    restore_for_event(event.tag(), registration.filter(|registration| registration.runtime.user_data == owner))
+}
+}
+
+fn restore_for_event(tag: EventTag, registration: Option<Arc<Registration>>) -> i32 {
+    let Some(registration) = registration else {
+        return 1;
+    };
+    if matches!(tag, EventTag::SessionStart | EventTag::SessionTree) {
+        let Ok(_gate) = registration.enter() else {
+            return 1;
+        };
+        if registration.restore_from_branch().is_err() {
+            return 1;
         }
-        _ => {}
     }
     0
-}
 }
 
 fn render(state: &TodoState, include_done: bool) -> String {
@@ -231,46 +314,6 @@ fn result(action: &str, state: &TodoState, text: String, error: Option<&str>) ->
         details["error"] = json!(error);
     }
     json!({"content":[{"type":"text","text":text}],"details":details}).to_string()
-}
-
-fn todo(params: &Value) -> Result<String, String> {
-    let _gate = COMMIT_GATE.lock().unwrap_or_else(|p| p.into_inner());
-    let committed = current_state()?;
-    let mut next = committed.clone();
-    let response = candidate(params, &mut next)?;
-    if next == committed {
-        return Ok(response);
-    }
-    let acknowledgement = call_runtime(
-        RuntimeActionId::AppendEntry,
-        json!({"customType": TODO_ENTRY, "data": state_json(&next)}),
-    );
-    match acknowledgement {
-        Ok(value)
-            if value
-                .get("entryId")
-                .and_then(Value::as_str)
-                .is_some_and(|id| !id.trim().is_empty()) => {}
-        // A nonzero host return is a rejected append, not a commit. Keep the
-        // previously committed state readable and do not consume an ID.
-        Err(RuntimeFailure::Rejected(error)) => {
-            return Err(format!("todo persistence failed: {error}"));
-        }
-        // A successful host call with no usable identity may already have
-        // appended. Block reads and writes until an explicit branch reload.
-        unknown => {
-            let reason = match unknown {
-                Err(error) => error.message(),
-                Ok(_) => "AppendEntry returned no usable entryId".into(),
-            };
-            let error = format!("todo append acknowledgement is unknown: {reason}; explicitly reload the session before retrying");
-            state().lock().unwrap_or_else(|p| p.into_inner()).recovery =
-                Recovery::Blocked(error.clone());
-            return Err(error);
-        }
-    }
-    state().lock().unwrap_or_else(|p| p.into_inner()).committed = next;
-    Ok(response)
 }
 
 // Pure candidate construction: neither invalid input nor unchanged state writes
@@ -393,10 +436,11 @@ fn tool_schema() -> StableToolSchema {
 static HANDLES: ToolHandles<Drive> = ToolHandles::new();
 
 struct Drive {
+    registration: Option<Arc<Registration>>,
     params: Value,
     done: bool,
 }
-extern "C" fn execute(
+extern "C" fn execute<const SLOT: usize>(
     _: StbStringRef,
     params: StbString,
     free: Option<FreeStringFn>,
@@ -404,6 +448,9 @@ extern "C" fn execute(
     let text = params.to_string_lossy();
     params.free_with(free);
     HANDLES.insert(Drive {
+        // This tool calls the runtime synchronously in poll. The native driver
+        // supplies the invocation context on that thread.
+        registration: lifecycle::tool::<SLOT>(),
         params: serde_json::from_str(&text).unwrap_or(Value::Null),
         done: false,
     })
@@ -427,7 +474,12 @@ extern "C" fn poll(handle: StepHandle, _: Option<ToolPartialCb>, _: *mut c_void)
         ));
     }
     drive.done = true;
-    match todo(&drive.params) {
+    let result = drive
+        .registration
+        .as_ref()
+        .ok_or_else(|| "todo runtime is unavailable".to_string())
+        .and_then(|registration| registration.todo(&drive.params));
+    match result {
         Ok(value) => StepResult::done(StbString::from_string(value)),
         Err(error) => StepResult::err(StbString::from_string(error)),
     }
@@ -438,16 +490,33 @@ extern "C" fn cancel(handle: StepHandle) {
 extern "C" fn destroy(handle: StepHandle) {
     drop(HANDLES.remove(handle));
 }
-use rpi_plugin_sdk::callbacks::free_string;
+rpi_plugin_sdk::string_handler! {
+fn command(args, out, owner) {
+    let _ = args;
+    show_todos(out, lifecycle::callback(owner))
+}
+}
 
 rpi_plugin_sdk::string_handler! {
-fn command(args, out, _user_data) {
+fn legacy_command(args, out, owner) {
+    let _ = args;
+    // Older isolated hosts may supply no registration token to commands.
+    let registration = lifecycle::legacy();
+    show_todos(out, registration.filter(|registration| owner.is_null() || owner == registration.runtime.user_data))
+}
+}
+
+fn show_todos(out: &mut Output<'_>, registration: Option<Arc<Registration>>) -> i32 {
     if !out.is_available() {
         return 1;
     }
-    let _ = args;
-    let _gate = COMMIT_GATE.lock().unwrap_or_else(|p| p.into_inner());
-    let response = match current_state() {
+    let state = registration
+        .ok_or_else(|| "todo runtime is unavailable".to_string())
+        .and_then(|registration| {
+            let _gate = registration.enter()?;
+            registration.current_state()
+        });
+    let response = match state {
         Ok(state) => json!({"kind":"message","text":render(&state, true)}),
         Err(error) => json!({"kind":"message","text":format!("Error: {error}"),"error":error}),
     };
@@ -456,35 +525,58 @@ fn command(args, out, _user_data) {
     out.write(response.to_string());
     0
 }
-}
-rpi_plugin_sdk::export_plugin!(|api| {
-    let _ = RUNTIME.set(*api);
+
+fn register(api: &PluginApi, cleanup: Option<lifecycle::Register>) -> i32 {
+    let Some(register_tool) = api.register_tool else {
+        return 1;
+    };
+    let (execute, event_handler, command_handler) = match cleanup {
+        Some(cleanup) => match lifecycle::install(*api, cleanup) {
+            Ok(execute) => (
+                execute,
+                handle_event as EventHandlerFn,
+                command as rpi_plugin_sdk::CommandHandlerFn,
+            ),
+            Err(rc) => return rc,
+        },
+        None => (
+            lifecycle::LEGACY_EXECUTE,
+            handle_legacy_event as EventHandlerFn,
+            legacy_command as rpi_plugin_sdk::CommandHandlerFn,
+        ),
+    };
     if let Some(register_event) = api.register_event_handler {
         for tag in [EventTag::SessionStart, EventTag::SessionTree] {
-            if register_event(tag, handle_event as EventHandlerFn, std::ptr::null_mut()) != 0 {
-                return 1;
+            let rc = register_event(tag, event_handler, api.user_data);
+            if rc != 0 {
+                return rc;
             }
         }
     }
     if let Some(register_command) = api.register_command {
-        let _ = register_command(
+        let rc = register_command(
             StbStringRef::from_str("todos"),
             StbStringRef::from_str("Show todos on the current session branch"),
-            command,
+            command_handler,
         );
+        if rc != 0 {
+            return rc;
+        }
     }
-    let Some(register) = api.register_tool else {
-        return 1;
-    };
     let schema = Box::new(tool_schema());
-    let rc = register(&*schema, execute, poll, cancel, destroy, free_string);
-    drop(schema);
+    let rc = register_tool(&*schema, execute, poll, cancel, destroy, free_string);
+    if rc == 0 && cleanup.is_none() {
+        lifecycle::install_legacy(*api);
+    }
     rc
-});
+}
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::OnceLock;
+
+    mod shared;
 
     #[test]
     fn registered_schema_has_defaults_and_conditional_requirements() {
@@ -713,6 +805,10 @@ mod tests {
 
     static HOST: OnceLock<Mutex<MockHost>> = OnceLock::new();
 
+    fn registration() -> Arc<Registration> {
+        lifecycle::legacy().unwrap()
+    }
+
     fn host() -> &'static Mutex<MockHost> {
         HOST.get_or_init(|| Mutex::new(MockHost::default()))
     }
@@ -721,8 +817,8 @@ mod tests {
     fn branch_runtime(action, args, out, _user_data) {
         // Every host call must run under the separate gate and never under the
         // state mutex (the host is allowed to take its own locks).
-        assert!(COMMIT_GATE.try_lock().is_err());
-        assert!(state().try_lock().is_ok());
+        assert!(registration().commit_gate.try_lock().is_err());
+        assert!(registration().store.try_lock().is_ok());
         let args: Value = serde_json::from_str(args).unwrap();
         let mut host = host().lock().unwrap();
         match RuntimeActionId::try_from(action).unwrap() {
@@ -770,14 +866,14 @@ mod tests {
     }
 
     fn reload(tag: EventTag) -> i32 {
-        handle_event(
+        handle_legacy_event(
             rpi_plugin_sdk::StablePluginEvent::empty(tag),
             std::ptr::null_mut(),
         )
     }
 
     fn invoke(params: Value, expected: rpi_plugin_sdk::StepResultTag) {
-        let handle = execute(
+        let handle = (lifecycle::LEGACY_EXECUTE)(
             StbStringRef::from_str("call"),
             StbString::from_string(params.to_string()),
             Some(free_string),
@@ -801,7 +897,8 @@ mod tests {
     }
 
     fn details(params: Value) -> Value {
-        serde_json::from_str::<Value>(&todo(&params).unwrap()).unwrap()["details"].clone()
+        serde_json::from_str::<Value>(&registration().todo(&params).unwrap()).unwrap()["details"]
+            .clone()
     }
 
     fn append_count() -> usize {
@@ -811,7 +908,7 @@ mod tests {
     fn command_text(expect_error: bool) -> String {
         let mut out = StbString::empty();
         assert_eq!(
-            command(StbStringRef::from_str(""), &mut out, std::ptr::null_mut()),
+            legacy_command(StbStringRef::from_str(""), &mut out, std::ptr::null_mut()),
             0
         );
         let response: Value = serde_json::from_str(&out.to_string_lossy()).unwrap();
@@ -824,34 +921,47 @@ mod tests {
         response["text"].as_str().unwrap().to_owned()
     }
 
-    // All tests touching the FFI statics live in this one serial test. Other
-    // tests exercise pure candidates and parsing, so parallel cargo tests are safe.
+    extern "C" fn accept_tool(
+        _: *const StableToolSchema,
+        _: rpi_plugin_sdk::ToolExecuteFn,
+        _: rpi_plugin_sdk::ToolPollFn,
+        _: rpi_plugin_sdk::ToolCancelFn,
+        _: rpi_plugin_sdk::ToolDestroyFn,
+        _: FreeStringFn,
+    ) -> i32 {
+        0
+    }
+
+    fn mock_api(runtime_action: rpi_plugin_sdk::RuntimeActionFn) -> PluginApi {
+        PluginApi {
+            abi_version: rpi_plugin_sdk::RPI_PLUGIN_ABI_VERSION_UNIFIED,
+            struct_size: std::mem::size_of::<PluginApi>() as u32,
+            runtime_action,
+            free_string,
+            user_data: std::ptr::null_mut(),
+            register_tool: Some(accept_tool),
+            register_command: None,
+            register_shortcut: None,
+            register_flag: None,
+            register_provider: None,
+            register_message_renderer: None,
+            register_markdown_transformer: None,
+            register_entry_renderer: None,
+            register_event_handler: None,
+            register_resources_discover: None,
+            dispatch_event: None,
+            declare: None,
+            register_before_agent_start: None,
+            register_oauth_provider: None,
+        }
+    }
+
+    // This test owns the legacy registration and its mock host for its duration.
     #[test]
     fn ffi_commits_recovery_failures_and_serialization() {
         use rpi_plugin_sdk::StepResultTag::{Done, Err as Failed};
-        assert!(RUNTIME
-            .set(PluginApi {
-                abi_version: rpi_plugin_sdk::RPI_PLUGIN_ABI_VERSION_UNIFIED,
-                struct_size: std::mem::size_of::<PluginApi>() as u32,
-                runtime_action: branch_runtime,
-                free_string,
-                user_data: std::ptr::null_mut(),
-                register_tool: None,
-                register_command: None,
-                register_shortcut: None,
-                register_flag: None,
-                register_provider: None,
-                register_message_renderer: None,
-                register_markdown_transformer: None,
-                register_entry_renderer: None,
-                register_event_handler: None,
-                register_resources_discover: None,
-                dispatch_event: None,
-                declare: None,
-                register_before_agent_start: None,
-                register_oauth_provider: None,
-            })
-            .is_ok());
+        let api = mock_api(branch_runtime);
+        assert_eq!(rpi_plugin_register(&api), 0);
 
         // No SessionStart and no completion event: --print's first mutation
         // lazily restores, appends, and only then returns Done/publishes ID 0.
@@ -890,11 +1000,11 @@ mod tests {
         );
 
         // Rejected append cannot advance memory or nextId; list stays usable.
-        let committed = state().lock().unwrap().committed.clone();
+        let committed = registration().store.lock().unwrap().committed.clone();
         host().lock().unwrap().append_fails = true;
         invoke(json!({"action":"add","text":"not committed"}), Failed);
         invoke(json!({"action":"clear"}), Failed);
-        assert_eq!(state().lock().unwrap().committed, committed);
+        assert_eq!(registration().store.lock().unwrap().committed, committed);
         assert_eq!(details(json!({"action":"list"}))["nextId"], 1);
         host().lock().unwrap().append_fails = false;
         invoke(json!({"action":"add","text":"second"}), Done);
@@ -939,12 +1049,13 @@ mod tests {
             r#"{"entryId":"  "}"#,
         ] {
             host().lock().unwrap().ack = ack.into();
-            let old = state().lock().unwrap().committed.clone();
+            let old = registration().store.lock().unwrap().committed.clone();
             invoke(json!({"action":"add","text":"uncertain"}), Failed);
-            assert_eq!(state().lock().unwrap().committed, old);
+            assert_eq!(registration().store.lock().unwrap().committed, old);
             let writes = append_count();
             let reads = host().lock().unwrap().reads;
-            assert!(todo(&json!({"action":"list"}))
+            assert!(registration()
+                .todo(&json!({"action":"list"}))
                 .unwrap_err()
                 .contains("acknowledgement is unknown"));
             invoke(json!({"action":"add","text":"must not retry"}), Failed);
@@ -966,7 +1077,7 @@ mod tests {
         ]});
         assert_eq!(reload(EventTag::SessionStart), 0);
         assert_eq!(details(json!({"action":"list"}))["nextId"], 11);
-        assert!(state().lock().unwrap().committed.todos[0].in_progress);
+        assert!(registration().store.lock().unwrap().committed.todos[0].in_progress);
         invoke(json!({"action":"add","text":"eleven"}), Done);
         assert_eq!(details(json!({"action":"list"}))["todos"][1]["id"], 11);
 
@@ -974,17 +1085,17 @@ mod tests {
         // command use, without appending or needing a lifecycle event.
         let reads = host().lock().unwrap().reads;
         let writes = append_count();
-        *state().lock().unwrap() = Store::default();
+        *registration().store.lock().unwrap() = Store::default();
         invoke(json!({"action":"list"}), Done);
         assert_eq!(details(json!({"action":"list"}))["nextId"], 12);
-        *state().lock().unwrap() = Store::default();
+        *registration().store.lock().unwrap() = Store::default();
         assert!(command_text(false).contains("[•] #7: Recovered"));
         assert_eq!(host().lock().unwrap().reads, reads + 3);
         assert_eq!(append_count(), writes);
 
         // Bad restore envelopes and malformed snapshots fail closed, retain
         // but never expose stale memory, and require an explicit reload.
-        let old = state().lock().unwrap().committed.clone();
+        let old = registration().store.lock().unwrap().committed.clone();
         for branch in [
             json!({"entries":[]}),
             json!({"filtered":false,"entries":[]}),
@@ -999,10 +1110,11 @@ mod tests {
         ] {
             host().lock().unwrap().branch_response = Some(branch);
             assert_eq!(reload(EventTag::SessionTree), 1);
-            assert_eq!(state().lock().unwrap().committed, old);
+            assert_eq!(registration().store.lock().unwrap().committed, old);
             let reads = host().lock().unwrap().reads;
             let writes = append_count();
-            assert!(todo(&json!({"action":"list"}))
+            assert!(registration()
+                .todo(&json!({"action":"list"}))
                 .unwrap_err()
                 .contains("restore failed"));
             invoke(json!({"action":"add","text":"blocked"}), Failed);
@@ -1013,7 +1125,8 @@ mod tests {
         host().lock().unwrap().branch_response = None;
         host().lock().unwrap().restore_fails = true;
         assert_eq!(reload(EventTag::SessionStart), 1);
-        assert!(todo(&json!({"action":"list"}))
+        assert!(registration()
+            .todo(&json!({"action":"list"}))
             .unwrap_err()
             .contains("mock restore failure"));
         host().lock().unwrap().restore_fails = false;
@@ -1024,7 +1137,7 @@ mod tests {
 
         // Lazy recovery failure is also latched; changing the host response
         // alone cannot turn the next tool call into an implicit recovery.
-        *state().lock().unwrap() = Store::default();
+        *registration().store.lock().unwrap() = Store::default();
         host().lock().unwrap().restore_fails = true;
         invoke(json!({"action":"add","text":"blocked first use"}), Failed);
         let reads = host().lock().unwrap().reads;
@@ -1035,7 +1148,7 @@ mod tests {
 
         // First command use has the same latch, while preserving the detailed
         // error in a host-supported message response with a successful ABI rc.
-        *state().lock().unwrap() = Store::default();
+        *registration().store.lock().unwrap() = Store::default();
         host().lock().unwrap().restore_fails = true;
         assert!(command_text(true).contains("mock restore failure"));
         let reads = host().lock().unwrap().reads;
@@ -1056,7 +1169,7 @@ mod tests {
         started_rx
             .recv_timeout(std::time::Duration::from_secs(10))
             .unwrap();
-        assert_eq!(state().lock().unwrap().committed.next_id, 0);
+        assert_eq!(registration().store.lock().unwrap().committed.next_id, 0);
         let second = std::thread::spawn(|| invoke(json!({"action":"add","text":"two"}), Done));
         resume_tx.send(()).unwrap();
         first.join().unwrap();
@@ -1093,7 +1206,10 @@ mod tests {
         writer.join().unwrap();
         assert_eq!(reader.join().unwrap(), 0);
         assert_eq!(details(json!({"action":"list"}))["nextId"], 11);
-        assert_eq!(state().lock().unwrap().committed.todos.len(), 1);
+        assert_eq!(
+            registration().store.lock().unwrap().committed.todos.len(),
+            1
+        );
         invoke(json!({"action":"clear"}), Done);
         let writes = append_count();
         let reads = host().lock().unwrap().reads;

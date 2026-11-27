@@ -113,36 +113,233 @@
 //! - `RPI_VOICE_INPUT_GAIN`    Software input gain for a very quiet mic
 //!   (default 1.0 = off, capped at 100)
 
-#![forbid(unsafe_code)]
+#![deny(unsafe_code)]
 
+mod audio_lease;
 #[cfg(feature = "local-stt")]
 mod local_stt;
 mod pet;
 mod player;
 mod recorder;
+mod registration;
 mod spoken_style;
 mod whisper;
 
 use rpi_plugin_sdk::{EventTag, PluginApi, RuntimeActionId, StbString, StbStringRef};
 use serde_json::{json, Value};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{mpsc, Arc, Mutex, OnceLock};
+use std::sync::{mpsc, Arc, Mutex};
 
 // ---------------------------------------------------------------------------
 // Runtime context (captured at registration, used by event/command handlers)
 // ---------------------------------------------------------------------------
 
 // Reuse the SDK's host-context lifetime and thread-safety contract.
-#[derive(Clone, Copy)]
 struct RuntimeContext {
     api: PluginApi,
+    stopping: AtomicBool,
+    ready: AtomicBool,
+    native_audio_used: AtomicBool,
+    workers: Mutex<Vec<std::thread::JoinHandle<()>>>,
+    tts_tx: Mutex<Option<mpsc::Sender<SpeechJob>>>,
+    manual_stop: Arc<AtomicBool>,
+    next_ptt: AtomicU64,
+    pet: Mutex<pet::Pet>,
+    pet_animation: Mutex<Option<pet::Animation>>,
+    #[cfg(feature = "local-stt")]
+    engine: std::sync::OnceLock<Mutex<Result<local_stt::SenseVoice, String>>>,
+    #[cfg(feature = "local-stt")]
+    preloading: AtomicBool,
+    /// Auto-TTS enabled flag (default: false; opt in with `/voice on` or `RPI_VOICE_AUTO_TTS=on`)
+    auto_tts_enabled: AtomicBool,
+    /// Currently playing TTS (to avoid overlapping playback / drive status)
+    tts_playing: AtomicBool,
+    /// Playback failures used to go to `eprintln!`, which is invisible inside the
+    /// TUI's alternate screen — the user saw "no sound" and nothing else. Keeping
+    /// the message here lets `/voice status` explain the silence.
+    last_tts_error: Mutex<Option<String>>,
+    /// Loudness of the audio currently being played, as `f32` bits (see
+    /// [`player::play_mp3`]). `0` whenever nothing is playing. Drives the
+    /// music-style equalizer animation next to `voice:` in the footer.
+    playback_level: AtomicU32,
+    /// Stop flag of the utterance currently on the speakers, so *any* thread can
+    /// cut it short — this is the handle barge-in pulls. `None` when silent.
+    playback_stop: Mutex<Option<Arc<AtomicBool>>>,
+    /// The TTS worker speaks one queued reply at a time, and a reply that arrives
+    /// while another is being read is *queued*, not dropped. Cutting off only the
+    /// utterance on the speakers would therefore leave the queue intact and the
+    /// worker would start the next one a moment later — reading aloud into the very
+    /// microphone the user just opened. Stamping each job with the generation it was
+    /// queued in, and skipping jobs from an older one, is what makes a barge-in
+    /// actually reach the queue.
+    playback_generation: AtomicU64,
+    /// Hands-free ("continuous conversation") mode: once a reply finishes playing,
+    /// the mic reopens on its own, so the user never touches a key.
+    auto_talk_enabled: AtomicBool,
+    /// Consecutive hands-free turns that heard nothing. Guards against holding the
+    /// microphone open after the user has walked away.
+    auto_talk_empty: AtomicUsize,
+    /// Stop flag of the in-flight hands-free recording, so `/voice auto off` can
+    /// cut a listen short instead of waiting out its no-speech window.
+    auto_talk_stop: Mutex<Option<Arc<AtomicBool>>>,
+    /// Peak input level of the most recent recording (f32 bits) and how long its
+    /// VAD classified as speech. Published by [`finish_recording`] so the
+    /// hands-free loop can say *why* a turn came up empty.
+    last_peak_level: AtomicU32,
+    last_speech_ms: AtomicUsize,
+    /// Length of the last recording in ms. Published alongside the peak because
+    /// `peak 0.0000` means two completely different things at 0.2s (the turn was cut
+    /// short) and at the full wait window (the device really did deliver silence).
+    last_duration_ms: AtomicUsize,
+    /// Software input gain of the last recording (f32 bits), so the level in
+    /// [`LAST_PEAK_LEVEL`] can be read back against the raw capture.
+    last_gain: AtomicU32,
+    /// Share of the last recording's samples that the gain pushed past full scale
+    /// (f32 bits). A high value means the *gain* destroyed the audio, not the mic.
+    last_clipped: AtomicU32,
+    /// Currently recording voice input
+    recording: AtomicBool,
+    /// Whether the user selected hands-free mode for this session. This is separate
+    /// from AUTO_TALK_ENABLED: typing can pause the current listener while keeping
+    /// the long-press resume entry available.
+    auto_mode_enabled: AtomicBool,
+    /// Push-to-talk mode (`/voice ptt`). While on, the host routes the claimed key
+    /// (`ptt_key()`) to [`on_input_key`] instead of the editor when the input box is
+    /// empty, so holding the key records and releasing it sends.
+    ptt_enabled: AtomicBool,
+    ptt: Mutex<Ptt>,
+    /// Session override set by `/voice output …`; `None` defers to the environment.
+    output_override: Mutex<Option<OutputMode>>,
+    /// Session-level TTS voice override (set via `/voice set <name>`)
+    voice_override: Mutex<Option<String>>,
+    /// Text received through native Pi's `message_update` delta stream. It is
+    /// flushed at sentence boundaries (or a size limit) so one model token does
+    /// not become one network TTS request. `MessageEnd` only flushes this buffer;
+    /// it never supplies a cumulative snapshot.
+    text_delta_buffer: Mutex<String>,
+    /// Whether the current assistant reply emitted text that was actually queued
+    /// for playback. MessageEnd uses this to decide whether a final snapshot
+    /// fallback is still needed.
+    stream_reply_active: AtomicBool,
+    stream_text_queued: AtomicBool,
+    /// Last cumulative assistant text received through hosts that send the full
+    /// partial assistant message on every MessageUpdate. We diff snapshots so the
+    /// same text is never sent to TTS twice.
+    stream_text_snapshot: Mutex<String>,
+    /// When the current assistant reply started, for the `RPI_VOICE_DEBUG` trace.
+    /// It is the only way to tell "queued during streaming" from "queued at the
+    /// end": the log line carries the offset from message start, so a reply that
+    /// only speaks after the last delta is obvious at a glance.
+    stream_started_at: Mutex<Option<std::time::Instant>>,
 }
 
-static RUNTIME_CTX: OnceLock<RuntimeContext> = OnceLock::new();
-
 impl RuntimeContext {
+    fn new(api: PluginApi) -> Self {
+        Self {
+            api,
+            stopping: AtomicBool::new(false),
+            ready: AtomicBool::new(false),
+            native_audio_used: AtomicBool::new(false),
+            workers: Mutex::default(),
+            tts_tx: Mutex::default(),
+            manual_stop: Arc::new(AtomicBool::new(false)),
+            next_ptt: AtomicU64::new(1),
+            pet: Mutex::default(),
+            pet_animation: Mutex::default(),
+            #[cfg(feature = "local-stt")]
+            engine: std::sync::OnceLock::new(),
+            #[cfg(feature = "local-stt")]
+            preloading: AtomicBool::new(false),
+            auto_tts_enabled: AtomicBool::new(false),
+            tts_playing: AtomicBool::new(false),
+            last_tts_error: Mutex::new(None),
+            playback_level: AtomicU32::new(0),
+            playback_stop: Mutex::new(None),
+            playback_generation: AtomicU64::new(0),
+            auto_talk_enabled: AtomicBool::new(false),
+            auto_talk_empty: AtomicUsize::new(0),
+            auto_talk_stop: Mutex::new(None),
+            last_peak_level: AtomicU32::new(0),
+            last_speech_ms: AtomicUsize::new(0),
+            last_duration_ms: AtomicUsize::new(0),
+            last_gain: AtomicU32::new(0),
+            last_clipped: AtomicU32::new(0),
+            recording: AtomicBool::new(false),
+            auto_mode_enabled: AtomicBool::new(false),
+            ptt_enabled: AtomicBool::new(false),
+            ptt: Mutex::new(Ptt {
+                pressed_at: None,
+                pressed_token: None,
+                token: 0,
+                stop: None,
+                recording_owner: None,
+                send_tokens: Vec::new(),
+            }),
+            output_override: Mutex::new(None),
+            voice_override: Mutex::new(None),
+            text_delta_buffer: Mutex::new(String::new()),
+            stream_reply_active: AtomicBool::new(false),
+            stream_text_queued: AtomicBool::new(false),
+            stream_text_snapshot: Mutex::new(String::new()),
+            stream_started_at: Mutex::new(None),
+        }
+    }
+
+    fn is_stopping(&self) -> bool {
+        self.stopping.load(Ordering::Acquire)
+    }
+
+    fn spawn(
+        self: &Arc<Self>,
+        name: &str,
+        run: impl FnOnce(Arc<Self>) + Send + 'static,
+    ) -> std::io::Result<()> {
+        let mut workers = self.workers.lock().unwrap();
+        if self.is_stopping() {
+            return Err(std::io::Error::other("voice registration is shutting down"));
+        }
+        let mut index = 0;
+        while index < workers.len() {
+            if workers[index].is_finished() {
+                let _ = workers.swap_remove(index).join();
+            } else {
+                index += 1;
+            }
+        }
+        let voice = self.clone();
+        workers.push(
+            std::thread::Builder::new()
+                .name(name.into())
+                .spawn(move || run(voice))?,
+        );
+        Ok(())
+    }
+
+    fn begin(self: &Arc<Self>) {
+        self.stopping.store(true, Ordering::Release);
+        self.manual_stop.store(true, Ordering::Release);
+        pet::silence(self);
+        self.tts_tx.lock().unwrap().take();
+        pet::signal_animation_stop(self);
+    }
+
+    fn finish(self: &Arc<Self>) {
+        self.begin();
+        // Closing admission and taking the handles under the spawn lock closes
+        // the race with a worker that was already entering spawn during begin.
+        let workers = std::mem::take(&mut *self.workers.lock().unwrap());
+        for worker in workers {
+            let _ = worker.join();
+        }
+        pet::stop_animation(self);
+    }
+
     /// Invoke a host runtime action, always reclaiming the host-owned output.
+    #[allow(unsafe_code)]
     fn action(&self, id: RuntimeActionId, args: Value) -> Result<String, String> {
+        if self.is_stopping() {
+            return Err("voice registration is shutting down".into());
+        }
         let args_json = args.to_string();
         let mut output = StbString::empty();
         let rc = (self.api.runtime_action)(
@@ -151,8 +348,11 @@ impl RuntimeContext {
             &mut output,
             self.api.user_data,
         );
-        let out_text = output.to_string_lossy();
-        (self.api.free_string)(output);
+        // SAFETY: the host transfers its output and supplies the matching free function.
+        let out_text = unsafe {
+            rpi_plugin_sdk::callbacks::OwnedString::from_raw(output, Some(self.api.free_string))
+        }
+        .to_string_lossy();
         if rc != 0 {
             return Err(out_text);
         }
@@ -160,85 +360,22 @@ impl RuntimeContext {
     }
 
     /// Publish a short status string for the host TUI footer (best effort).
-    fn set_status(&self, value: &str) {
+    fn set_status(self: &Arc<Self>, value: &str) {
         let _ = self.action(
             RuntimeActionId::SetStatus,
             json!({"key": "voice", "value": value}),
         );
-        pet::voice_status(value);
+        if !self.is_stopping() {
+            pet::voice_status(self, value);
+        }
     }
 }
-
-// ---------------------------------------------------------------------------
-// State
-// ---------------------------------------------------------------------------
-
-/// Auto-TTS enabled flag (default: false; opt in with `/voice on` or `RPI_VOICE_AUTO_TTS=on`)
-static AUTO_TTS_ENABLED: AtomicBool = AtomicBool::new(false);
-
-/// Currently playing TTS (to avoid overlapping playback / drive status)
-static TTS_PLAYING: AtomicBool = AtomicBool::new(false);
-
-/// Why the last utterance failed to play, if it did.
-///
-/// Playback failures used to go to `eprintln!`, which is invisible inside the
-/// TUI's alternate screen — the user saw "no sound" and nothing else. Keeping
-/// the message here lets `/voice status` explain the silence.
-static LAST_TTS_ERROR: Mutex<Option<String>> = Mutex::new(None);
-
-/// Loudness of the audio currently being played, as `f32` bits (see
-/// [`player::play_mp3`]). `0` whenever nothing is playing. Drives the
-/// music-style equalizer animation next to `voice:` in the footer.
-static PLAYBACK_LEVEL: AtomicU32 = AtomicU32::new(0);
-
-/// Stop flag of the utterance currently on the speakers, so *any* thread can
-/// cut it short — this is the handle barge-in pulls. `None` when silent.
-static PLAYBACK_STOP: Mutex<Option<Arc<AtomicBool>>> = Mutex::new(None);
-
-/// Bumped by every barge-in, so a queued utterance can tell it was superseded.
-///
-/// The TTS worker speaks one queued reply at a time, and a reply that arrives
-/// while another is being read is *queued*, not dropped. Cutting off only the
-/// utterance on the speakers would therefore leave the queue intact and the
-/// worker would start the next one a moment later — reading aloud into the very
-/// microphone the user just opened. Stamping each job with the generation it was
-/// queued in, and skipping jobs from an older one, is what makes a barge-in
-/// actually reach the queue.
-static PLAYBACK_GENERATION: AtomicU64 = AtomicU64::new(0);
-
-/// Hands-free ("continuous conversation") mode: once a reply finishes playing,
-/// the mic reopens on its own, so the user never touches a key.
-static AUTO_TALK_ENABLED: AtomicBool = AtomicBool::new(false);
-
-/// Consecutive hands-free turns that heard nothing. Guards against holding the
-/// microphone open after the user has walked away.
-static AUTO_TALK_EMPTY: AtomicUsize = AtomicUsize::new(0);
-
-/// Stop flag of the in-flight hands-free recording, so `/voice auto off` can
-/// cut a listen short instead of waiting out its no-speech window.
-static AUTO_TALK_STOP: Mutex<Option<Arc<AtomicBool>>> = Mutex::new(None);
 
 /// Error message used when a recording contained no usable speech. Shared with
 /// [`is_empty_turn`] so the two can never drift apart.
 const ERR_NO_SPEECH: &str = "no speech detected";
 /// Error message for a recording too brief to transcribe.
 const ERR_TOO_SHORT: &str = "recording too short";
-
-/// Peak input level of the most recent recording (f32 bits) and how long its
-/// VAD classified as speech. Published by [`finish_recording`] so the
-/// hands-free loop can say *why* a turn came up empty.
-static LAST_PEAK_LEVEL: AtomicU32 = AtomicU32::new(0);
-static LAST_SPEECH_MS: AtomicUsize = AtomicUsize::new(0);
-/// Length of the last recording in ms. Published alongside the peak because
-/// `peak 0.0000` means two completely different things at 0.2s (the turn was cut
-/// short) and at the full wait window (the device really did deliver silence).
-static LAST_DURATION_MS: AtomicUsize = AtomicUsize::new(0);
-/// Software input gain of the last recording (f32 bits), so the level in
-/// [`LAST_PEAK_LEVEL`] can be read back against the raw capture.
-static LAST_GAIN: AtomicU32 = AtomicU32::new(0);
-/// Share of the last recording's samples that the gain pushed past full scale
-/// (f32 bits). A high value means the *gain* destroyed the audio, not the mic.
-static LAST_CLIPPED: AtomicU32 = AtomicU32::new(0);
 
 /// Below this peak the capture was effectively digital silence — a muted device
 /// or the wrong endpoint — rather than merely a quiet microphone.
@@ -315,20 +452,18 @@ fn is_empty_turn(error: &str) -> bool {
 /// Leave hands-free mode because the user took the keyboard. Silent unless the
 /// mode was actually on, so ordinary typing never produces a status line.
 /// Returns `true` when the mode was switched off.
-fn pause_auto_talk(reason: &str) -> bool {
-    if !AUTO_TALK_ENABLED.swap(false, Ordering::Relaxed) {
+fn pause_auto_talk(voice: &Arc<RuntimeContext>, reason: &str) -> bool {
+    if !voice.auto_talk_enabled.swap(false, Ordering::Relaxed) {
         return false;
     }
     debug_log(&format!("continuous mode paused: {reason}"));
     // Abort a listen that may be running right now, otherwise the user's typing
     // would be transcribed and delivered after they took over.
-    let stop = AUTO_TALK_STOP.lock().unwrap().take();
+    let stop = voice.auto_talk_stop.lock().unwrap().take();
     if let Some(stop) = stop {
         stop.store(true, Ordering::Relaxed);
     }
-    if let Some(runtime) = RUNTIME_CTX.get().copied() {
-        runtime.set_status(&format!("voice: ✋ {reason} — continuous mode paused"));
-    }
+    voice.set_status(&format!("voice: ✋ {reason} — continuous mode paused"));
     true
 }
 
@@ -343,31 +478,20 @@ fn pause_auto_talk(reason: &str) -> bool {
 /// let the worker start the queued one seconds later — audibly ignoring the
 /// interrupt. The generation bump is what tells the worker those jobs are stale
 /// (see [`PLAYBACK_GENERATION`]); the playing utterance stops via its own flag.
-fn stop_playback() -> bool {
-    PLAYBACK_GENERATION.fetch_add(1, Ordering::Relaxed);
-    let flag = PLAYBACK_STOP.lock().unwrap().take();
+fn stop_playback(voice: &Arc<RuntimeContext>) -> bool {
+    voice.playback_generation.fetch_add(1, Ordering::Relaxed);
+    let flag = voice.playback_stop.lock().unwrap().take();
     match flag {
         Some(flag) => {
             flag.store(true, Ordering::Relaxed);
-            PLAYBACK_LEVEL.store(0f32.to_bits(), Ordering::Relaxed);
+            voice
+                .playback_level
+                .store(0f32.to_bits(), Ordering::Relaxed);
             true
         }
         None => false,
     }
 }
-
-/// Currently recording voice input
-static RECORDING: AtomicBool = AtomicBool::new(false);
-
-/// Whether the user selected hands-free mode for this session. This is separate
-/// from AUTO_TALK_ENABLED: typing can pause the current listener while keeping
-/// the long-press resume entry available.
-static AUTO_MODE_ENABLED: AtomicBool = AtomicBool::new(false);
-
-/// Push-to-talk mode (`/voice ptt`). While on, the host routes the claimed key
-/// (`ptt_key()`) to [`on_input_key`] instead of the editor when the input box is
-/// empty, so holding the key records and releasing it sends.
-static PTT_ENABLED: AtomicBool = AtomicBool::new(false);
 
 /// Push-to-talk session state (one mutex guards all of it).
 struct Ptt {
@@ -393,15 +517,6 @@ struct Ptt {
     /// utterances overlap.
     send_tokens: Vec<u64>,
 }
-
-static PTT: Mutex<Ptt> = Mutex::new(Ptt {
-    pressed_at: None,
-    pressed_token: None,
-    token: 0,
-    stop: None,
-    recording_owner: None,
-    send_tokens: Vec::new(),
-});
 
 /// The key that drives push-to-talk (normalized name, e.g. `space`).
 fn ptt_key() -> String {
@@ -447,12 +562,9 @@ enum OutputMode {
     Send,
 }
 
-/// Session override set by `/voice output …`; `None` defers to the environment.
-static OUTPUT_OVERRIDE: Mutex<Option<OutputMode>> = Mutex::new(None);
-
 /// How a transcription is delivered (default: editable draft).
-fn output_mode() -> OutputMode {
-    if let Some(mode) = *OUTPUT_OVERRIDE.lock().unwrap() {
+fn output_mode(voice: &Arc<RuntimeContext>) -> OutputMode {
+    if let Some(mode) = *voice.output_override.lock().unwrap() {
         return mode;
     }
     match std::env::var("RPI_VOICE_OUTPUT")
@@ -475,8 +587,8 @@ fn draft_auto_send_ms() -> u64 {
 }
 
 /// Human-readable description of the current output mode (for `/voice`).
-fn output_mode_label() -> String {
-    match output_mode() {
+fn output_mode_label(voice: &Arc<RuntimeContext>) -> String {
+    match output_mode(voice) {
         OutputMode::Send => "send (straight to the model)".to_string(),
         OutputMode::Draft => {
             let ms = draft_auto_send_ms();
@@ -489,9 +601,6 @@ fn output_mode_label() -> String {
     }
 }
 
-/// Session-level TTS voice override (set via `/voice set <name>`)
-static VOICE_OVERRIDE: Mutex<Option<String>> = Mutex::new(None);
-
 /// Which STT engine to use: `local` (default), `auto`, or `api`.
 fn stt_engine_pref() -> String {
     std::env::var("RPI_STT_ENGINE")
@@ -501,16 +610,46 @@ fn stt_engine_pref() -> String {
         .unwrap_or_else(|| "local".to_string())
 }
 
+#[cfg(feature = "local-stt")]
+impl RuntimeContext {
+    fn recognizer(&self) -> std::sync::MutexGuard<'_, Result<local_stt::SenseVoice, String>> {
+        self.engine
+            .get_or_init(|| Mutex::new(local_stt::SenseVoice::load()))
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn recognizer_ready(&self) -> bool {
+        self.engine
+            .get()
+            .is_some_and(|engine| engine.lock().unwrap_or_else(|p| p.into_inner()).is_ok())
+    }
+}
+
 /// Start loading the local STT model in the background.
 ///
 /// Called whenever voice is switched on (or the user starts talking) so the
 /// ~5.5 s model load overlaps with the user speaking rather than following it.
 /// No-op when the local engine is not compiled in or an API engine is pinned.
-fn preload_stt_model() {
+fn preload_stt_model(_voice: &Arc<RuntimeContext>) {
     #[cfg(feature = "local-stt")]
     {
-        if stt_engine_pref() != "api" {
-            local_stt::preload_in_background();
+        let voice = _voice;
+        if stt_engine_pref() != "api"
+            && !voice.recognizer_ready()
+            && !voice.preloading.swap(true, Ordering::AcqRel)
+        {
+            if voice
+                .spawn("rpi-voice-stt-load", |voice| {
+                    if let Err(error) = voice.recognizer().as_ref() {
+                        eprintln!("[rpi-voice] STT preload failed: {error}");
+                    }
+                    voice.preloading.store(false, Ordering::Release);
+                })
+                .is_err()
+            {
+                voice.preloading.store(false, Ordering::Release);
+            }
         }
     }
 }
@@ -525,29 +664,9 @@ struct SpeechJob {
     generation: u64,
 }
 
-static TTS_TX: OnceLock<mpsc::Sender<SpeechJob>> = OnceLock::new();
-/// Text received through native Pi's `message_update` delta stream. It is
-/// flushed at sentence boundaries (or a size limit) so one model token does
-/// not become one network TTS request. `MessageEnd` only flushes this buffer;
-/// it never supplies a cumulative snapshot.
-static TEXT_DELTA_BUFFER: Mutex<String> = Mutex::new(String::new());
-/// Whether the current assistant reply emitted text that was actually queued
-/// for playback. MessageEnd uses this to decide whether a final snapshot
-/// fallback is still needed.
-static STREAM_REPLY_ACTIVE: AtomicBool = AtomicBool::new(false);
-static STREAM_TEXT_QUEUED: AtomicBool = AtomicBool::new(false);
-/// Last cumulative assistant text received through hosts that send the full
-/// partial assistant message on every MessageUpdate. We diff snapshots so the
-/// same text is never sent to TTS twice.
-static STREAM_TEXT_SNAPSHOT: Mutex<String> = Mutex::new(String::new());
-/// When the current assistant reply started, for the `RPI_VOICE_DEBUG` trace.
-/// It is the only way to tell "queued during streaming" from "queued at the
-/// end": the log line carries the offset from message start, so a reply that
-/// only speaks after the last delta is obvious at a glance.
-static STREAM_STARTED_AT: Mutex<Option<std::time::Instant>> = Mutex::new(None);
-
-fn stream_mark(message: &str) {
-    let elapsed = STREAM_STARTED_AT
+fn stream_mark(voice: &Arc<RuntimeContext>, message: &str) {
+    let elapsed = voice
+        .stream_started_at
         .lock()
         .ok()
         .and_then(|slot| *slot)
@@ -564,77 +683,89 @@ const SPEECH_MIN_CHARS: usize = 4;
 const SPEECH_TARGET_CHARS: usize = 36;
 const SPEECH_MAX_CHARS: usize = 72;
 
-fn tts_sender() -> &'static mpsc::Sender<SpeechJob> {
-    TTS_TX.get_or_init(|| {
-        let (tx, rx) = mpsc::channel::<SpeechJob>();
-        std::thread::Builder::new()
-            .name("rpi-voice-tts".to_string())
-            .spawn(move || {
-                for job in rx {
-                    // A barge-in since this was queued means the user is talking,
-                    // or already said something else. Speaking it now would talk
-                    // over them (and into the open microphone).
-                    let job_generation = job.generation;
-                    if job_generation != PLAYBACK_GENERATION.load(Ordering::Relaxed) {
-                        debug_log("tts job dropped: superseded by a barge-in");
-                        continue;
-                    }
-                    let text = job.text;
-                    if !AUTO_TTS_ENABLED.load(Ordering::Relaxed) {
-                        // Muted: nothing to speak, but hands-free mode still runs
-                        // on the *voice* switch alone, so keep the loop alive.
-                        // Reopen only when nothing was muted *for* this job
-                        // (`maybe_auto_listen` checks the mode itself).
-                        if let Some(runtime) = RUNTIME_CTX.get().copied() {
-                            maybe_auto_listen(runtime);
-                        }
-                        continue;
-                    }
-                    // Mic first: if the user is talking, this reply is stale —
-                    // speaking it would be read back as their own words.
-                    if mic_owns_the_floor() {
-                        debug_log("tts job dropped: the microphone owns the floor");
-                        continue;
-                    }
-                    TTS_PLAYING.store(true, Ordering::Relaxed);
-                    pet::caption(&text, "pet");
-                    let outcome = synthesize_and_play(&text);
-                    if let Err(e) = outcome {
-                        // Do not write TTS errors to stderr: the interactive host
-                        // can route plugin stderr into the prompt editor. Keep
-                        // the detailed error in the opt-in debug log and expose
-                        // only a short status-line message to the user.
-                        debug_log(&format!("tts error: {e}"));
-                        *LAST_TTS_ERROR.lock().unwrap() = Some(e.clone());
-                        if let Some(runtime) = RUNTIME_CTX.get().copied() {
-                            runtime.set_status("voice: ⚠ speech failed — check TTS connection");
-                        }
-                    } else {
-                        *LAST_TTS_ERROR.lock().unwrap() = None;
-                    }
-                    TTS_PLAYING.store(false, Ordering::Relaxed);
-                    // Reopen the mic only if nothing interrupted this utterance.
-                    // A barge-in (a keystroke, or the user taking the key to
-                    // talk) bumps the generation and already owns the floor: PTT
-                    // opens the mic itself, and typing pauses hands-free mode. A
-                    // reopen here would fight either of those, which is the
-                    // "interrupt did not take" symptom.
-                    let superseded = job_generation != PLAYBACK_GENERATION.load(Ordering::Relaxed);
-                    if superseded {
-                        debug_log("auto-listen skipped: a barge-in took the floor");
-                    } else if let Some(runtime) = RUNTIME_CTX.get().copied() {
-                        maybe_auto_listen(runtime);
-                    }
-                }
-            })
-            .expect("spawn rpi-voice TTS worker");
-        tx
-    })
+fn send_speech(voice: &Arc<RuntimeContext>, job: SpeechJob) -> bool {
+    let mut sender = voice.tts_tx.lock().unwrap();
+    if voice.is_stopping() {
+        return false;
+    }
+    if sender.is_none() {
+        let (tx, rx) = mpsc::channel();
+        if voice
+            .spawn("rpi-voice-tts", move |worker| run_tts(&worker, rx))
+            .is_err()
+        {
+            return false;
+        }
+        *sender = Some(tx);
+    }
+    sender.as_ref().is_some_and(|tx| tx.send(job).is_ok())
+}
+
+fn run_tts(voice: &Arc<RuntimeContext>, rx: mpsc::Receiver<SpeechJob>) {
+    for job in rx {
+        if voice.is_stopping() {
+            break;
+        }
+        // A barge-in since this was queued means the user is talking,
+        // or already said something else. Speaking it now would talk
+        // over them (and into the open microphone).
+        let job_generation = job.generation;
+        if job_generation != voice.playback_generation.load(Ordering::Relaxed) {
+            debug_log("tts job dropped: superseded by a barge-in");
+            continue;
+        }
+        let text = job.text;
+        if !voice.auto_tts_enabled.load(Ordering::Relaxed) {
+            // Muted: nothing to speak, but hands-free mode still runs
+            // on the *voice* switch alone, so keep the loop alive.
+            // Reopen only when nothing was muted *for* this job
+            // (`maybe_auto_listen` checks the mode itself).
+            maybe_auto_listen(voice);
+            continue;
+        }
+        // Mic first: if the user is talking, this reply is stale —
+        // speaking it would be read back as their own words.
+        if mic_owns_the_floor(voice) {
+            debug_log("tts job dropped: the microphone owns the floor");
+            continue;
+        }
+        voice.tts_playing.store(true, Ordering::Relaxed);
+        pet::caption(voice, &text, "pet");
+        let outcome = synthesize_and_play(voice, &text, job_generation);
+        if let Err(e) = outcome {
+            // Do not write TTS errors to stderr: the interactive host
+            // can route plugin stderr into the prompt editor. Keep
+            // the detailed error in the opt-in debug log and expose
+            // only a short status-line message to the user.
+            debug_log(&format!("tts error: {e}"));
+            *voice.last_tts_error.lock().unwrap() = Some(e.clone());
+            voice.set_status(if e == audio_lease::BUSY {
+                audio_lease::BUSY
+            } else {
+                "voice: ⚠ speech failed — check TTS connection"
+            });
+        } else {
+            *voice.last_tts_error.lock().unwrap() = None;
+        }
+        voice.tts_playing.store(false, Ordering::Relaxed);
+        // Reopen the mic only if nothing interrupted this utterance.
+        // A barge-in (a keystroke, or the user taking the key to
+        // talk) bumps the generation and already owns the floor: PTT
+        // opens the mic itself, and typing pauses hands-free mode. A
+        // reopen here would fight either of those, which is the
+        // "interrupt did not take" symptom.
+        let superseded = job_generation != voice.playback_generation.load(Ordering::Relaxed);
+        if superseded {
+            debug_log("auto-listen skipped: a barge-in took the floor");
+        } else {
+            maybe_auto_listen(voice);
+        }
+    }
 }
 
 /// Current TTS voice: session override, else `RPI_VOICE`, else the default.
-fn current_voice() -> String {
-    if let Some(v) = VOICE_OVERRIDE.lock().unwrap().as_ref() {
+fn current_voice(voice: &Arc<RuntimeContext>) -> String {
+    if let Some(v) = voice.voice_override.lock().unwrap().as_ref() {
         return v.clone();
     }
     std::env::var("RPI_VOICE").unwrap_or_else(|_| "zh-CN-XiaoxiaoNeural".to_string())
@@ -644,19 +775,19 @@ fn current_voice() -> String {
 // Events: native Pi message_update deltas → streaming TTS
 // ---------------------------------------------------------------------------
 
-fn enqueue_speech_text(text: String) {
+fn enqueue_speech_text(voice: &Arc<RuntimeContext>, text: String) {
     let text = sanitize_for_speech(&text);
     if text.trim().is_empty() {
         return;
     }
     let job = SpeechJob {
         text,
-        generation: PLAYBACK_GENERATION.load(Ordering::Relaxed),
+        generation: voice.playback_generation.load(Ordering::Relaxed),
     };
-    if tts_sender().send(job).is_err() {
+    if !send_speech(voice, job) {
         debug_log("TTS worker unavailable");
     } else {
-        STREAM_TEXT_QUEUED.store(true, Ordering::Relaxed);
+        voice.stream_text_queued.store(true, Ordering::Relaxed);
     }
 }
 
@@ -766,9 +897,9 @@ fn take_speech_chunks(buffer: &mut String) -> Vec<String> {
     chunks
 }
 
-fn flush_text_delta_buffer() {
+fn flush_text_delta_buffer(voice: &Arc<RuntimeContext>) {
     let chunks = {
-        let mut buffer = TEXT_DELTA_BUFFER.lock().unwrap();
+        let mut buffer = voice.text_delta_buffer.lock().unwrap();
         let mut chunks = take_speech_chunks(&mut buffer);
         if !buffer.trim().is_empty() {
             chunks.push(std::mem::take(&mut *buffer));
@@ -776,12 +907,14 @@ fn flush_text_delta_buffer() {
         chunks
     };
     for chunk in chunks {
-        enqueue_speech_text(chunk);
+        enqueue_speech_text(voice, chunk);
     }
 }
 
 rpi_plugin_sdk::event_handler! {
-fn on_message_start(event, _user_data) {
+fn on_message_start(event, user_data) {
+    let Some(owner) = registration::callback(user_data) else { return 0; };
+    let voice = &owner;
     let payload = event.message_text().unwrap_or_default();
     let is_assistant = serde_json::from_str::<Value>(&payload)
         .ok()
@@ -794,12 +927,12 @@ fn on_message_start(event, _user_data) {
         })
         .unwrap_or(false);
     if is_assistant {
-        TEXT_DELTA_BUFFER.lock().unwrap().clear();
-        STREAM_TEXT_SNAPSHOT.lock().unwrap().clear();
-        STREAM_REPLY_ACTIVE.store(false, Ordering::Relaxed);
-        STREAM_TEXT_QUEUED.store(false, Ordering::Relaxed);
-        *STREAM_STARTED_AT.lock().unwrap() = Some(std::time::Instant::now());
-        stream_mark("message_start (assistant)");
+        voice.text_delta_buffer.lock().unwrap().clear();
+        voice.stream_text_snapshot.lock().unwrap().clear();
+        voice.stream_reply_active.store(false, Ordering::Relaxed);
+        voice.stream_text_queued.store(false, Ordering::Relaxed);
+        *voice.stream_started_at.lock().unwrap() = Some(std::time::Instant::now());
+        stream_mark(voice, "message_start (assistant)");
     }
     0
 }
@@ -839,8 +972,10 @@ fn stream_event_from_payload(message_update: &Value) -> Option<&Value> {
 }
 
 rpi_plugin_sdk::event_handler! {
-fn on_message_update(event, _user_data) {
-    if !AUTO_TTS_ENABLED.load(Ordering::Relaxed) {
+fn on_message_update(event, user_data) {
+    let Some(owner) = registration::callback(user_data) else { return 0; };
+    let voice = &owner;
+    if !voice.auto_tts_enabled.load(Ordering::Relaxed) {
         return 0;
     }
 
@@ -868,7 +1003,7 @@ fn on_message_update(event, _user_data) {
         // Some providers send the entire growing assistant message on every
         // update. Diff snapshots and only pass the newly appended suffix on.
         let snapshot = extract_message_text(&message_update).trim_end().to_string();
-        let mut previous = STREAM_TEXT_SNAPSHOT.lock().unwrap();
+        let mut previous = voice.stream_text_snapshot.lock().unwrap();
         cumulative_speech_delta(&mut previous, snapshot)
     } else {
         debug_log(&format!(
@@ -881,56 +1016,58 @@ fn on_message_update(event, _user_data) {
         return 0;
     }
 
-    STREAM_REPLY_ACTIVE.store(true, Ordering::Relaxed);
+    voice.stream_reply_active.store(true, Ordering::Relaxed);
     let chunks = {
-        let mut buffer = TEXT_DELTA_BUFFER.lock().unwrap();
+        let mut buffer = voice.text_delta_buffer.lock().unwrap();
         buffer.push_str(&delta);
         take_speech_chunks(&mut buffer)
     };
     for chunk in chunks {
-        stream_mark(&format!(
+        stream_mark(voice, &format!(
             "enqueue from MessageUpdate: {:?}",
             truncate(chunk.trim(), 40)
         ));
-        enqueue_speech_text(chunk);
+        enqueue_speech_text(voice, chunk);
     }
     0
 }
 }
 
 rpi_plugin_sdk::event_handler! {
-fn on_message_end(event, _user_data) {
-    if pet::enabled() {
+fn on_message_end(event, user_data) {
+    let Some(owner) = registration::callback(user_data) else { return 0; };
+    let voice = &owner;
+    if pet::enabled(voice) {
         let payload = event.message_text().unwrap_or_default();
         if let Ok(message) = serde_json::from_str::<Value>(&payload) {
-            pet::message_end(&message);
+            pet::message_end(voice, &message);
         }
     }
-    if !AUTO_TTS_ENABLED.load(Ordering::Relaxed) {
-        TEXT_DELTA_BUFFER.lock().unwrap().clear();
-        STREAM_REPLY_ACTIVE.store(false, Ordering::Relaxed);
+    if !voice.auto_tts_enabled.load(Ordering::Relaxed) {
+        voice.text_delta_buffer.lock().unwrap().clear();
+        voice.stream_reply_active.store(false, Ordering::Relaxed);
         return 0;
     }
 
-    let stream_active = STREAM_REPLY_ACTIVE.swap(false, Ordering::Relaxed);
+    let stream_active = voice.stream_reply_active.swap(false, Ordering::Relaxed);
     if stream_active {
         // Flush first: the final short sentence may be the first text that was
         // actually queued. Only use the snapshot fallback when nothing from the
         // delta stream made it into the TTS queue.
-        let queued_before_flush = STREAM_TEXT_QUEUED.load(Ordering::Relaxed);
-        stream_mark(&format!(
+        let queued_before_flush = voice.stream_text_queued.load(Ordering::Relaxed);
+        stream_mark(voice, &format!(
             "message_end: streaming reply, queued_from_stream={queued_before_flush}"
         ));
-        flush_text_delta_buffer();
-        STREAM_TEXT_SNAPSHOT.lock().unwrap().clear();
-        let streamed_text_queued = STREAM_TEXT_QUEUED.swap(false, Ordering::Relaxed);
-        *STREAM_STARTED_AT.lock().unwrap() = None;
+        flush_text_delta_buffer(voice);
+        voice.stream_text_snapshot.lock().unwrap().clear();
+        let streamed_text_queued = voice.stream_text_queued.swap(false, Ordering::Relaxed);
+        *voice.stream_started_at.lock().unwrap() = None;
         if streamed_text_queued {
             return 0;
         }
-        stream_mark("message_end: fallback (stream produced nothing deliverable)");
+        stream_mark(voice, "message_end: fallback (stream produced nothing deliverable)");
     } else {
-        STREAM_TEXT_QUEUED.store(false, Ordering::Relaxed);
+        voice.stream_text_queued.store(false, Ordering::Relaxed);
     }
 
     // Compatibility fallback for hosts/providers that expose only the final
@@ -945,10 +1082,10 @@ fn on_message_end(event, _user_data) {
         .and_then(Value::as_str)
         .unwrap_or("");
     if role == "assistant" {
-        stream_mark("message_end: fallback path — speaking the final snapshot");
-        enqueue_speech_text(extract_message_text(&message));
+        stream_mark(voice, "message_end: fallback path — speaking the final snapshot");
+        enqueue_speech_text(voice, extract_message_text(&message));
     }
-    *STREAM_STARTED_AT.lock().unwrap() = None;
+    *voice.stream_started_at.lock().unwrap() = None;
     0
 }
 }
@@ -975,15 +1112,17 @@ rpi_plugin_sdk::event_handler! {
 ///
 /// Recording runs on its own thread: the host calls this on the TUI key thread,
 /// which must return promptly to stay responsive.
-fn on_input_key(event, _user_data) {
+fn on_input_key(event, user_data) {
+    let Some(owner) = registration::callback(user_data) else { return 0; };
+    let voice = &owner;
     const CONTINUE: i32 = rpi_plugin_sdk::EVENT_HANDLER_CONTINUE;
 
-    if !PTT_ENABLED.load(Ordering::Relaxed) && !AUTO_MODE_ENABLED.load(Ordering::Relaxed) {
+    if !voice.ptt_enabled.load(Ordering::Relaxed) && !voice.auto_mode_enabled.load(Ordering::Relaxed) {
         return CONTINUE;
     }
     // Payload lives in the `data` union arm for Input events.
     let raw = event.data_text().unwrap_or_default();
-    handle_ptt_key(&raw, &ptt_key())
+    handle_ptt_key(voice, &raw, &ptt_key())
 }
 }
 
@@ -996,15 +1135,17 @@ rpi_plugin_sdk::event_handler! {
 /// injected transcription, or the host clearing the draft after auto-sending
 /// it) is deliberately *not* treated as the user taking over — otherwise the
 /// hands-free loop would cancel itself on every single turn.
-fn on_editor_change(event, _user_data) {
+fn on_editor_change(event, user_data) {
+    let Some(owner) = registration::callback(user_data) else { return 0; };
+    let voice = &owner;
     let raw = event.data_text().unwrap_or_default();
-    handle_editor_change(&raw)
+    handle_editor_change(voice, &raw)
 }
 }
 
 /// Pure `EditorChange` policy (parses the payload, so it is unit-testable
 /// without an FFI event).
-fn handle_editor_change(raw: &str) -> i32 {
+fn handle_editor_change(voice: &Arc<RuntimeContext>, raw: &str) -> i32 {
     const CONTINUE: i32 = rpi_plugin_sdk::EVENT_HANDLER_CONTINUE;
 
     // A missing `source` is treated as the user: the conservative reading, since
@@ -1030,8 +1171,8 @@ fn handle_editor_change(raw: &str) -> i32 {
         return CONTINUE;
     }
     debug_log("editor change from the user — barge-in");
-    stop_playback();
-    pause_auto_talk("you started typing");
+    stop_playback(voice);
+    pause_auto_talk(voice, "you started typing");
     CONTINUE
 }
 
@@ -1042,11 +1183,13 @@ fn handle_editor_change(raw: &str) -> i32 {
 /// Returns the handler code the host expects
 /// ([`rpi_plugin_sdk::EVENT_HANDLER_CLAIMED`] to swallow the key,
 /// [`rpi_plugin_sdk::EVENT_HANDLER_CONTINUE`] to pass it to the editor).
-fn handle_ptt_key(raw: &str, wanted: &str) -> i32 {
+fn handle_ptt_key(voice: &Arc<RuntimeContext>, raw: &str, wanted: &str) -> i32 {
     const CONTINUE: i32 = rpi_plugin_sdk::EVENT_HANDLER_CONTINUE;
     const CLAIMED: i32 = rpi_plugin_sdk::EVENT_HANDLER_CLAIMED;
 
-    if !PTT_ENABLED.load(Ordering::Relaxed) && !AUTO_MODE_ENABLED.load(Ordering::Relaxed) {
+    if !voice.ptt_enabled.load(Ordering::Relaxed)
+        && !voice.auto_mode_enabled.load(Ordering::Relaxed)
+    {
         return CONTINUE;
     }
     let Ok(payload) = serde_json::from_str::<Value>(raw) else {
@@ -1071,22 +1214,22 @@ fn handle_ptt_key(raw: &str, wanted: &str) -> i32 {
     let kind = payload.get("kind").and_then(Value::as_str).unwrap_or("");
     match kind {
         "press" => {
-            let mut ptt = PTT.lock().unwrap();
+            let mut ptt = voice.ptt.lock().unwrap();
             if ptt.pressed_at.is_some() {
                 return CLAIMED; // already held (stray duplicate press)
             }
             ptt.pressed_at = Some(std::time::Instant::now());
-            let token = next_ptt_token();
+            let token = next_ptt_token(voice);
             ptt.pressed_token = Some(token);
             ptt.token = token;
             drop(ptt);
-            arm_ptt_start(token, ptt_hold_ms());
+            arm_ptt_start(voice, token, ptt_hold_ms());
             CLAIMED
         }
         // Held keys repeat; the timer is already armed, just swallow them.
         "repeat" => CLAIMED,
         "release" => {
-            let mut ptt = PTT.lock().unwrap();
+            let mut ptt = voice.ptt.lock().unwrap();
             // A release with no matching press (e.g. pressed before PTT was
             // enabled) is not ours.
             if ptt.pressed_at.take().is_none() {
@@ -1096,7 +1239,7 @@ fn handle_ptt_key(raw: &str, wanted: &str) -> i32 {
             // recording after this release. Drawn from the same monotonic
             // counter as presses so the two can never collide.
             let released_token = ptt.token;
-            ptt.token = next_ptt_token();
+            ptt.token = next_ptt_token(voice);
             ptt.pressed_token = None;
             if let Some(stop) = ptt.stop.take() {
                 // Record this press's send intent. Keyed by token so it cannot
@@ -1112,9 +1255,8 @@ fn handle_ptt_key(raw: &str, wanted: &str) -> i32 {
 
 /// Monotonic token identifying the current press. Bumped on release so a
 /// pending hold-timer thread knows its press is over.
-fn next_ptt_token() -> u64 {
-    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
-    NEXT.fetch_add(1, Ordering::Relaxed)
+fn next_ptt_token(voice: &Arc<RuntimeContext>) -> u64 {
+    voice.next_ptt.fetch_add(1, Ordering::Relaxed)
 }
 
 /// Wait out the hold threshold, then open the mic if the same press is still
@@ -1123,21 +1265,18 @@ fn next_ptt_token() -> u64 {
 /// Shows a countdown while the key is held so the user gets immediate feedback
 /// that they are entering speaking mode — without it, the 2-second hold is dead
 /// air and there is no way to know a press registered at all.
-fn arm_ptt_start(token: u64, hold_ms: u64) {
-    let Some(runtime) = RUNTIME_CTX.get().copied() else {
-        return;
-    };
-    std::thread::Builder::new()
-        .name("rpi-voice-ptt-arm".to_string())
-        .spawn(move || {
+fn arm_ptt_start(voice: &Arc<RuntimeContext>, token: u64, hold_ms: u64) {
+    voice
+        .spawn("rpi-voice-ptt-arm", move |worker| {
+            let voice = &worker;
             let started = std::time::Instant::now();
             // Step the countdown at the host's status-poll interval so every
             // frame has a chance to paint.
-            loop {
+            while !voice.is_stopping() {
                 let elapsed = started.elapsed().as_millis() as u64;
                 // Still held, and still the same press?
                 let (ours, nothing_held) = {
-                    let ptt = PTT.lock().unwrap();
+                    let ptt = voice.ptt.lock().unwrap();
                     let ours = ptt.pressed_at.is_some() && ptt.token == token && ptt.stop.is_none();
                     (ours, ptt.pressed_at.is_none())
                 };
@@ -1148,17 +1287,17 @@ fn arm_ptt_start(token: u64, hold_ms: u64) {
                     // newer press already took over, its own countdown owns the
                     // status line and this stale thread must not stomp it.
                     if nothing_held {
-                        runtime.set_status("voice: idle");
+                        voice.set_status("voice: idle");
                     }
                     return;
                 }
                 if elapsed >= hold_ms {
                     break;
                 }
-                runtime.set_status(&hold_status(elapsed, hold_ms));
+                voice.set_status(&hold_status(elapsed, hold_ms));
                 std::thread::sleep(std::time::Duration::from_millis(LISTENING_FRAME_MS));
             }
-            start_ptt_recording(token, runtime);
+            start_ptt_recording(voice, token);
         })
         .ok();
 }
@@ -1181,43 +1320,46 @@ fn hold_status(elapsed_ms: u64, hold_ms: u64) -> String {
 
 /// Open the mic for a push-to-talk utterance. Ends on key release (the release
 /// handler sets the stop flag) or at `ptt_max_ms()` as a stuck-key safety cap.
-fn start_ptt_recording(token: u64, runtime: RuntimeContext) {
-    if RECORDING.load(Ordering::Relaxed) {
+fn start_ptt_recording(voice: &Arc<RuntimeContext>, token: u64) {
+    if voice.is_stopping() {
         return;
     }
     // The hold threshold was reached: the user is about to speak, so cut off
     // whatever the assistant is still reading aloud (barge-in). A long press
     // also resumes a paused Auto session.
-    if AUTO_MODE_ENABLED.load(Ordering::Relaxed) {
-        AUTO_TALK_ENABLED.store(true, Ordering::Relaxed);
+    if voice.auto_mode_enabled.load(Ordering::Relaxed) {
+        voice.auto_talk_enabled.store(true, Ordering::Relaxed);
     }
-    preload_stt_model();
-    stop_playback();
+    preload_stt_model(voice);
+    stop_playback(voice);
     let stop = Arc::new(AtomicBool::new(false));
     {
-        let mut ptt = PTT.lock().unwrap();
+        let mut ptt = voice.ptt.lock().unwrap();
         // The press ended while we were starting up — don't record at all.
-        if ptt.pressed_at.is_none() || ptt.token != token || ptt.stop.is_some() {
+        if ptt.pressed_at.is_none()
+            || ptt.token != token
+            || ptt.stop.is_some()
+            || voice.recording.swap(true, Ordering::AcqRel)
+        {
             return;
         }
         ptt.stop = Some(stop.clone());
         ptt.recording_owner = Some(token);
     }
 
-    RECORDING.store(true, Ordering::Relaxed);
     // Publish the meter's first frame so the line is correct even if the
     // animation thread fails to spawn below.
-    runtime.set_status(&listening_status(0.0, 0, ListenHint::Release, None, 0));
+    voice.set_status(&listening_status(0.0, 0, ListenHint::Release, None, 0));
     // Drive a "listening" animation from the live input level. The host repaints
     // only when this status string actually changes, so the watcher steps a bar
     // whose width tracks the microphone — the user sees the meter move as they
     // speak, and a still bar means the mic isn't picking anything up.
-    let meter = recorder::LevelMeter::new();
-    let animation = start_listening_animation(runtime, meter.clone(), ListenHint::Release, None, 0);
-
-    std::thread::Builder::new()
-        .name("rpi-voice-ptt".to_string())
-        .spawn(move || {
+    if voice
+        .spawn("rpi-voice-ptt", move |worker| {
+            let voice = &worker;
+            let meter = recorder::LevelMeter::new();
+            let animation =
+                start_listening_animation(voice, meter.clone(), ListenHint::Release, None, 0);
             let params = recorder::RecordParams {
                 // Release normally ends this; the cap only guards a stuck key.
                 max_ms: ptt_max_ms(),
@@ -1228,8 +1370,8 @@ fn start_ptt_recording(token: u64, runtime: RuntimeContext) {
                 no_speech_ms: None,
                 warmup_ms: 0,
             };
-            let result = recorder::record_until_with_level(stop, params, Some(meter));
-            RECORDING.store(false, Ordering::Relaxed);
+            let result = capture(voice, stop, params, meter);
+            voice.recording.store(false, Ordering::Relaxed);
             // Stop the animation before the transcribing status is published, so
             // the two writers can't fight over the key.
             if let Some(animation) = animation {
@@ -1239,45 +1381,49 @@ fn start_ptt_recording(token: u64, runtime: RuntimeContext) {
             // Read the intent the release handler recorded, then clear state.
             // Ownership-checked: if a newer press started while this recording
             // was tearing down, leave its state alone.
-            let send = ptt_finish(token);
+            let send = ptt_finish(voice, token);
 
             match result {
-                Ok(rec) if send => match finish_recording(&runtime, rec, false, None) {
-                    Ok(()) => set_status_unless_pressed(&runtime, "voice: idle"),
+                Ok(rec) if send => match finish_recording(voice, rec, false, None) {
+                    Ok(()) => set_status_unless_pressed(voice, "voice: idle"),
                     Err(e) => {
                         eprintln!("[rpi-voice] PTT error: {e}");
-                        set_status_unless_pressed(&runtime, &format!("voice: ⚠ {e}"));
+                        set_status_unless_pressed(voice, &format!("voice: ⚠ {e}"));
                     }
                 },
                 // Released under the minimum, or the cap fired: nothing to send.
-                Ok(_) => set_status_unless_pressed(&runtime, "voice: idle"),
+                Ok(_) => set_status_unless_pressed(voice, "voice: idle"),
                 Err(e) => {
                     eprintln!("[rpi-voice] PTT recording error: {e}");
-                    set_status_unless_pressed(&runtime, &format!("voice: ⚠ {e}"));
+                    set_status_unless_pressed(voice, &format!("voice: ⚠ {e}"));
                 }
             }
         })
-        .ok();
+        .is_err()
+    {
+        ptt_finish(voice, token);
+        voice.recording.store(false, Ordering::Release);
+    }
 }
 
 /// Publish a terminal status only when no press is in flight, so a finishing
 /// recording cannot wipe the countdown of a newer press the user started while
 /// this one was still tearing down.
-fn set_status_unless_pressed(runtime: &RuntimeContext, value: &str) {
-    let pressed = PTT.lock().unwrap().pressed_at.is_some();
+fn set_status_unless_pressed(voice: &Arc<RuntimeContext>, value: &str) {
+    let pressed = voice.ptt.lock().unwrap().pressed_at.is_some();
     if !pressed {
-        runtime.set_status(value);
+        voice.set_status(value);
     }
 }
 
 /// Clear all push-to-talk state (used by tests and the `/voice ptt off` path),
 /// returning whether the pending recording should be sent.
-fn ptt_reset() -> bool {
-    let mut ptt = PTT.lock().unwrap();
+fn ptt_reset(voice: &Arc<RuntimeContext>) -> bool {
+    let mut ptt = voice.ptt.lock().unwrap();
     let send = !ptt.send_tokens.is_empty();
     ptt.pressed_at = None;
     ptt.pressed_token = None;
-    ptt.token = next_ptt_token();
+    ptt.token = next_ptt_token(voice);
     ptt.stop = None;
     ptt.recording_owner = None;
     ptt.send_tokens.clear();
@@ -1290,8 +1436,8 @@ fn ptt_reset() -> bool {
 /// When an overlapping newer press has already taken over, its `pressed_at` is
 /// left intact — otherwise the user's eventual release would find no press
 /// recorded and fall through to the editor as a typed space.
-fn ptt_finish(token: u64) -> bool {
-    let mut ptt = PTT.lock().unwrap();
+fn ptt_finish(voice: &Arc<RuntimeContext>, token: u64) -> bool {
+    let mut ptt = voice.ptt.lock().unwrap();
     // Consume this recording's own send intent (never a later press's).
     let send = if let Some(idx) = ptt.send_tokens.iter().position(|t| *t == token) {
         ptt.send_tokens.remove(idx);
@@ -1317,15 +1463,21 @@ pub struct ListeningAnimation {
     thread: Option<std::thread::JoinHandle<()>>,
 }
 
-impl ListeningAnimation {
-    /// Stop the animation and join its thread before another status writer
-    /// publishes a follow-up message. Joining also prevents stale animation
-    /// frames from a previous turn racing with the next recording.
-    pub fn stop(mut self) {
+impl Drop for ListeningAnimation {
+    fn drop(&mut self) {
         self.stop.store(true, Ordering::Relaxed);
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();
         }
+    }
+}
+
+impl ListeningAnimation {
+    /// Stop the animation and join its thread before another status writer
+    /// publishes a follow-up message. Joining also prevents stale animation
+    /// frames from a previous turn racing with the next recording.
+    pub fn stop(self) {
+        drop(self);
     }
 }
 
@@ -1393,7 +1545,7 @@ fn listening_status(
 /// `LISTENING_FRAME_MS`. Returns `None` if the thread could not be spawned
 /// (the recording still works; it just won't animate).
 fn start_listening_animation(
-    runtime: RuntimeContext,
+    voice: &Arc<RuntimeContext>,
     meter: recorder::LevelMeter,
     hint: ListenHint,
     start_window_ms: Option<u64>,
@@ -1401,13 +1553,15 @@ fn start_listening_animation(
 ) -> Option<ListeningAnimation> {
     let stop = Arc::new(AtomicBool::new(false));
     let stop_thread = stop.clone();
+    let owner = voice.clone();
     let started = std::time::Instant::now();
     let thread = std::thread::Builder::new()
         .name("rpi-voice-meter".to_string())
         .spawn(move || {
-            while !stop_thread.load(Ordering::Relaxed) {
+            let voice = &owner;
+            while !stop_thread.load(Ordering::Relaxed) && !voice.is_stopping() {
                 let elapsed = started.elapsed().as_millis() as u64;
-                runtime.set_status(&listening_status(
+                voice.set_status(&listening_status(
                     meter.get(),
                     elapsed,
                     hint,
@@ -1467,49 +1621,43 @@ fn playing_status(level: f32, frame: u64, elapsed_ms: u64) -> String {
 
 /// Handle to the running playback animation; stopping it publishes the final
 /// status synchronously so the footer never keeps a stale equalizer frame.
-pub struct PlayingAnimation {
-    stop: Arc<AtomicBool>,
-}
-
-impl PlayingAnimation {
-    pub fn stop(&self) {
-        self.stop.store(true, Ordering::Relaxed);
-    }
-}
-
 /// Animate the `voice` status while speech is on the speakers. Returns `None`
 /// when the thread could not be spawned (playback is unaffected — it just
 /// won't animate).
-fn start_playing_animation() -> Option<PlayingAnimation> {
-    let runtime = RUNTIME_CTX.get().copied()?;
+fn start_playing_animation(voice: &Arc<RuntimeContext>) -> Option<ListeningAnimation> {
     let stop = Arc::new(AtomicBool::new(false));
     let stop_thread = stop.clone();
-    let animation = PlayingAnimation { stop };
+    let owner = voice.clone();
+
     let started = std::time::Instant::now();
-    std::thread::Builder::new()
+    let thread = std::thread::Builder::new()
         .name("rpi-voice-eq".to_string())
         .spawn(move || {
+            let voice = &owner;
             let mut frame: u64 = 0;
-            while !stop_thread.load(Ordering::Relaxed) {
-                let level = f32::from_bits(PLAYBACK_LEVEL.load(Ordering::Relaxed));
+            while !stop_thread.load(Ordering::Relaxed) && !voice.is_stopping() {
+                let level = f32::from_bits(voice.playback_level.load(Ordering::Relaxed));
                 let elapsed = started.elapsed().as_millis() as u64;
-                runtime.set_status(&playing_status(level, frame, elapsed));
+                voice.set_status(&playing_status(level, frame, elapsed));
                 frame = frame.wrapping_add(1);
                 std::thread::sleep(std::time::Duration::from_millis(PLAYING_FRAME_MS));
             }
             // Hand the footer back, but never stomp a recording that started
             // while this utterance was still finishing.
-            set_idle_if_not_recording(&runtime);
+            set_idle_if_not_recording(voice);
         })
-        .ok()
-        .map(|_| animation)
+        .ok()?;
+    Some(ListeningAnimation {
+        stop,
+        thread: Some(thread),
+    })
 }
 
 /// Restore the resting status unless a recording owns the line right now.
-fn set_idle_if_not_recording(runtime: &RuntimeContext) {
-    let listening = PTT.lock().unwrap().recording_owner.is_some();
-    if !RECORDING.load(Ordering::Relaxed) && !listening {
-        runtime.set_status("voice: idle");
+fn set_idle_if_not_recording(voice: &Arc<RuntimeContext>) {
+    let listening = voice.ptt.lock().unwrap().recording_owner.is_some();
+    if !voice.recording.load(Ordering::Relaxed) && !listening {
+        voice.set_status("voice: idle");
     }
 }
 
@@ -1529,26 +1677,28 @@ fn set_idle_if_not_recording(runtime: &RuntimeContext) {
 /// Ordering matters for more than tidiness — starting the recording from the
 /// playback-completion point is what guarantees the microphone never overlaps
 /// the speakers, so the assistant cannot transcribe its own voice.
-fn maybe_auto_listen(runtime: RuntimeContext) {
-    if !AUTO_TALK_ENABLED.load(Ordering::Relaxed) {
+fn maybe_auto_listen(voice: &Arc<RuntimeContext>) {
+    if voice.is_stopping() || !voice.auto_talk_enabled.load(Ordering::Relaxed) {
         debug_log("auto-listen skipped: continuous mode is off");
         return;
     }
     // A manual recording (PTT or one-shot `/voice`) owns the mic right now. Its
     // own reply will trigger the next hands-free turn.
-    if RECORDING.load(Ordering::Relaxed) {
+    if voice.recording.swap(true, Ordering::AcqRel) {
         debug_log("auto-listen skipped: another recording owns the mic");
         return;
     }
     let stop = Arc::new(AtomicBool::new(false));
-    *AUTO_TALK_STOP.lock().unwrap() = Some(stop.clone());
-    let spawned = std::thread::Builder::new()
-        .name("rpi-voice-auto".to_string())
-        .spawn(move || auto_talk_turn(&runtime, stop))
+    *voice.auto_talk_stop.lock().unwrap() = Some(stop.clone());
+    let spawned = voice
+        .spawn("rpi-voice-auto", move |worker| {
+            auto_talk_turn(&worker, stop)
+        })
         .is_ok();
     if !spawned {
-        *AUTO_TALK_STOP.lock().unwrap() = None;
-        runtime.set_status("voice: ⚠ could not start the hands-free listener");
+        voice.recording.store(false, Ordering::Release);
+        *voice.auto_talk_stop.lock().unwrap() = None;
+        voice.set_status("voice: ⚠ could not start the hands-free listener");
     }
 }
 
@@ -1557,15 +1707,10 @@ fn maybe_auto_listen(runtime: RuntimeContext) {
 /// A turn that hears nothing is *not* the end of the conversation — the user may
 /// just be thinking — so the mic reopens, up to
 /// [`auto_talk_max_empty`] times in a row before the mode exits on its own.
-fn auto_talk_turn(runtime: &RuntimeContext, stop: Arc<AtomicBool>) {
-    // Claim the mic. If something else got there first, bow out quietly.
-    if RECORDING.swap(true, Ordering::Relaxed) {
-        debug_log("auto turn skipped: RECORDING was already set");
-        return;
-    }
+fn auto_talk_turn(voice: &Arc<RuntimeContext>, stop: Arc<AtomicBool>) {
     debug_log("auto turn: opening the mic");
-    let loop_result = loop {
-        if !AUTO_TALK_ENABLED.load(Ordering::Relaxed) || stop.load(Ordering::Relaxed) {
+    loop {
+        if !voice.auto_talk_enabled.load(Ordering::Relaxed) || stop.load(Ordering::Relaxed) {
             debug_log("auto turn aborted before/while recording");
             break;
         }
@@ -1574,10 +1719,10 @@ fn auto_talk_turn(runtime: &RuntimeContext, stop: Arc<AtomicBool>) {
             "auto turn: recording (no_speech_ms={:?}, silence_ms={}, max_ms={})",
             params.no_speech_ms, params.silence_ms, params.max_ms
         ));
-        match record_and_send_until(runtime, params, stop.clone(), ListenHint::Silence, true) {
+        match record_and_send_until(voice, params, stop.clone(), ListenHint::Silence, true) {
             Ok(()) => {
                 debug_log("auto turn: delivered a transcription");
-                AUTO_TALK_EMPTY.store(0, Ordering::Relaxed);
+                voice.auto_talk_empty.store(0, Ordering::Relaxed);
                 break;
             }
             Err(error) if is_empty_turn(&error) => {
@@ -1589,22 +1734,22 @@ fn auto_talk_turn(runtime: &RuntimeContext, stop: Arc<AtomicBool>) {
                 if !counts_as_empty_turn(
                     &error,
                     stop.load(Ordering::Relaxed),
-                    AUTO_TALK_ENABLED.load(Ordering::Relaxed),
+                    voice.auto_talk_enabled.load(Ordering::Relaxed),
                 ) {
                     debug_log("auto turn aborted on request — not counted as empty");
                     break;
                 }
-                let empties = AUTO_TALK_EMPTY.fetch_add(1, Ordering::Relaxed) + 1;
+                let empties = voice.auto_talk_empty.fetch_add(1, Ordering::Relaxed) + 1;
                 let max = auto_talk_max_empty();
-                let peak = f32::from_bits(LAST_PEAK_LEVEL.load(Ordering::Relaxed));
-                let secs = LAST_DURATION_MS.load(Ordering::Relaxed) as f64 / 1000.0;
+                let peak = f32::from_bits(voice.last_peak_level.load(Ordering::Relaxed));
+                let secs = voice.last_duration_ms.load(Ordering::Relaxed) as f64 / 1000.0;
                 debug_log(&format!(
                     "auto turn: empty ({empties}/{max}) — {error} (peak={peak:.4}, {secs:.1}s, speech={}ms)",
-                    LAST_SPEECH_MS.load(Ordering::Relaxed)
+                    voice.last_speech_ms.load(Ordering::Relaxed)
                 ));
                 if empties >= max {
-                    AUTO_TALK_ENABLED.store(false, Ordering::Relaxed);
-                    runtime.set_status(&format!(
+                    voice.auto_talk_enabled.store(false, Ordering::Relaxed);
+                    voice.set_status(&format!(
                         "voice: 💤 heard nothing {empties}× (peak {peak:.3}, {secs:.1}s) — continuous mode stopped; use `/voice auto` to resume"
                     ));
                     break;
@@ -1616,39 +1761,38 @@ fn auto_talk_turn(runtime: &RuntimeContext, stop: Arc<AtomicBool>) {
                 //   small       only room noise          → probably the wrong device
                 //   healthy     audio but no words       → timing or STT
                 if peak < DEAF_PEAK_LEVEL {
-                    runtime.set_status(&format!(
+                    voice.set_status(&format!(
                         "voice: 🎧 mic is silent (peak {peak:.4}, {secs:.1}s) — check the input device ({empties}/{max})"
                     ));
                 } else if peak < ROOM_NOISE_PEAK_LEVEL {
                     // The most common real-world cause: the microphone is fine but
                     // its level is far too low, so the voice never rises above the
                     // room. Name both fixes rather than the symptom.
-                    runtime.set_status(&format!(
+                    voice.set_status(&format!(
                         "voice: 🎧 only room noise (peak {peak:.3}, {secs:.1}s, gain {:.0}x) — wrong mic, or set RPI_VOICE_INPUT_GAIN ({empties}/{max})",
-                        f32::from_bits(LAST_GAIN.load(Ordering::Relaxed))
+                        f32::from_bits(voice.last_gain.load(Ordering::Relaxed))
                     ));
                 } else {
-                    runtime.set_status(&format!(
+                    voice.set_status(&format!(
                         "voice: 🎧 nothing heard (peak {peak:.3}, {secs:.1}s) — still listening ({empties}/{max})"
                     ));
                 }
             }
             Err(error) => {
                 debug_log(&format!("auto turn: failed — {error}"));
-                AUTO_TALK_ENABLED.store(false, Ordering::Relaxed);
-                runtime.set_status(&format!("voice: ⚠ {error}"));
+                voice.auto_talk_enabled.store(false, Ordering::Relaxed);
+                voice.set_status(&format!("voice: ⚠ {error}"));
                 break;
             }
         }
-    };
-    let _ = loop_result;
+    }
     {
-        let mut slot = AUTO_TALK_STOP.lock().unwrap();
+        let mut slot = voice.auto_talk_stop.lock().unwrap();
         if slot.as_ref().is_some_and(|f| Arc::ptr_eq(f, &stop)) {
             *slot = None;
         }
     }
-    RECORDING.store(false, Ordering::Relaxed);
+    voice.recording.store(false, Ordering::Relaxed);
 }
 
 /// Turn on speech for replies, returning whether it had been muted.
@@ -1660,24 +1804,24 @@ fn auto_talk_turn(runtime: &RuntimeContext, stop: Arc<AtomicBool>) {
 ///
 /// One helper is the point: `/voice ptt` originally forgot this call and was
 /// silent, while `/voice auto` worked.
-fn enable_auto_tts() -> bool {
-    !AUTO_TTS_ENABLED.swap(true, Ordering::Relaxed)
+fn enable_auto_tts(voice: &Arc<RuntimeContext>) -> bool {
+    !voice.auto_tts_enabled.swap(true, Ordering::Relaxed)
 }
 
 /// Enable hands-free mode and listen immediately, so `/voice auto` starts the
 /// conversation rather than waiting for a reply that may never come.
-fn enable_auto_talk(runtime: RuntimeContext) -> String {
+fn enable_auto_talk(voice: &Arc<RuntimeContext>) -> String {
     // The loop is closed by *playback finishing*, so muted replies would leave
     // it stalled with the mic shut. Say so, since silently unmuting is rude.
-    let was_muted = enable_auto_tts();
-    preload_stt_model();
-    AUTO_TALK_ENABLED.store(true, Ordering::Relaxed);
-    AUTO_TALK_EMPTY.store(0, Ordering::Relaxed);
-    stop_playback();
+    let was_muted = enable_auto_tts(voice);
+    preload_stt_model(voice);
+    voice.auto_talk_enabled.store(true, Ordering::Relaxed);
+    voice.auto_talk_empty.store(0, Ordering::Relaxed);
+    stop_playback(voice);
     // `maybe_auto_listen` spawns the listener and returns immediately, so the
     // first turn starts right away instead of waiting for a reply to finish.
     debug_log("continuous mode ON");
-    maybe_auto_listen(runtime);
+    maybe_auto_listen(voice);
     let mut note = if was_muted {
         "🔊 Auto-TTS was off — turned it back on (the loop needs replies spoken)".to_string()
     } else {
@@ -1825,13 +1969,13 @@ fn sanitize_for_speech(text: &str) -> String {
 ///
 /// Checked immediately before playback rather than at enqueue time, because a
 /// keystroke or a held key during synthesis is exactly the case that matters.
-fn mic_owns_the_floor() -> bool {
-    if RECORDING.load(Ordering::Relaxed) {
+fn mic_owns_the_floor(voice: &Arc<RuntimeContext>) -> bool {
+    if voice.recording.load(Ordering::Relaxed) {
         return true;
     }
     // A push-to-talk press that has not reached its hold threshold yet has not
     // set `RECORDING`; the hold owns the key either way, so treat it as talking.
-    PTT.lock().unwrap().pressed_at.is_some()
+    voice.ptt.lock().unwrap().pressed_at.is_some()
 }
 
 /// Synthesize text to speech and play it (blocking).
@@ -1842,14 +1986,51 @@ fn mic_owns_the_floor() -> bool {
 /// aborts the synthesis itself — previously the flag only existed after
 /// `synthesize` had already buffered everything, which made an interrupt during
 /// the network fetch a no-op.
-fn synthesize_and_play(text: &str) -> Result<(), String> {
-    let voice = current_voice();
+fn synthesize_and_play(
+    voice: &Arc<RuntimeContext>,
+    text: &str,
+    generation: u64,
+) -> Result<(), String> {
+    let voice_name = current_voice(voice);
     let stop = Arc::new(AtomicBool::new(false));
     // Published up front so a keystroke can cut the utterance short from the
     // very first byte. A stale handle would let a later barge-in flag a dead
     // utterance, so every exit path clears it (below).
-    *PLAYBACK_STOP.lock().unwrap() = Some(stop.clone());
-    let animation = start_playing_animation();
+    {
+        let mut playback = voice.playback_stop.lock().unwrap();
+        if voice.is_stopping()
+            || generation != voice.playback_generation.load(Ordering::Relaxed)
+            || mic_owns_the_floor(voice)
+        {
+            return Ok(());
+        }
+        *playback = Some(stop.clone());
+    }
+    let result = play_speech(voice, text, voice_name, stop.clone());
+    {
+        let mut slot = voice.playback_stop.lock().unwrap();
+        if slot.as_ref().is_some_and(|f| Arc::ptr_eq(f, &stop)) {
+            *slot = None;
+        }
+    }
+    voice
+        .playback_level
+        .store(0f32.to_bits(), Ordering::Relaxed);
+    result
+}
+
+fn play_speech(
+    voice: &Arc<RuntimeContext>,
+    text: &str,
+    voice_name: String,
+    stop: Arc<AtomicBool>,
+) -> Result<(), String> {
+    let lease = match audio_lease::Lease::acquire(voice, audio_lease::Direction::Playback, &stop) {
+        Err(e) if e == player::CANCELLED => return Ok(()),
+        result => result?,
+    };
+    voice.native_audio_used.store(true, Ordering::Release);
+    let animation = start_playing_animation(voice);
 
     let stop_for_stream = stop.clone();
     // The producer thread takes ownership, so hand it an owned copy of the text
@@ -1859,7 +2040,7 @@ fn synthesize_and_play(text: &str) -> Result<(), String> {
         move |sink: &mut dyn FnMut(&[u8]) -> Result<(), String>| {
             let (end, bytes) = rpi_tts::synthesize_stream(
                 &text,
-                &voice,
+                &voice_name,
                 "+0%",
                 "+0Hz",
                 "+0%",
@@ -1875,21 +2056,13 @@ fn synthesize_and_play(text: &str) -> Result<(), String> {
             Ok(())
         },
         stop.clone(),
-        &PLAYBACK_LEVEL,
+        &voice.playback_level,
     );
 
     if let Some(animation) = animation {
         animation.stop();
     }
-    // Drop our handle only if it is still ours — an interrupt may have taken it
-    // already, and a newer utterance must not be clobbered.
-    {
-        let mut slot = PLAYBACK_STOP.lock().unwrap();
-        if slot.as_ref().is_some_and(|f| Arc::ptr_eq(f, &stop)) {
-            *slot = None;
-        }
-    }
-    PLAYBACK_LEVEL.store(0f32.to_bits(), Ordering::Relaxed);
+    drop(lease);
     // `Ok(false)` is "the user cancelled", which is not a failure to report.
     result.map(|_played_to_end| ())
 }
@@ -1899,12 +2072,18 @@ fn synthesize_and_play(text: &str) -> Result<(), String> {
 // ---------------------------------------------------------------------------
 
 rpi_plugin_sdk::string_handler! {
-fn voice_command(args_json, out, _user_data) {
-    handle_voice_command(args_json, out)
+fn voice_command(args_json, out, user_data) {
+    let Some(owner) = registration::callback(user_data) else { return 1; };
+    let voice = &owner;
+    handle_voice_command(voice, args_json, out)
 }
 }
 
-fn handle_voice_command(args_json: &str, out: &mut rpi_plugin_sdk::callbacks::Output<'_>) -> i32 {
+fn handle_voice_command(
+    voice: &Arc<RuntimeContext>,
+    args_json: &str,
+    out: &mut rpi_plugin_sdk::callbacks::Output<'_>,
+) -> i32 {
     let args_str = args_json;
     let args: Value = serde_json::from_str(args_str).unwrap_or(Value::Null);
     let action = args
@@ -1921,17 +2100,17 @@ fn handle_voice_command(args_json: &str, out: &mut rpi_plugin_sdk::callbacks::Ou
 
     match verb {
         "off" => {
-            AUTO_TTS_ENABLED.store(false, Ordering::Relaxed);
-            AUTO_MODE_ENABLED.store(false, Ordering::Relaxed);
+            voice.auto_tts_enabled.store(false, Ordering::Relaxed);
+            voice.auto_mode_enabled.store(false, Ordering::Relaxed);
             // Turning Auto-TTS off must also stop hands-free mode. Otherwise a
             // running continuous loop can call `enable_auto_talk` on its next
             // turn and silently turn Auto-TTS back on.
-            AUTO_TALK_ENABLED.store(false, Ordering::Relaxed);
-            if let Some(stop) = AUTO_TALK_STOP.lock().unwrap().take() {
+            voice.auto_talk_enabled.store(false, Ordering::Relaxed);
+            if let Some(stop) = voice.auto_talk_stop.lock().unwrap().take() {
                 stop.store(true, Ordering::Relaxed);
             }
             // Muting means silence *now*, not from the next reply on.
-            stop_playback();
+            stop_playback(voice);
             set_output(
                 out,
                 json!({"kind": "message", "text": "🔇 Auto-TTS disabled; continuous mode stopped"}),
@@ -1956,30 +2135,23 @@ fn handle_voice_command(args_json: &str, out: &mut rpi_plugin_sdk::callbacks::Ou
                 }
             };
             if !enable {
-                AUTO_MODE_ENABLED.store(false, Ordering::Relaxed);
-                AUTO_TALK_ENABLED.store(false, Ordering::Relaxed);
+                voice.auto_mode_enabled.store(false, Ordering::Relaxed);
+                voice.auto_talk_enabled.store(false, Ordering::Relaxed);
                 // Abort the in-flight listen (and any speech) right away.
-                let stop = AUTO_TALK_STOP.lock().unwrap().take();
+                let stop = voice.auto_talk_stop.lock().unwrap().take();
                 if let Some(stop) = stop {
                     stop.store(true, Ordering::Relaxed);
                 }
-                stop_playback();
+                stop_playback(voice);
                 set_output(
                     out,
                     json!({"kind": "message", "text": "⏹ Continuous mode off"}),
                 );
                 return 0;
             }
-            let Some(ctx) = RUNTIME_CTX.get().copied() else {
-                set_output(
-                    out,
-                    json!({"kind": "message", "text": "❌ Runtime context not available"}),
-                );
-                return 1;
-            };
-            AUTO_MODE_ENABLED.store(true, Ordering::Relaxed);
-            preload_stt_model();
-            let note = enable_auto_talk(ctx);
+            voice.auto_mode_enabled.store(true, Ordering::Relaxed);
+            preload_stt_model(voice);
+            let note = enable_auto_talk(voice);
             set_output(out, json!({"kind": "message", "text": note}));
             return 0;
         }
@@ -1987,8 +2159,8 @@ fn handle_voice_command(args_json: &str, out: &mut rpi_plugin_sdk::callbacks::Ou
             // A manual stop is an explicit session-level mute, not just a
             // one-frame player interruption. Do not let the next assistant
             // message or continuous-mode callback turn speech back on.
-            AUTO_TTS_ENABLED.store(false, Ordering::Relaxed);
-            let stopped = stop_playback();
+            voice.auto_tts_enabled.store(false, Ordering::Relaxed);
+            let stopped = stop_playback(voice);
             set_output(
                 out,
                 json!({"kind": "message", "text": if stopped {
@@ -2000,7 +2172,7 @@ fn handle_voice_command(args_json: &str, out: &mut rpi_plugin_sdk::callbacks::Ou
             return 0;
         }
         "on" => {
-            AUTO_TTS_ENABLED.store(true, Ordering::Relaxed);
+            voice.auto_tts_enabled.store(true, Ordering::Relaxed);
             set_output(
                 out,
                 json!({"kind": "message", "text": "🔊 Auto-TTS enabled"}),
@@ -2008,7 +2180,7 @@ fn handle_voice_command(args_json: &str, out: &mut rpi_plugin_sdk::callbacks::Ou
             return 0;
         }
         "status" => {
-            set_output(out, json!({"kind": "message", "text": status_text()}));
+            set_output(out, json!({"kind": "message", "text": status_text(voice)}));
             return 0;
         }
         "ptt" => {
@@ -2026,32 +2198,32 @@ fn handle_voice_command(args_json: &str, out: &mut rpi_plugin_sdk::callbacks::Ou
                 }
             };
             if !enable {
-                PTT_ENABLED.store(false, Ordering::Relaxed);
+                voice.ptt_enabled.store(false, Ordering::Relaxed);
                 // Abort anything in flight: a release after this would otherwise
                 // send a half utterance.
-                let stop = PTT.lock().unwrap().stop.take();
+                let stop = voice.ptt.lock().unwrap().stop.take();
                 if let Some(stop) = stop {
                     stop.store(true, Ordering::Relaxed);
                 }
-                ptt_reset();
+                ptt_reset(voice);
                 set_output(
                     out,
                     json!({"kind": "message", "text": "🔇 Push-to-talk off"}),
                 );
                 return 0;
             }
-            PTT_ENABLED.store(true, Ordering::Relaxed);
+            voice.ptt_enabled.store(true, Ordering::Relaxed);
             // Push-to-talk is a spoken conversation, so replies must be read
             // aloud — without this the mode is silent.
-            let was_muted = enable_auto_tts();
-            preload_stt_model();
+            let was_muted = enable_auto_tts(voice);
+            preload_stt_model(voice);
             set_output(
                 out,
                 json!({"kind": "message", "text": format!(
                     "🎤 Push-to-talk ON\n  key: hold `{}` for {}s, release → {}\n  (only while the input box is empty; `/voice ptt off` to exit){}",
                     ptt_key(),
                     ptt_hold_ms() as f64 / 1000.0,
-                    match output_mode() {
+                    match output_mode(voice) {
                         OutputMode::Send => "send".to_string(),
                         OutputMode::Draft if draft_auto_send_ms() == 0 =>
                             "input box (Enter to send)".to_string(),
@@ -2076,11 +2248,11 @@ fn handle_voice_command(args_json: &str, out: &mut rpi_plugin_sdk::callbacks::Ou
                     out,
                     json!({"kind": "message", "text": format!(
                         "Transcription output: {}\nUsage: /voice output [draft|send]",
-                        output_mode_label()
+                        output_mode_label(voice)
                     )}),
                 ),
                 "draft" | "edit" => {
-                    *OUTPUT_OVERRIDE.lock().unwrap() = Some(OutputMode::Draft);
+                    *voice.output_override.lock().unwrap() = Some(OutputMode::Draft);
                     set_output(
                         out,
                         json!({"kind": "message", "text": format!(
@@ -2094,7 +2266,7 @@ fn handle_voice_command(args_json: &str, out: &mut rpi_plugin_sdk::callbacks::Ou
                     );
                 }
                 "send" | "direct" => {
-                    *OUTPUT_OVERRIDE.lock().unwrap() = Some(OutputMode::Send);
+                    *voice.output_override.lock().unwrap() = Some(OutputMode::Send);
                     set_output(
                         out,
                         json!({"kind": "message", "text": "➡ Transcriptions are sent immediately"}),
@@ -2190,27 +2362,21 @@ fn handle_voice_command(args_json: &str, out: &mut rpi_plugin_sdk::callbacks::Ou
         }
         "model" => {
             if rest == "download" {
-                let Some(ctx) = RUNTIME_CTX.get().copied() else {
-                    set_output(
-                        out,
-                        json!({"kind": "message", "text": "❌ Runtime context not available"}),
-                    );
-                    return 1;
-                };
                 set_output(
                     out,
                     json!({"kind": "message", "text": format!(
                         "⬇ Downloading STT model in the background…\n{}",
-                        model_info()
+                        model_info(voice)
                     )}),
                 );
-                std::thread::Builder::new()
-                    .name("rpi-voice-model".to_string())
-                    .spawn(move || match stt_prepare_model(&ctx) {
-                        Ok(_dir) => ctx.set_status("voice: model ready"),
-                        Err(e) => {
-                            eprintln!("[rpi-voice] model download error: {e}");
-                            ctx.set_status(&format!("voice: ⚠ {e}"));
+                voice
+                    .spawn("rpi-voice-model", move |worker| {
+                        match stt_prepare_model(&worker) {
+                            Ok(_dir) => worker.set_status("voice: model ready"),
+                            Err(e) => {
+                                eprintln!("[rpi-voice] model download error: {e}");
+                                worker.set_status(&format!("voice: ⚠ {e}"));
+                            }
                         }
                     })
                     .ok();
@@ -2228,7 +2394,7 @@ fn handle_voice_command(args_json: &str, out: &mut rpi_plugin_sdk::callbacks::Ou
                 }
                 #[cfg(feature = "local-stt")]
                 {
-                    if local_stt::is_ready() {
+                    if voice.recognizer_ready() {
                         set_output(
                             out,
                             json!({"kind": "message", "text":
@@ -2236,30 +2402,22 @@ fn handle_voice_command(args_json: &str, out: &mut rpi_plugin_sdk::callbacks::Ou
                         );
                         return 0;
                     }
-                    let Some(ctx) = RUNTIME_CTX.get().copied() else {
-                        set_output(
-                            out,
-                            json!({"kind": "message", "text": "❌ Runtime context not available"}),
-                        );
-                        return 1;
-                    };
                     set_output(
                         out,
                         json!({"kind": "message", "text":
                             "🧠 Loading the STT model now… (~5 s, one time)
   speak once it says ready — /voice status shows the state"}),
                     );
-                    std::thread::Builder::new()
-                        .name("rpi-voice-stt-load".to_string())
-                        .spawn(move || {
-                            local_stt::preload_in_background();
+                    voice
+                        .spawn("rpi-voice-stt-load", move |worker| {
+                            let voice = &worker;
                             // Wait for the actual result so the status line can
                             // report success or the load error.
-                            match local_stt::preload() {
-                                Ok(()) => ctx.set_status("voice: 🧠 model ready"),
+                            match voice.recognizer().as_ref() {
+                                Ok(_) => voice.set_status("voice: 🧠 model ready"),
                                 Err(e) => {
                                     eprintln!("[rpi-voice] STT load error: {e}");
-                                    ctx.set_status(&format!("voice: ⚠ {e}"));
+                                    voice.set_status(&format!("voice: ⚠ {e}"));
                                 }
                             }
                         })
@@ -2267,7 +2425,7 @@ fn handle_voice_command(args_json: &str, out: &mut rpi_plugin_sdk::callbacks::Ou
                     return 0;
                 }
             }
-            set_output(out, json!({"kind": "message", "text": model_info()}));
+            set_output(out, json!({"kind": "message", "text": model_info(voice)}));
             return 0;
         }
         "set" | "voice" => {
@@ -2276,12 +2434,12 @@ fn handle_voice_command(args_json: &str, out: &mut rpi_plugin_sdk::callbacks::Ou
                     out,
                     json!({"kind": "message", "text": format!(
                         "Current voice: {}\nUsage: /voice set <voice-name>",
-                        current_voice()
+                        current_voice(voice)
                     )}),
                 );
                 return 0;
             }
-            *VOICE_OVERRIDE.lock().unwrap() = Some(rest.to_string());
+            *voice.voice_override.lock().unwrap() = Some(rest.to_string());
             set_output(
                 out,
                 json!({"kind": "message", "text": format!("🔊 TTS voice set to {rest}")}),
@@ -2306,7 +2464,7 @@ fn handle_voice_command(args_json: &str, out: &mut rpi_plugin_sdk::callbacks::Ou
     }
 
     // Default: start voice input.
-    if RECORDING.load(Ordering::Relaxed) {
+    if voice.recording.swap(true, Ordering::AcqRel) {
         set_output(
             out,
             json!({"kind": "message", "text": "⏳ Already recording… please wait"}),
@@ -2314,18 +2472,9 @@ fn handle_voice_command(args_json: &str, out: &mut rpi_plugin_sdk::callbacks::Ou
         return 0;
     }
 
-    let Some(ctx) = RUNTIME_CTX.get().copied() else {
-        set_output(
-            out,
-            json!({"kind": "message", "text": "❌ Runtime context not available"}),
-        );
-        return 1;
-    };
-
     // Starting a fresh dictation silences the assistant first (barge-in):
     // otherwise the mic would pick up its own voice through the speakers.
-    stop_playback();
-    RECORDING.store(true, Ordering::Relaxed);
+    stop_playback(voice);
     let params = recorder::RecordParams::from_env();
     set_output(
         out,
@@ -2336,29 +2485,45 @@ fn handle_voice_command(args_json: &str, out: &mut rpi_plugin_sdk::callbacks::Ou
         )}),
     );
 
-    std::thread::Builder::new()
-        .name("rpi-voice-input".to_string())
-        .spawn(move || {
-            let result = record_and_send(&ctx, params);
-            RECORDING.store(false, Ordering::Relaxed);
+    if voice
+        .spawn("rpi-voice-input", move |worker| {
+            let voice = &worker;
+            let result = record_and_send(voice, params);
+            voice.recording.store(false, Ordering::Relaxed);
             match result {
-                Ok(()) => ctx.set_status("voice: idle"),
+                Ok(()) => voice.set_status("voice: idle"),
                 Err(e) => {
                     eprintln!("[rpi-voice] Voice input error: {e}");
-                    ctx.set_status(&format!("voice: ⚠ {e}"));
+                    voice.set_status(&format!("voice: ⚠ {e}"));
                 }
             }
         })
-        .expect("spawn rpi-voice input thread");
+        .is_err()
+    {
+        voice.recording.store(false, Ordering::Release);
+        set_output(
+            out,
+            json!({"kind":"message","text":"⚠ Could not start voice input"}),
+        );
+        return 1;
+    }
 
     0
 }
 
 /// Record from microphone, transcribe, and deliver the text.
-fn record_and_send(runtime: &RuntimeContext, params: recorder::RecordParams) -> Result<(), String> {
+fn record_and_send(
+    voice: &Arc<RuntimeContext>,
+    params: recorder::RecordParams,
+) -> Result<(), String> {
     // Recording auto-stops on silence; the stop flag lets it be cut short.
-    let stop = Arc::new(AtomicBool::new(false));
-    record_and_send_until(runtime, params, stop, ListenHint::Silence, false)
+    record_and_send_until(
+        voice,
+        params,
+        voice.manual_stop.clone(),
+        ListenHint::Silence,
+        false,
+    )
 }
 
 /// Like [`record_and_send`], but with a caller-owned stop flag — the hands-free
@@ -2368,7 +2533,7 @@ fn record_and_send(runtime: &RuntimeContext, params: recorder::RecordParams) -> 
 /// Every recording path goes through here so they all show the same live level
 /// meter while the mic is open: push-to-talk, one-shot `/voice`, and hands-free
 fn record_and_send_until(
-    runtime: &RuntimeContext,
+    voice: &Arc<RuntimeContext>,
     params: recorder::RecordParams,
     stop: Arc<AtomicBool>,
     hint: ListenHint,
@@ -2381,20 +2546,30 @@ fn record_and_send_until(
         ListenHint::Silence => params.no_speech_ms,
         ListenHint::Release => None,
     };
-    let animation =
-        start_listening_animation(*runtime, meter.clone(), hint, window, params.warmup_ms);
+    let animation = start_listening_animation(voice, meter.clone(), hint, window, params.warmup_ms);
     // Publish the first frame so the line is right even if the animation thread
     // could not be spawned.
-    runtime.set_status(&listening_status(0.0, 0, hint, window, params.warmup_ms));
+    voice.set_status(&listening_status(0.0, 0, hint, window, params.warmup_ms));
 
-    let recorded = recorder::record_until_with_level(stop.clone(), params, Some(meter));
+    let recorded = capture(voice, stop.clone(), params, meter);
     // Stop the animation before publishing any follow-up status ("transcribing…"),
     // so the two writers cannot fight over the status line.
     if let Some(animation) = animation {
         animation.stop();
     }
 
-    finish_recording(runtime, recorded?, auto_mode, Some(&stop))
+    finish_recording(voice, recorded?, auto_mode, Some(&stop))
+}
+
+fn capture(
+    voice: &Arc<RuntimeContext>,
+    stop: Arc<AtomicBool>,
+    params: recorder::RecordParams,
+    meter: recorder::LevelMeter,
+) -> Result<recorder::Recording, String> {
+    let _lease = audio_lease::Lease::acquire(voice, audio_lease::Direction::Capture, &stop)?;
+    voice.native_audio_used.store(true, Ordering::Release);
+    recorder::record_until_with_level(stop, params, Some(meter))
 }
 
 /// The error to report when a recording produced no usable speech.
@@ -2424,21 +2599,27 @@ fn no_speech_error(recording: &recorder::Recording) -> String {
 /// Shared by the `/voice` one-shot path and push-to-talk (which ends the
 /// recording on key release rather than on trailing silence).
 fn finish_recording(
-    runtime: &RuntimeContext,
+    voice: &Arc<RuntimeContext>,
     recording: recorder::Recording,
     auto_mode: bool,
     stop: Option<&AtomicBool>,
 ) -> Result<(), String> {
-    if stop.is_some_and(|s| s.load(Ordering::Relaxed)) {
+    if voice.is_stopping() || stop.is_some_and(|s| s.load(Ordering::Relaxed)) {
         return Err("recording cancelled".into());
     }
     // Publish the capture diagnostics first: every exit below (too short, no
     // speech, a failed request) is otherwise indistinguishable to the user from
     // "the mic is not working".
-    LAST_PEAK_LEVEL.store(recording.peak_level.to_bits(), Ordering::Relaxed);
-    LAST_SPEECH_MS.store(recording.speech_ms as usize, Ordering::Relaxed);
-    LAST_GAIN.store(recording.gain.to_bits(), Ordering::Relaxed);
-    LAST_DURATION_MS.store(
+    voice
+        .last_peak_level
+        .store(recording.peak_level.to_bits(), Ordering::Relaxed);
+    voice
+        .last_speech_ms
+        .store(recording.speech_ms as usize, Ordering::Relaxed);
+    voice
+        .last_gain
+        .store(recording.gain.to_bits(), Ordering::Relaxed);
+    voice.last_duration_ms.store(
         (recording.duration_secs() * 1000.0) as usize,
         Ordering::Relaxed,
     );
@@ -2452,18 +2633,20 @@ fn finish_recording(
         recording.speech_ms,
         recording.samples.len()
     ));
-    LAST_CLIPPED.store(recording.clipped_ratio.to_bits(), Ordering::Relaxed);
+    voice
+        .last_clipped
+        .store(recording.clipped_ratio.to_bits(), Ordering::Relaxed);
     if recording.duration_secs() < 0.4 {
         return Err(ERR_TOO_SHORT.to_string());
     }
 
-    runtime.set_status("voice: 📝 transcribing…");
+    voice.set_status("voice: 📝 transcribing…");
     let language = std::env::var("RPI_VOICE_STT_LANG")
         .ok()
         .filter(|s| !s.trim().is_empty());
-    let text = transcribe(runtime, &recording, language.as_deref())?;
+    let text = transcribe(voice, &recording, language.as_deref())?;
     // A pause while STT was running must not inject an utterance afterwards.
-    if stop.is_some_and(|s| s.load(Ordering::Relaxed)) {
+    if voice.is_stopping() || stop.is_some_and(|s| s.load(Ordering::Relaxed)) {
         return Err("recording cancelled".into());
     }
 
@@ -2471,21 +2654,21 @@ fn finish_recording(
         return Err(no_speech_error(&recording));
     }
 
-    pet::caption(&text, "user");
+    pet::caption(voice, &text, "user");
     match if auto_mode {
         OutputMode::Draft
     } else {
-        output_mode()
+        output_mode(voice)
     } {
         OutputMode::Send => {
-            runtime.set_status(&format!("voice: ➡ {}", truncate(&text, 40)));
-            runtime.action(RuntimeActionId::SendUserMessage, json!({ "text": text }))?;
+            voice.set_status(&format!("voice: ➡ {}", truncate(&text, 40)));
+            voice.action(RuntimeActionId::SendUserMessage, json!({ "text": text }))?;
         }
         OutputMode::Draft => {
             // `append` keeps an in-progress draft: a second utterance is added
             // after the first rather than replacing it.
             let ms = draft_auto_send_ms();
-            runtime.set_status(&format!(
+            voice.set_status(&format!(
                 "voice: ✏️ draft{}",
                 if ms == 0 {
                     " — Enter to send".to_string()
@@ -2493,7 +2676,7 @@ fn finish_recording(
                     format!(" — auto-send in {}s (type to edit)", ms as f64 / 1000.0)
                 }
             ));
-            runtime.action(
+            voice.action(
                 RuntimeActionId::SetEditorText,
                 json!({ "text": text, "mode": "append", "autoSendMs": ms }),
             )?;
@@ -2505,7 +2688,7 @@ fn finish_recording(
 /// Transcribe a recording using the preferred engine, falling back to the API
 /// when the local model is unavailable and the preference is not forced.
 fn transcribe(
-    runtime: &RuntimeContext,
+    voice: &Arc<RuntimeContext>,
     recording: &recorder::Recording,
     language: Option<&str>,
 ) -> Result<String, String> {
@@ -2513,17 +2696,17 @@ fn transcribe(
     {
         let pref = stt_engine_pref();
         if pref != "api" {
-            match stt_prepare_model(runtime) {
+            match stt_prepare_model(voice) {
                 Ok(_dir) => {
                     // Usually already loaded (voice-on preloads it), so this is
                     // a lock, not a 5.5 s load. Only the very first utterance in
                     // a session where the preload lost the race still waits.
-                    if !local_stt::is_ready() {
-                        runtime.set_status("voice: 🧠 loading model…");
+                    if !voice.recognizer_ready() {
+                        voice.set_status("voice: 🧠 loading model…");
                     }
-                    let mut engine = local_stt::engine()?;
+                    let mut engine = voice.recognizer();
                     let engine = engine.as_mut().map_err(|e| e.clone())?;
-                    runtime.set_status("voice: 🧠 transcribing…");
+                    voice.set_status("voice: 🧠 transcribing…");
                     return engine.transcribe(&recording.to_f32_16k_mono());
                 }
                 Err(e) => {
@@ -2536,25 +2719,25 @@ fn transcribe(
         }
     }
 
-    runtime.set_status("voice: ☁ transcribing…");
+    voice.set_status("voice: ☁ transcribing…");
     let client = whisper::WhisperProvider::new(None, None)?;
     client.transcribe_wav(&recording.to_wav_bytes()?, language)
 }
 
 /// Ensure the local model files exist, reporting progress to the TUI status.
 #[cfg(feature = "local-stt")]
-fn stt_prepare_model(runtime: &RuntimeContext) -> Result<std::path::PathBuf, String> {
-    local_stt::ensure_model(|msg| runtime.set_status(&format!("voice: {msg}")))
+fn stt_prepare_model(voice: &Arc<RuntimeContext>) -> Result<std::path::PathBuf, String> {
+    local_stt::ensure_model(|msg| voice.set_status(&format!("voice: {msg}")))
 }
 
 #[cfg(not(feature = "local-stt"))]
 #[allow(dead_code)]
-fn stt_prepare_model(_runtime: &RuntimeContext) -> Result<std::path::PathBuf, String> {
+fn stt_prepare_model(_voice: &Arc<RuntimeContext>) -> Result<std::path::PathBuf, String> {
     Err("local STT not compiled in (rebuild with --features local-stt)".to_string())
 }
 
 /// Human-readable STT engine/model report for `/voice model`.
-fn model_info() -> String {
+fn model_info(_voice: &Arc<RuntimeContext>) -> String {
     let pref = stt_engine_pref();
     let mut lines = vec![
         "🧠 STT configuration".to_string(),
@@ -2577,7 +2760,7 @@ fn model_info() -> String {
             String::new()
         };
         #[cfg(feature = "local-stt")]
-        let loaded = if local_stt::is_ready() {
+        let loaded = if _voice.recognizer_ready() {
             " ✓ loaded in memory"
         } else {
             " (not loaded yet)"
@@ -2609,26 +2792,26 @@ fn truncate(s: &str, max: usize) -> String {
     out
 }
 
-fn status_text() -> String {
-    let enabled = AUTO_TTS_ENABLED.load(Ordering::Relaxed);
-    let playing = TTS_PLAYING.load(Ordering::Relaxed);
-    let recording = RECORDING.load(Ordering::Relaxed);
-    let ptt = PTT_ENABLED.load(Ordering::Relaxed);
+fn status_text(voice: &Arc<RuntimeContext>) -> String {
+    let enabled = voice.auto_tts_enabled.load(Ordering::Relaxed);
+    let playing = voice.tts_playing.load(Ordering::Relaxed);
+    let recording = voice.recording.load(Ordering::Relaxed);
+    let ptt = voice.ptt_enabled.load(Ordering::Relaxed);
     let mut lines = format!(
         "🎤 rpi-voice\n  Auto-TTS: {}\n  Voice: {}\n  Push-to-talk: {}\n  Continuous: {}\n  Output: {}\n  Input device: {}\n  Input level: {}\n  Last capture: {}\n  Playing: {}\n  Recording: {}\n  STT: {}",
         if enabled { "enabled" } else { "disabled" },
-        current_voice(),
+        current_voice(voice),
         if ptt {
             format!("on (hold `{}` {}s)", ptt_key(), ptt_hold_ms() as f64 / 1000.0)
         } else {
             "off".to_string()
         },
-        if AUTO_TALK_ENABLED.load(Ordering::Relaxed) {
+        if voice.auto_talk_enabled.load(Ordering::Relaxed) {
             "on (hands-free)".to_string()
         } else {
             "off".to_string()
         },
-        output_mode_label(),
+        output_mode_label(voice),
         {
             let active = recorder::active_input_device();
             match recorder::configured_device_pref() {
@@ -2640,15 +2823,15 @@ fn status_text() -> String {
         // What the last recording actually measured — the fastest way to tell a
         // dead microphone from a quiet one from a mis-selected one.
         {
-            let peak = f32::from_bits(LAST_PEAK_LEVEL.load(Ordering::Relaxed));
-            let speech = LAST_SPEECH_MS.load(Ordering::Relaxed);
+            let peak = f32::from_bits(voice.last_peak_level.load(Ordering::Relaxed));
+            let speech = voice.last_speech_ms.load(Ordering::Relaxed);
             if peak == 0.0 && speech == 0 {
                 "(nothing recorded yet)".to_string()
             } else {
                 format!(
                     "peak {peak:.4}, {:.1}s, gain {:.0}x, speech {speech}ms",
-                    LAST_DURATION_MS.load(Ordering::Relaxed) as f64 / 1000.0,
-                    f32::from_bits(LAST_GAIN.load(Ordering::Relaxed))
+                    voice.last_duration_ms.load(Ordering::Relaxed) as f64 / 1000.0,
+                    f32::from_bits(voice.last_gain.load(Ordering::Relaxed))
                 )
             }
         },
@@ -2660,7 +2843,7 @@ fn status_text() -> String {
         "\n  Output device: {}",
         player::active_output_device()
     ));
-    if let Some(err) = LAST_TTS_ERROR.lock().unwrap().as_ref() {
+    if let Some(err) = voice.last_tts_error.lock().unwrap().as_ref() {
         lines.push_str(&format!("\n  Last speech: ⚠ {err}"));
     }
     lines
@@ -2719,22 +2902,12 @@ fn set_output(out: &mut rpi_plugin_sdk::callbacks::Output<'_>, value: Value) {
 // ---------------------------------------------------------------------------
 // Plugin registration
 // ---------------------------------------------------------------------------
-rpi_plugin_sdk::export_plugin!(|api| {
-    let ctx = RuntimeContext { api: *api };
-    let _ = RUNTIME_CTX.set(ctx);
+rpi_plugin_sdk::export_plugin!(|api| { registration::register(api) });
+
+fn register_callbacks(api: &PluginApi) -> i32 {
     let rc = pet::register(api);
     if rc != 0 {
         return rc;
-    }
-
-    // Auto-TTS is opt-in. Set `RPI_VOICE_AUTO_TTS=on` to enable it
-    // for the whole session, or use `/voice on` interactively.
-    if let Ok(v) = std::env::var("RPI_VOICE_AUTO_TTS") {
-        let on = matches!(
-            v.trim().to_lowercase().as_str(),
-            "on" | "1" | "true" | "yes"
-        );
-        AUTO_TTS_ENABLED.store(on, Ordering::Relaxed);
     }
 
     // Auto-TTS consumes native Pi's real text deltas. MessageEnd only
@@ -2743,14 +2916,17 @@ rpi_plugin_sdk::export_plugin!(|api| {
         let rc = register_event(EventTag::MessageStart, on_message_start, api.user_data);
         if rc != 0 {
             eprintln!("[rpi-voice] Failed to register MessageStart handler: {rc}");
+            return rc;
         }
         let rc = register_event(EventTag::MessageUpdate, on_message_update, api.user_data);
         if rc != 0 {
             eprintln!("[rpi-voice] Failed to register MessageUpdate handler: {rc}");
+            return rc;
         }
         let rc = register_event(EventTag::MessageEnd, on_message_end, api.user_data);
         if rc != 0 {
             eprintln!("[rpi-voice] Failed to register MessageEnd flush handler: {rc}");
+            return rc;
         }
         // Push-to-talk: key events routed by the host. Subscribing is
         // harmless while PTT is off — the handler declines (CONTINUE)
@@ -2758,12 +2934,14 @@ rpi_plugin_sdk::export_plugin!(|api| {
         let rc = register_event(EventTag::Input, on_input_key, api.user_data);
         if rc != 0 {
             eprintln!("[rpi-voice] Failed to register Input handler: {rc}");
+            return rc;
         }
         // Barge-in: the user started typing, so stop the current
         // utterance. Harmless (and silent) when nothing is playing.
         let rc = register_event(EventTag::EditorChange, on_editor_change, api.user_data);
         if rc != 0 {
             eprintln!("[rpi-voice] Failed to register EditorChange handler: {rc}");
+            return rc;
         }
     }
 
@@ -2776,6 +2954,7 @@ rpi_plugin_sdk::export_plugin!(|api| {
         let rc = register_command(name, description, voice_command);
         if rc != 0 {
             eprintln!("[rpi-voice] Failed to register /voice command: {rc}");
+            return rc;
         }
     }
 
@@ -2806,7 +2985,7 @@ rpi_plugin_sdk::export_plugin!(|api| {
     }
 
     0 // Success
-});
+}
 
 // ---------------------------------------------------------------------------
 // Tests
@@ -2815,9 +2994,6 @@ rpi_plugin_sdk::export_plugin!(|api| {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// Serializes the tests that touch the process-global playback slot.
-    static PLAYBACK_TEST_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
     fn cumulative_assistant_snapshots_produce_only_the_new_suffix() {
@@ -2929,8 +3105,6 @@ mod tests {
 
     #[test]
     fn native_text_delta_buffer_flushes_complete_sentences_only() {
-        let _guard = PLAYBACK_TEST_LOCK.lock().unwrap();
-
         let mut buffer = "这是第一句。第二句还没结束".to_string();
         let chunks = take_speech_chunks(&mut buffer);
         assert_eq!(chunks, vec!["这是第一句。"]);
@@ -2977,20 +3151,22 @@ mod tests {
 
     #[test]
     fn streaming_reply_end_does_not_replay_cumulative_snapshot() {
-        let _guard = PLAYBACK_TEST_LOCK.lock().unwrap();
-        TEXT_DELTA_BUFFER.lock().unwrap().clear();
-        STREAM_REPLY_ACTIVE.store(true, Ordering::Relaxed);
+        let owner = registration::test_runtime();
+        let voice = &owner;
+
+        voice.text_delta_buffer.lock().unwrap().clear();
+        voice.stream_reply_active.store(true, Ordering::Relaxed);
         {
-            let mut buffer = TEXT_DELTA_BUFFER.lock().unwrap();
+            let mut buffer = voice.text_delta_buffer.lock().unwrap();
             buffer.push_str("已经播过的句子。剩余句子");
         }
 
         // The streaming reply owns the buffer; MessageEnd only flushes the
         // remainder and must not extract the final cumulative message again.
-        assert!(STREAM_REPLY_ACTIVE.swap(false, Ordering::Relaxed));
-        let remainder = std::mem::take(&mut *TEXT_DELTA_BUFFER.lock().unwrap());
+        assert!(voice.stream_reply_active.swap(false, Ordering::Relaxed));
+        let remainder = std::mem::take(&mut *voice.text_delta_buffer.lock().unwrap());
         assert_eq!(remainder, "已经播过的句子。剩余句子");
-        TEXT_DELTA_BUFFER.lock().unwrap().clear();
+        voice.text_delta_buffer.lock().unwrap().clear();
     }
 
     /// The equalizer is a real level meter: the bars track the audio loudness
@@ -3145,38 +3321,39 @@ mod tests {
     /// every turn. A human keystroke, by contrast, does stand it down.
     #[test]
     fn only_user_editor_changes_pause_continuous_mode() {
-        let _guard = PLAYBACK_TEST_LOCK.lock().unwrap();
+        let owner = registration::test_runtime();
+        let voice = &owner;
 
-        AUTO_TALK_ENABLED.store(true, Ordering::Relaxed);
-        let rc = handle_editor_change(r#"{"chars":5,"empty":false,"source":"extension"}"#);
+        voice.auto_talk_enabled.store(true, Ordering::Relaxed);
+        let rc = handle_editor_change(voice, r#"{"chars":5,"empty":false,"source":"extension"}"#);
         assert_eq!(rc, rpi_plugin_sdk::EVENT_HANDLER_CONTINUE);
         assert!(
-            AUTO_TALK_ENABLED.load(Ordering::Relaxed),
+            voice.auto_talk_enabled.load(Ordering::Relaxed),
             "the loop cancelled itself on its own injected draft"
         );
 
-        handle_editor_change(r#"{"chars":0,"empty":true}"#);
+        handle_editor_change(voice, r#"{"chars":0,"empty":true}"#);
         assert!(
-            AUTO_TALK_ENABLED.load(Ordering::Relaxed),
+            voice.auto_talk_enabled.load(Ordering::Relaxed),
             "clearing the command editor must not pause continuous mode"
         );
 
-        handle_editor_change(r#"{"chars":6,"empty":false,"source":"user"}"#);
+        handle_editor_change(voice, r#"{"chars":6,"empty":false,"source":"user"}"#);
         assert!(
-            !AUTO_TALK_ENABLED.load(Ordering::Relaxed),
+            !voice.auto_talk_enabled.load(Ordering::Relaxed),
             "typing must pause continuous mode"
         );
 
         // Absent `source` is read as the user: the safe direction, since the
         // worst case is a stopped voice rather than a mangled draft.
-        AUTO_TALK_ENABLED.store(true, Ordering::Relaxed);
-        handle_editor_change(r#"{"chars":1,"empty":false}"#);
-        assert!(!AUTO_TALK_ENABLED.load(Ordering::Relaxed));
+        voice.auto_talk_enabled.store(true, Ordering::Relaxed);
+        handle_editor_change(voice, r#"{"chars":1,"empty":false}"#);
+        assert!(!voice.auto_talk_enabled.load(Ordering::Relaxed));
 
         // A keystroke that pauses the mode claims no key and never vetoes.
-        AUTO_TALK_ENABLED.store(false, Ordering::Relaxed);
+        voice.auto_talk_enabled.store(false, Ordering::Relaxed);
         assert_eq!(
-            handle_editor_change("not json at all"),
+            handle_editor_change(voice, "not json at all"),
             rpi_plugin_sdk::EVENT_HANDLER_CONTINUE
         );
     }
@@ -3242,27 +3419,34 @@ mod tests {
     /// a second interrupt reports "nothing was playing" instead of lying.
     #[test]
     fn barge_in_stops_the_current_utterance_exactly_once() {
-        let _guard = PLAYBACK_TEST_LOCK.lock().unwrap();
-        *PLAYBACK_STOP.lock().unwrap() = None;
-        assert!(!stop_playback(), "idle: nothing to stop");
+        let owner = registration::test_runtime();
+        let voice = &owner;
+
+        *voice.playback_stop.lock().unwrap() = None;
+        assert!(!stop_playback(voice), "idle: nothing to stop");
 
         let flag = Arc::new(AtomicBool::new(false));
-        *PLAYBACK_STOP.lock().unwrap() = Some(flag.clone());
-        PLAYBACK_LEVEL.store(0.5f32.to_bits(), Ordering::Relaxed);
+        *voice.playback_stop.lock().unwrap() = Some(flag.clone());
+        voice
+            .playback_level
+            .store(0.5f32.to_bits(), Ordering::Relaxed);
 
-        assert!(stop_playback(), "a playing utterance must report a stop");
+        assert!(
+            stop_playback(voice),
+            "a playing utterance must report a stop"
+        );
         assert!(
             flag.load(Ordering::Relaxed),
             "the player's flag must be set"
         );
         assert_eq!(
-            f32::from_bits(PLAYBACK_LEVEL.load(Ordering::Relaxed)),
+            f32::from_bits(voice.playback_level.load(Ordering::Relaxed)),
             0.0,
             "the meter must drop to zero immediately"
         );
         // Handle consumed ⇒ never flag a later, unrelated utterance.
-        assert!(!stop_playback());
-        *PLAYBACK_STOP.lock().unwrap() = None;
+        assert!(!stop_playback(voice));
+        *voice.playback_stop.lock().unwrap() = None;
     }
 
     /// A barge-in must discard replies that are still *queued*, not just the one
@@ -3274,11 +3458,13 @@ mod tests {
     /// assistant transcribed its own voice.
     #[test]
     fn a_barge_in_supersedes_queued_utterances() {
-        let _guard = PLAYBACK_TEST_LOCK.lock().unwrap();
-        let before = PLAYBACK_GENERATION.load(Ordering::Relaxed);
+        let owner = registration::test_runtime();
+        let voice = &owner;
+
+        let before = voice.playback_generation.load(Ordering::Relaxed);
         // Reported "nothing playing" is fine — the queue still has to go.
-        let _ = stop_playback();
-        let after = PLAYBACK_GENERATION.load(Ordering::Relaxed);
+        let _ = stop_playback(voice);
+        let after = voice.playback_generation.load(Ordering::Relaxed);
         assert_eq!(
             after,
             before + 1,
@@ -3290,19 +3476,21 @@ mod tests {
     /// while one queued after it must be.
     #[test]
     fn only_jobs_from_the_current_generation_are_speakable() {
-        let _guard = PLAYBACK_TEST_LOCK.lock().unwrap();
-        let queued_at = PLAYBACK_GENERATION.load(Ordering::Relaxed);
+        let owner = registration::test_runtime();
+        let voice = &owner;
+
+        let queued_at = voice.playback_generation.load(Ordering::Relaxed);
         let stale = SpeechJob {
             text: "queued first".to_string(),
             generation: queued_at,
         };
-        let _ = stop_playback(); // the user interrupts
+        let _ = stop_playback(voice); // the user interrupts
         let fresh = SpeechJob {
             text: "said after the interrupt".to_string(),
-            generation: PLAYBACK_GENERATION.load(Ordering::Relaxed),
+            generation: voice.playback_generation.load(Ordering::Relaxed),
         };
 
-        let current = PLAYBACK_GENERATION.load(Ordering::Relaxed);
+        let current = voice.playback_generation.load(Ordering::Relaxed);
         assert_ne!(
             stale.generation, current,
             "the queued reply must be recognisable as superseded"
@@ -3322,50 +3510,51 @@ mod tests {
         // `with_ptt_state` is the shared lock for the process-global PTT state;
         // it resets on both sides, so this cannot leak into the other PTT tests
         // (which is exactly what happened when this test managed its own lock).
-        with_ptt_state(|| {
-            RECORDING.store(false, Ordering::Relaxed);
-            assert!(!mic_owns_the_floor(), "idle: the floor is free");
+        with_ptt_state(|voice| {
+            voice.recording.store(false, Ordering::Relaxed);
+            assert!(!mic_owns_the_floor(voice), "idle: the floor is free");
 
-            RECORDING.store(true, Ordering::Relaxed);
+            voice.recording.store(true, Ordering::Relaxed);
             assert!(
-                mic_owns_the_floor(),
+                mic_owns_the_floor(voice),
                 "an open microphone must block playback"
             );
-            RECORDING.store(false, Ordering::Relaxed);
+            voice.recording.store(false, Ordering::Relaxed);
 
             // A held key that has not reached the threshold yet still owns the
             // floor — `RECORDING` is not set until the hold elapses, but the key
             // is already claimed, so it must disable the editor too.
-            PTT.lock().unwrap().pressed_at = Some(std::time::Instant::now());
+            voice.ptt.lock().unwrap().pressed_at = Some(std::time::Instant::now());
             assert!(
-                mic_owns_the_floor(),
+                mic_owns_the_floor(voice),
                 "a held push-to-talk key must block playback"
             );
         });
-        assert!(!mic_owns_the_floor(), "state must be clean after the guard");
     }
 
     /// A transcription lands in the editor as an auto-sending draft by default;
     /// only an explicit `send` (env or `/voice output send`) bypasses it.
     #[test]
     fn output_mode_defaults_to_draft_and_send_is_opt_in() {
-        let previous = OUTPUT_OVERRIDE.lock().unwrap().take();
+        let owner = registration::test_runtime();
+        let voice = &owner;
+        let previous = voice.output_override.lock().unwrap().take();
         std::env::remove_var("RPI_VOICE_OUTPUT");
-        assert_eq!(output_mode(), OutputMode::Draft);
+        assert_eq!(output_mode(voice), OutputMode::Draft);
 
         std::env::set_var("RPI_VOICE_OUTPUT", "send");
-        assert_eq!(output_mode(), OutputMode::Send);
+        assert_eq!(output_mode(voice), OutputMode::Send);
         // An unrecognised value falls back to the safe (editable) default.
         std::env::set_var("RPI_VOICE_OUTPUT", "banana");
-        assert_eq!(output_mode(), OutputMode::Draft);
+        assert_eq!(output_mode(voice), OutputMode::Draft);
 
         // The session override wins over the environment.
         std::env::set_var("RPI_VOICE_OUTPUT", "send");
-        *OUTPUT_OVERRIDE.lock().unwrap() = Some(OutputMode::Draft);
-        assert_eq!(output_mode(), OutputMode::Draft);
+        *voice.output_override.lock().unwrap() = Some(OutputMode::Draft);
+        assert_eq!(output_mode(voice), OutputMode::Draft);
 
         std::env::remove_var("RPI_VOICE_OUTPUT");
-        *OUTPUT_OVERRIDE.lock().unwrap() = previous;
+        *voice.output_override.lock().unwrap() = previous;
     }
 
     /// The auto-send window is 2s by default and can be disabled (`0`) so the
@@ -3593,28 +3782,34 @@ mod tests {
         .to_string()
     }
 
-    /// PTT state is process-global; serialize the tests that touch it.
-    fn with_ptt_state<R>(f: impl FnOnce() -> R) -> R {
-        static LOCK: Mutex<()> = Mutex::new(());
-        let _guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        ptt_reset();
-        PTT_ENABLED.store(false, Ordering::Relaxed);
-        let out = f();
-        ptt_reset();
-        PTT_ENABLED.store(false, Ordering::Relaxed);
+    fn with_ptt_state<R>(f: impl FnOnce(&Arc<RuntimeContext>) -> R) -> R {
+        let owner = registration::test_runtime();
+        let out = f(&owner);
+        owner.finish();
         out
     }
 
     /// Drive `/voice` the way the host does: args in, output out.
-    fn run_voice_command(args: &str) -> (i32, String) {
+    #[allow(unsafe_code)]
+    fn run_voice_command(voice: &Arc<RuntimeContext>, args: &str) -> (i32, String) {
         let args_json = serde_json::json!({"args": args}).to_string();
         let mut out = StbString::empty();
-        let rc = voice_command(
-            StbStringRef::from_str(&args_json),
-            &mut out,
-            std::ptr::null_mut(),
-        );
-        (rc, out.to_string_lossy())
+        registration::with_test_callback(voice, || {
+            let rc = voice_command(
+                StbStringRef::from_str(&args_json),
+                &mut out,
+                voice.api.user_data,
+            );
+            // SAFETY: the fixture takes ownership of the plugin output.
+            let text = unsafe {
+                rpi_plugin_sdk::callbacks::OwnedString::from_raw(
+                    out,
+                    Some(rpi_plugin_sdk::callbacks::free_string),
+                )
+            }
+            .to_string_lossy();
+            (rc, text)
+        })
     }
 
     #[test]
@@ -3622,12 +3817,12 @@ mod tests {
         // The reported bug: `/voice ptt on` recorded and transcribed, but the
         // reply was never spoken, so the mode looked broken. PTT is a spoken
         // conversation, so enabling it must enable speech.
-        with_ptt_state(|| {
-            AUTO_TTS_ENABLED.store(false, Ordering::Relaxed);
-            let (rc, text) = run_voice_command("ptt on");
+        with_ptt_state(|voice| {
+            voice.auto_tts_enabled.store(false, Ordering::Relaxed);
+            let (rc, text) = run_voice_command(voice, "ptt on");
             assert_eq!(rc, 0);
             assert!(
-                AUTO_TTS_ENABLED.load(Ordering::Relaxed),
+                voice.auto_tts_enabled.load(Ordering::Relaxed),
                 "/voice ptt on must enable auto-TTS; output was: {text}"
             );
             // The user has to be told, since the switch is otherwise invisible.
@@ -3639,28 +3834,31 @@ mod tests {
     fn auto_tts_is_off_until_explicitly_enabled() {
         // The whole "/voice but no reading" confusion: recording and speech are
         // separate switches, and speech must stay off unless asked for.
-        with_ptt_state(|| {
-            AUTO_TTS_ENABLED.store(false, Ordering::Relaxed);
-            assert!(!AUTO_TTS_ENABLED.load(Ordering::Relaxed));
+        with_ptt_state(|voice| {
+            voice.auto_tts_enabled.store(false, Ordering::Relaxed);
+            assert!(!voice.auto_tts_enabled.load(Ordering::Relaxed));
         });
     }
 
     #[test]
     fn ptt_ignores_unrelated_keys_and_payloads() {
-        with_ptt_state(|| {
-            PTT_ENABLED.store(true, Ordering::Relaxed);
+        with_ptt_state(|voice| {
+            voice.ptt_enabled.store(true, Ordering::Relaxed);
             // A different key is never ours.
-            assert_eq!(handle_ptt_key(&key_json("a", "press"), "space"), CONTINUE);
+            assert_eq!(
+                handle_ptt_key(voice, &key_json("a", "press"), "space"),
+                CONTINUE
+            );
             // Not a key payload at all.
             assert_eq!(
-                handle_ptt_key(&json!({"type": "mouse"}).to_string(), "space"),
+                handle_ptt_key(voice, &json!({"type": "mouse"}).to_string(), "space"),
                 CONTINUE
             );
             // Malformed JSON must not panic or claim.
-            assert_eq!(handle_ptt_key("not json", "space"), CONTINUE);
+            assert_eq!(handle_ptt_key(voice, "not json", "space"), CONTINUE);
             // An unknown kind is not ours.
             assert_eq!(
-                handle_ptt_key(&key_json("space", "weird"), "space"),
+                handle_ptt_key(voice, &key_json("space", "weird"), "space"),
                 CONTINUE
             );
         });
@@ -3668,14 +3866,14 @@ mod tests {
 
     #[test]
     fn ptt_declines_while_disabled_so_the_key_still_types() {
-        with_ptt_state(|| {
+        with_ptt_state(|voice| {
             // Disabled: even the configured key passes through to the editor.
             assert_eq!(
-                handle_ptt_key(&key_json("space", "press"), "space"),
+                handle_ptt_key(voice, &key_json("space", "press"), "space"),
                 CONTINUE
             );
             assert_eq!(
-                handle_ptt_key(&key_json("space", "release"), "space"),
+                handle_ptt_key(voice, &key_json("space", "release"), "space"),
                 CONTINUE
             );
         });
@@ -3683,24 +3881,24 @@ mod tests {
 
     #[test]
     fn ptt_claims_press_and_release_while_enabled() {
-        with_ptt_state(|| {
-            PTT_ENABLED.store(true, Ordering::Relaxed);
+        with_ptt_state(|voice| {
+            voice.ptt_enabled.store(true, Ordering::Relaxed);
             assert_eq!(
-                handle_ptt_key(&key_json("space", "press"), "space"),
+                handle_ptt_key(voice, &key_json("space", "press"), "space"),
                 CLAIMED
             );
             // Repeats while held are swallowed too.
             assert_eq!(
-                handle_ptt_key(&key_json("space", "repeat"), "space"),
+                handle_ptt_key(voice, &key_json("space", "repeat"), "space"),
                 CLAIMED
             );
             assert_eq!(
-                handle_ptt_key(&key_json("space", "release"), "space"),
+                handle_ptt_key(voice, &key_json("space", "release"), "space"),
                 CLAIMED
             );
             // A release without a matching press is not ours.
             assert_eq!(
-                handle_ptt_key(&key_json("space", "release"), "space"),
+                handle_ptt_key(voice, &key_json("space", "release"), "space"),
                 CONTINUE
             );
         });
@@ -3708,49 +3906,49 @@ mod tests {
 
     #[test]
     fn ptt_leaves_modifier_chords_to_the_editor() {
-        with_ptt_state(|| {
-            PTT_ENABLED.store(true, Ordering::Relaxed);
+        with_ptt_state(|voice| {
+            voice.ptt_enabled.store(true, Ordering::Relaxed);
             let ctrl_space = json!({"type": "key", "key": "space", "kind": "press",
                                     "ctrl": true, "alt": false, "shift": false})
             .to_string();
-            assert_eq!(handle_ptt_key(&ctrl_space, "space"), CONTINUE);
+            assert_eq!(handle_ptt_key(voice, &ctrl_space, "space"), CONTINUE);
             let alt_space = json!({"type": "key", "key": "space", "kind": "press",
                                    "ctrl": false, "alt": true, "shift": false})
             .to_string();
-            assert_eq!(handle_ptt_key(&alt_space, "space"), CONTINUE);
+            assert_eq!(handle_ptt_key(voice, &alt_space, "space"), CONTINUE);
             // Shift+space is still a deliberate hold.
             let shift_space = json!({"type": "key", "key": "space", "kind": "press",
                                      "ctrl": false, "alt": false, "shift": true})
             .to_string();
-            assert_eq!(handle_ptt_key(&shift_space, "space"), CLAIMED);
+            assert_eq!(handle_ptt_key(voice, &shift_space, "space"), CLAIMED);
         });
     }
 
     #[test]
     fn ptt_release_marks_a_recording_for_sending() {
-        with_ptt_state(|| {
-            PTT_ENABLED.store(true, Ordering::Relaxed);
-            handle_ptt_key(&key_json("space", "press"), "space");
+        with_ptt_state(|voice| {
+            voice.ptt_enabled.store(true, Ordering::Relaxed);
+            handle_ptt_key(voice, &key_json("space", "press"), "space");
             // Simulate the hold timer having opened the mic.
             let stop = Arc::new(AtomicBool::new(false));
             {
-                let mut ptt = PTT.lock().unwrap();
+                let mut ptt = voice.ptt.lock().unwrap();
                 ptt.stop = Some(stop.clone());
                 ptt.recording_owner = Some(ptt.token);
             }
-            let owner = PTT.lock().unwrap().token;
+            let owner = voice.ptt.lock().unwrap().token;
             assert_eq!(
-                handle_ptt_key(&key_json("space", "release"), "space"),
+                handle_ptt_key(voice, &key_json("space", "release"), "space"),
                 CLAIMED
             );
             // Release stops the capture and flags it to be sent.
             assert!(stop.load(Ordering::Relaxed), "release must stop recording");
             assert!(
-                ptt_finish(owner),
+                ptt_finish(voice, owner),
                 "release must mark the recording for sending"
             );
             // State is clean for the next hold.
-            assert!(PTT.lock().unwrap().pressed_at.is_none());
+            assert!(voice.ptt.lock().unwrap().pressed_at.is_none());
         });
     }
 
@@ -3760,42 +3958,45 @@ mod tests {
     /// editor as a typed space.
     #[test]
     fn stale_recording_does_not_clear_a_newer_press() {
-        with_ptt_state(|| {
-            PTT_ENABLED.store(true, Ordering::Relaxed);
+        with_ptt_state(|voice| {
+            voice.ptt_enabled.store(true, Ordering::Relaxed);
 
             // First hold: the mic is open (recording owned by `first`).
-            handle_ptt_key(&key_json("space", "press"), "space");
+            handle_ptt_key(voice, &key_json("space", "press"), "space");
             let first = {
-                let mut ptt = PTT.lock().unwrap();
+                let mut ptt = voice.ptt.lock().unwrap();
                 ptt.stop = Some(Arc::new(AtomicBool::new(false)));
                 ptt.recording_owner = Some(ptt.token);
                 ptt.token
             };
             // Released: the first utterance is marked to be sent.
-            handle_ptt_key(&key_json("space", "release"), "space");
+            handle_ptt_key(voice, &key_json("space", "release"), "space");
 
             // Second press begins before the first thread has torn down.
-            handle_ptt_key(&key_json("space", "press"), "space");
-            let second = PTT.lock().unwrap().token;
+            handle_ptt_key(voice, &key_json("space", "press"), "space");
+            let second = voice.ptt.lock().unwrap().token;
             assert_ne!(first, second);
 
             // The stale thread finishes: it still sends *its own* utterance…
-            assert!(ptt_finish(first), "first utterance should still be sent");
+            assert!(
+                ptt_finish(voice, first),
+                "first utterance should still be sent"
+            );
             // …but must leave the newer press alone.
             assert!(
-                PTT.lock().unwrap().pressed_at.is_some(),
+                voice.ptt.lock().unwrap().pressed_at.is_some(),
                 "stale finish wiped the newer press"
             );
 
             // The newer release is still handled as a real hold (the mic it
             // never opened sends nothing, but the key is claimed, not typed).
             assert_eq!(
-                handle_ptt_key(&key_json("space", "release"), "space"),
+                handle_ptt_key(voice, &key_json("space", "release"), "space"),
                 CLAIMED
             );
-            assert!(PTT.lock().unwrap().pressed_at.is_none());
+            assert!(voice.ptt.lock().unwrap().pressed_at.is_none());
             // And the send intent did not leak into the second press.
-            assert!(PTT.lock().unwrap().send_tokens.is_empty());
+            assert!(voice.ptt.lock().unwrap().send_tokens.is_empty());
         });
     }
 

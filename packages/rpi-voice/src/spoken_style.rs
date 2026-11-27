@@ -112,12 +112,16 @@ rpi_plugin_sdk::string_handler! {
 /// itself. A malformed or missing envelope is treated as an empty base rather
 /// than a failure: losing the host's base prompt is worse than not appending, so
 /// in that case this returns "no change".
-fn on_before_agent_start(event_json, out, _user_data) {
+fn on_before_agent_start(event_json, out, user_data) {
+    let Some(voice) = super::registration::callback(user_data) else {
+        write_out(out, json!({}));
+        return 0;
+    };
     let raw = event_json;
-    let enabled = super::AUTO_TTS_ENABLED.load(Ordering::Relaxed);
+    let enabled = voice.auto_tts_enabled.load(Ordering::Relaxed);
 
     // Nothing to say, and the cheapest exit — most turns in a typed session.
-    if !enabled && !super::pet::enabled() {
+    if !enabled && !super::pet::enabled(&voice) {
         write_out(out, json!({}));
         return 0;
     }
@@ -138,7 +142,7 @@ fn on_before_agent_start(event_json, out, _user_data) {
         .unwrap_or_default();
 
     let spoken = prompt_for_turn(base, enabled);
-    let next = super::pet::prompt(spoken.as_deref().unwrap_or(base)).or(spoken);
+    let next = super::pet::prompt(&voice, spoken.as_deref().unwrap_or(base)).or(spoken);
     match next {
         Some(next) => {
             super::debug_log(&format!(
@@ -218,49 +222,40 @@ mod tests {
     }
 
     /// Drive the real FFI handler the way the host does.
-    fn call(event: &str) -> String {
-        let event_ref = StbStringRef::from_str(event);
-        let mut out = StbString::empty();
-        let rc = on_before_agent_start(event_ref, &mut out, std::ptr::null_mut());
-        assert_eq!(rc, 0);
-        let text = out.to_string_lossy();
-        assert!(
-            text.starts_with("{\"systemPrompt\"") || text.starts_with("{}"),
-            "unexpected payload: {text}"
-        );
-        text
+    #[allow(unsafe_code)]
+    fn call(owner: &std::sync::Arc<crate::RuntimeContext>, event: &str) -> String {
+        crate::registration::with_test_callback(owner, || {
+            let event_ref = StbStringRef::from_str(event);
+            let mut out = StbString::empty();
+            assert_eq!(
+                on_before_agent_start(event_ref, &mut out, owner.api.user_data),
+                0
+            );
+            // SAFETY: the fixture takes ownership of the plugin output.
+            unsafe {
+                rpi_plugin_sdk::callbacks::OwnedString::from_raw(
+                    out,
+                    Some(rpi_plugin_sdk::callbacks::free_string),
+                )
+            }
+            .to_string_lossy()
+        })
     }
 
     #[test]
-    fn handler_declines_when_speech_is_off() {
-        // Serialize against other tests touching the process-global flag.
-        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-        let _guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        super::super::AUTO_TTS_ENABLED.store(false, Ordering::Relaxed);
-        let payload = call(r#"{"prompt":"hi","systemPrompt":"BASE"}"#);
-        assert_eq!(payload, "{}", "speech off must report no change");
-    }
-
-    #[test]
-    fn handler_appends_when_speech_is_on() {
-        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-        let _guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        super::super::AUTO_TTS_ENABLED.store(true, Ordering::Relaxed);
-        let payload = call(r#"{"prompt":"hi","systemPrompt":"BASE"}"#);
-        let v: Value = serde_json::from_str(&payload).unwrap();
-        let prompt = v["systemPrompt"].as_str().expect("systemPrompt present");
+    fn prompt_handler_uses_the_calling_registrations_speech_preference() {
+        let quiet = crate::registration::test_runtime();
+        let spoken = crate::registration::test_runtime();
+        spoken.auto_tts_enabled.store(true, Ordering::Relaxed);
+        let event = r#"{"prompt":"hi","systemPrompt":"BASE"}"#;
+        assert_eq!(call(&quiet, event), "{}");
+        let payload: Value = serde_json::from_str(&call(&spoken, event)).unwrap();
+        let prompt = payload["systemPrompt"]
+            .as_str()
+            .expect("systemPrompt present");
         assert!(prompt.starts_with("BASE"));
         assert!(has_spoken_style(prompt));
-        super::super::AUTO_TTS_ENABLED.store(false, Ordering::Relaxed);
-    }
-
-    #[test]
-    fn a_malformed_envelope_declines_instead_of_dropping_the_base() {
-        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-        let _guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        super::super::AUTO_TTS_ENABLED.store(true, Ordering::Relaxed);
-        // No base to append to: must not replace the host's prompt with ours.
-        assert_eq!(call("not json"), "{}");
-        super::super::AUTO_TTS_ENABLED.store(false, Ordering::Relaxed);
+        assert_eq!(call(&spoken, "not json"), "{}");
+        assert_eq!(call(&quiet, event), "{}");
     }
 }

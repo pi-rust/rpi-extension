@@ -1,12 +1,12 @@
 //! `/btw`: command-only, host-managed side questions. No plugin worker threads.
-#![forbid(unsafe_code)]
+#![deny(unsafe_code)]
 // The pinned SDK exports a safe C entrypoint around its internal raw ABI read.
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
 use rpi_plugin_sdk::{FreeStringFn, PluginApi, RuntimeActionFn, StbString, StbStringRef};
 use serde_json::{json, Value};
 use std::ffi::c_void;
-use std::sync::Mutex;
+use std::sync::OnceLock;
 
 // Documented host protocol; the workspace's published SDK predates this enum.
 // Like rpi-subagents, retain the SDK pin and let the host validate the raw id.
@@ -32,9 +32,15 @@ struct HostFns {
     action: RuntimeActionFn,
     free: FreeStringFn,
 }
-// Only host function pointers, NEVER a registration's user_data. Each command
-// carries its own live owner binding, including duplicate DLL registrations.
-static HOST: Mutex<Option<HostFns>> = Mutex::new(None);
+// The native host uses a process-lifetime trampoline and allocator for all
+// registrations of this image. A different table must never replace them.
+static HOST: OnceLock<HostFns> = OnceLock::new();
+
+fn install_host(host: HostFns) -> bool {
+    let installed = HOST.get_or_init(|| host);
+    installed.action as usize == host.action as usize
+        && installed.free as usize == host.free as usize
+}
 
 fn request(args: &str) -> Result<Option<Value>, String> {
     let args = args.trim();
@@ -141,9 +147,11 @@ fn command_text(raw: &str, action: impl FnOnce(Value) -> Result<Value, String>) 
 rpi_plugin_sdk::string_handler! {
 fn btw_command(input, out, user_data) {
     if !out.is_available() { return 1; }
-    let host = *HOST.lock().unwrap_or_else(|e| e.into_inner());
     let text = command_text(input, |args| {
-        call(host.ok_or("BTW host runtime is unavailable")?, args, user_data)
+        if user_data.is_null() {
+            return Err("BTW host command binding is unavailable".into());
+        }
+        call(*HOST.get().ok_or("BTW host runtime is unavailable")?, args, user_data)
     });
     out.write(json!({"kind":"message","text":text,"markdown":true}).to_string());
     0
@@ -153,10 +161,12 @@ fn register(api: &PluginApi) -> i32 {
     let Some(register_command) = api.register_command else {
         return 1;
     };
-    *HOST.lock().unwrap_or_else(|e| e.into_inner()) = Some(HostFns {
+    if !install_host(HostFns {
         action: api.runtime_action,
         free: api.free_string,
-    });
+    }) {
+        return 1;
+    }
     register_command(
         StbStringRef::from_str("btw"),
         StbStringRef::from_str(
@@ -165,6 +175,11 @@ fn register(api: &PluginApi) -> i32 {
         btw_command,
     )
 }
+// Opt in to sharing the library image across native Host registrations.
+#[allow(unsafe_code)] // The marker only exports a symbol.
+#[no_mangle]
+pub extern "C" fn rpi_plugin_shared_sessions_v1() {}
+
 rpi_plugin_sdk::export_plugin!(register);
 
 #[cfg(test)]

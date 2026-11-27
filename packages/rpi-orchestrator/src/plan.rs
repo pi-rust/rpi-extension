@@ -12,15 +12,21 @@ use crate::control::Control;
 use crate::graph::{Graph, Node, Status};
 use crate::kit::{result_with_details, Progress};
 use crate::lock_graph;
+use crate::runtime::Registration;
 use serde_json::Value;
 
-pub fn plan(params: &Value, control: &Control, _progress: &Progress) -> Result<String, String> {
+pub fn plan(
+    registration: &Registration,
+    params: &Value,
+    control: &Control,
+    _progress: &Progress,
+) -> Result<String, String> {
     control.check()?;
     let action = params
         .get("action")
         .and_then(Value::as_str)
         .unwrap_or("show");
-    let mut guard = lock_graph(params);
+    let mut guard = lock_graph(registration, params);
     if matches!(action, "set" | "update") && guard.is_running() {
         return Err(
             "dispatch is running: wait for the wave to finish before editing the plan".into(),

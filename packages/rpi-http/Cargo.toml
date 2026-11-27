@@ -20,7 +20,7 @@ crate-type = ["cdylib", "rlib"]
 supported-targets = ["x86_64-pc-windows-msvc", "x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu", "x86_64-unknown-linux-musl", "x86_64-apple-darwin", "aarch64-apple-darwin"]
 
 [dependencies]
-rpi-plugin-sdk.workspace = true
+rpi-plugin-sdk = "=0.8.3"
 rpi-httpcore = { path = "../rpi-httpcore", version = "0.1.25" }
 axum = "0.8.9"
 serde_json.workspace = true

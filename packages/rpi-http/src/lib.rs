@@ -5,7 +5,7 @@
 //! `rpi-httpcore` and `rpi-extcore`. There is no Work node owner or Work-specific
 //! component protocol here.
 
-#![forbid(unsafe_code)]
+#![deny(unsafe_code)]
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
 mod plugin;

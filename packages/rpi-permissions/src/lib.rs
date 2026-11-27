@@ -1,4 +1,4 @@
-#![forbid(unsafe_code)]
+#![deny(unsafe_code)]
 // The `export_plugin!`/`execute_handler!` macros generate `extern "C"` entry
 // points that dereference the caller-supplied API pointer; the SDK's `guard`
 // wrapper owns the safety contract (same allow as the other extension crates).
@@ -11,10 +11,14 @@ use rpi_plugin_sdk::{
 use serde_json::{json, Value};
 use std::ffi::c_void;
 use std::fs;
+use std::io::Write;
 use std::path::PathBuf;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Mutex;
 
 static HANDLES: ToolHandles<Drive> = ToolHandles::new();
+static MUTATION: Mutex<()> = Mutex::new(());
+static STAGING_SEQ: AtomicU64 = AtomicU64::new(0);
 
 struct Drive {
     params: Value,
@@ -27,11 +31,19 @@ struct Rules {
 }
 
 fn project_root(p: &Value) -> PathBuf {
-    p.get("cwd")
+    let base = p[rpi_plugin_sdk::HOST_CONTEXT_KEY]["cwd"]
+        .as_str()
+        .map(PathBuf::from)
+        .filter(|cwd| cwd.is_absolute())
+        .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
+    match p
+        .get("cwd")
         .and_then(Value::as_str)
         .filter(|s| !s.is_empty())
-        .map(PathBuf::from)
-        .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")))
+    {
+        Some(cwd) => base.join(cwd),
+        None => base,
+    }
 }
 
 fn local_path(p: &Value) -> PathBuf {
@@ -110,24 +122,37 @@ fn save(path: &PathBuf, rules: &Rules) -> Result<(), String> {
 
 /// Write `text` to `path` via a temp sibling + rename.
 ///
-/// `fs::write` truncates and then writes in place, so a shorter document written
-/// over a longer one leaves the previous tail behind, and two rpi sessions
-/// sharing a project can interleave their writes. Either way the rule file
-/// becomes unparsable. `rename` replaces atomically on Unix and on Windows
-/// (`MoveFileEx` with `MOVEFILE_REPLACE_EXISTING`), so a reader only ever sees a
-/// whole document.
+/// Each writer reserves its own temp path, including writers in other images
+/// or processes. Readers see a complete old or new document after rename.
 fn write_store_atomically(path: &PathBuf, text: &str) -> Result<(), String> {
     let name = path
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_else(|| "permissions.json".to_string());
-    let tmp = path.with_file_name(format!("{name}.tmp-{}", std::process::id()));
-    fs::write(&tmp, text).map_err(|e| format!("write permissions: {e}"))?;
-    if let Err(error) = fs::rename(&tmp, path) {
+    let (tmp, mut file) = loop {
+        let seq = STAGING_SEQ.fetch_add(1, Ordering::Relaxed);
+        let tmp = path.with_file_name(format!("{name}.tmp-{}-{seq}", std::process::id()));
+        match fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tmp)
+        {
+            Ok(file) => break (tmp, file),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(format!("create permissions staging file: {error}")),
+        }
+    };
+    let written = file
+        .write_all(text.as_bytes())
+        .map_err(|error| format!("write permissions: {error}"));
+    drop(file);
+    let committed = written.and_then(|()| {
+        fs::rename(&tmp, path).map_err(|error| format!("commit permissions: {error}"))
+    });
+    if committed.is_err() {
         let _ = fs::remove_file(&tmp);
-        return Err(format!("commit permissions: {error}"));
     }
-    Ok(())
+    committed
 }
 
 fn split_rule(rule: &str) -> (&str, &str) {
@@ -170,6 +195,11 @@ fn rule_matches(rule: &str, tool: &str, target: &str) -> bool {
     (rule_tool == "*" || rule_tool.eq_ignore_ascii_case(tool)) && glob_matches(pattern, target)
 }
 fn permissions(p: &Value) -> Result<String, String> {
+    let action = p.get("action").and_then(Value::as_str).unwrap_or("list");
+    // A grant or revoke must see the latest rules from other calls in this
+    // image, including when the first writer creates the project store.
+    let _mutation = matches!(action, "grant" | "revoke")
+        .then(|| MUTATION.lock().unwrap_or_else(|error| error.into_inner()));
     let local = local_path(p);
     let file = if local.exists() {
         local.clone()
@@ -177,7 +207,6 @@ fn permissions(p: &Value) -> Result<String, String> {
         global_path()
     };
     let mut rules = load(&file)?;
-    let action = p.get("action").and_then(Value::as_str).unwrap_or("list");
     match action {
         "list" => Ok(
             json!({"action":"list","rules":{"allow":rules.allow,"deny":rules.deny},"path":file})
@@ -287,7 +316,7 @@ const TOOL_PARAMETERS: &str = r#"{
     "rule": {"type":"string","description":"Required for grant/revoke unless capability is supplied. Exact rule text, trimmed, 1-200 UTF-8 bytes after trimming; for example Bash(git push *). Only * is a wildcard; a bare pattern matches any tool. Takes precedence over capability; revoke deletes exact text, not matching rules."},
     "capability": {"type":"string","description":"Legacy fallback for check's value or grant/revoke's rule; ignored when the corresponding primary field is present. Uses that field's limits and meaning."},
     "effect": {"type":"string","enum":["allow","deny"],"default":"allow","description":"For grant: allow adds an allow rule; deny ADDS a deny rule (not removal). Both remove the same exact rule from either list first. For revoke: validated but does not choose a list; both lists are cleared of the rule. Ignored by check/list."},
-    "cwd": {"type":"string","description":"Project directory for .pi/permissions.json; omitted or empty uses the plugin process working directory. Reads use the project file if present, otherwise RPI_AGENT_DIR/permissions.json or ~/.pi/agent/permissions.json. grant/revoke always write the project file (creating directories), seeding it from fallback rules if needed; never write global policy."}
+    "cwd": {"type":"string","description":"Project directory for .pi/permissions.json; omitted or empty uses the host session working directory when available, otherwise the plugin process directory. Relative paths are resolved from the same base. Reads use the project file if present, otherwise RPI_AGENT_DIR/permissions.json or ~/.pi/agent/permissions.json. grant/revoke always write the project file (creating directories), seeding it from fallback rules if needed; never write global policy."}
   },
   "required": ["action"],
   "additionalProperties": true
@@ -302,6 +331,12 @@ fn tool_schema() -> StableToolSchema {
 }
 
 use rpi_plugin_sdk::callbacks::free_string;
+// Tool handles carry no host callback context. Mutations serialize the full
+// read-modify-write across sessions sharing the image.
+#[allow(unsafe_code)] // Export the optional Host ABI marker.
+#[no_mangle]
+pub extern "C" fn rpi_plugin_shared_sessions_v1() {}
+
 rpi_plugin_sdk::export_plugin!(|api| {
     let Some(register) = api.register_tool else {
         return 1;
@@ -379,6 +414,38 @@ mod tests {
         let stored = load(&path).unwrap();
         assert!(stored.deny.is_empty());
         assert!(stored.allow.is_empty());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn concurrent_mutations_resolve_session_cwd_and_preserve_every_rule() {
+        let dir =
+            std::env::temp_dir().join(format!("rpi-permissions-shared-{}", std::process::id()));
+        let project = dir.join("project");
+        let store = project.join(".pi").join("permissions.json");
+        fs::create_dir_all(store.parent().unwrap()).unwrap();
+        fs::write(&store, r#"{"permissions":{"allow":[],"deny":[]}}"#).unwrap();
+        let start = std::sync::Barrier::new(8);
+        std::thread::scope(|scope| {
+            for index in 0..8 {
+                let start = &start;
+                let dir = &dir;
+                scope.spawn(move || {
+                    start.wait();
+                    permissions(&json!({
+                        "action": "grant", "effect": "deny", "rule": format!("Rule{index}"),
+                        "cwd": "project", "__rpi": {"cwd": dir},
+                    }))
+                    .unwrap();
+                });
+            }
+        });
+        let mut denied = load(&store).unwrap().deny;
+        denied.sort();
+        assert_eq!(
+            denied,
+            (0..8).map(|i| format!("Rule{i}")).collect::<Vec<_>>()
+        );
         fs::remove_dir_all(dir).unwrap();
     }
 

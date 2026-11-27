@@ -1,4 +1,4 @@
-#![forbid(unsafe_code)]
+#![deny(unsafe_code)]
 
 use rpi_plugin_sdk::handles::ToolHandles;
 use std::ffi::c_void;
@@ -40,7 +40,10 @@ fn project_root(params: &Value) -> Result<PathBuf, String> {
         .get("projectPath")
         .and_then(Value::as_str)
         .filter(|value| !value.trim().is_empty());
-    let root = match requested {
+    let host_cwd = params[rpi_plugin_sdk::HOST_CONTEXT_KEY]["cwd"]
+        .as_str()
+        .filter(|value| !value.is_empty());
+    let root = match requested.or(host_cwd) {
         Some(value) => PathBuf::from(value.trim()),
         None => std::env::current_dir()
             .map_err(|err| format!("cannot resolve current directory: {err}"))?,
@@ -467,7 +470,7 @@ fn parameters(mut properties: serde_json::Map<String, Value>, required: &[&str])
         "projectPath".into(),
         json!({
             "type": "string",
-            "description": "Optional absolute project path; omitted or blank defaults to the current working directory."
+            "description": "Use an absolute project path. Blank or omitted uses the session workspace, then the current working directory."
         }),
     );
     // Extra host metadata (including __rpi) must remain accepted.
@@ -568,6 +571,11 @@ fn tool_specs() -> Vec<ToolSpec> {
         },
     ]
 }
+// Each call owns its request, child process, and cancellation handle.
+#[allow(unsafe_code)] // Export the shared-session marker symbol.
+#[no_mangle]
+pub extern "C" fn rpi_plugin_shared_sessions_v1() {}
+
 rpi_plugin_sdk::export_plugin!(|api| {
     let Some(register) = api.register_tool else {
         return 1;

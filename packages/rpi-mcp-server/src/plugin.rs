@@ -1,53 +1,68 @@
 use crate::protocol::{run, ServerOptions};
+use rpi_plugin_sdk::callbacks::OwnedString;
 use rpi_plugin_sdk::{
-    EventTag, FreeStringFn, RuntimeActionFn, RuntimeActionId, StablePluginEvent, StbString,
-    StbStringRef,
+    EventTag, PluginApi, RuntimeActionId, StablePluginEvent, StbString, StbStringRef,
 };
 use serde_json::{json, Value};
-use std::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
-use std::sync::{Mutex, OnceLock};
+use std::ffi::c_void;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::thread;
 
 const MCP_FLAG: &str = "mcp";
 
-static RUNTIME_ACTION: OnceLock<RuntimeActionFn> = OnceLock::new();
-static RUNTIME_USER_DATA: AtomicPtr<std::ffi::c_void> = AtomicPtr::new(std::ptr::null_mut());
-static HOST_FREE_STRING: OnceLock<FreeStringFn> = OnceLock::new();
-static MCP_ENABLED: AtomicBool = AtomicBool::new(false);
+#[derive(Clone, Copy)]
+struct Host(PluginApi);
 
-/// The running server, if any. Both halves are replaced together, so a reload
-/// after `SessionShutdown` always joins the thread its own sender controls.
-#[derive(Default)]
-struct Running {
-    stop: Option<tokio::sync::watch::Sender<bool>>,
-    thread: Option<thread::JoinHandle<()>>,
-}
-
-static SERVER: Mutex<Option<Running>> = Mutex::new(None);
-
-fn action(id: RuntimeActionId, args: Value) -> Option<Value> {
-    let action = *RUNTIME_ACTION.get()?;
-    let mut out = StbString::empty();
-    let rc = action(
-        id as u32,
-        StbStringRef::from_str(&args.to_string()),
-        &mut out,
-        RUNTIME_USER_DATA.load(Ordering::Acquire),
-    );
-    let value = if rc == 0 {
-        serde_json::from_str(&out.to_string_lossy()).ok()
-    } else {
-        None
-    };
-    if let Some(free) = HOST_FREE_STRING.get() {
-        free(out);
+impl Host {
+    #[allow(unsafe_code)] // Adopt the string returned by the host ABI.
+    fn action(self, id: RuntimeActionId, args: Value) -> Option<Value> {
+        let encoded = args.to_string();
+        let mut out = StbString::empty();
+        let rc = (self.0.runtime_action)(
+            id as u32,
+            StbStringRef::from_str(&encoded),
+            &mut out,
+            self.0.user_data,
+        );
+        // SAFETY: the host transfers the output with its own deallocator.
+        let out = unsafe { OwnedString::from_raw(out, Some(self.0.free_string)) };
+        if rc == 0 {
+            serde_json::from_str(&out.to_string_lossy()).ok()
+        } else {
+            None
+        }
     }
-    value
+
+    fn flag(self, name: &str) -> Option<Value> {
+        self.action(RuntimeActionId::GetCliFlag, json!({"name":name}))
+            .and_then(|value| value.get("value").cloned())
+    }
+
+    fn finish(self, code: i32) {
+        let _ = self.action(
+            RuntimeActionId::StdioLifecycle,
+            json!({"op":"finish","exitCode":code}),
+        );
+    }
 }
 
-fn flag(name: &str) -> Option<Value> {
-    action(RuntimeActionId::GetCliFlag, json!({"name":name}))
-        .and_then(|value| value.get("value").cloned())
+// Passive registrations keep no state. The active registration holds the
+// slot until its worker has joined, so a replacement cannot overlap stdio.
+static OWNER: Mutex<Option<Arc<Owner>>> = Mutex::new(None);
+static NEXT_OWNER: AtomicUsize = AtomicUsize::new(1);
+
+struct Owner {
+    token: usize,
+    host: Host,
+    stop: tokio::sync::watch::Sender<bool>,
+    worker: Mutex<Worker>,
+}
+
+#[derive(Default)]
+struct Worker {
+    started: bool,
+    thread: Option<thread::JoinHandle<()>>,
 }
 
 fn flag_is_on(value: Option<&Value>) -> bool {
@@ -58,13 +73,6 @@ fn flag_is_on(value: Option<&Value>) -> bool {
         }
         _ => false,
     }
-}
-
-fn lifecycle(op: &str, code: i32) {
-    let _ = action(
-        RuntimeActionId::StdioLifecycle,
-        json!({"op":op,"exitCode":code}),
-    );
 }
 
 fn get_arg(name: &str) -> Option<String> {
@@ -82,21 +90,33 @@ fn get_flag(name: &str) -> bool {
     std::env::args().any(|arg| arg == name)
 }
 
-extern "C" fn start(_: StablePluginEvent, _: *mut std::ffi::c_void) -> i32 {
-    let mut running = SERVER.lock().unwrap();
-    if running.is_some() || !MCP_ENABLED.load(Ordering::Acquire) {
+extern "C" fn start(_: StablePluginEvent, context: *mut c_void) -> i32 {
+    rpi_plugin_sdk::guard_or(1, || start_owner(context as usize))
+}
+
+fn start_owner(token: usize) -> i32 {
+    let Some(owner) = find_owner(token) else {
+        return 0;
+    };
+    let mut worker = owner
+        .worker
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    let receiver = owner.stop.subscribe();
+    if worker.started || *receiver.borrow() {
         return 0;
     }
+    worker.started = true;
+    let host = owner.host;
     // Stdio ownership is already ours here, so refusing a conflicting adapter
     // can end the host instead of silently leaving two servers on one pipe.
     for other in ["acp", "http", "webserver", "web", "server", "webui"] {
-        if flag_is_on(flag(other).as_ref()) {
+        if flag_is_on(host.flag(other).as_ref()) {
             eprintln!("[rpi-mcp] --mcp cannot be combined with --{other}");
-            lifecycle("finish", 2);
+            host.finish(2);
             return 0;
         }
     }
-    let (stop, receiver) = tokio::sync::watch::channel(false);
     let options = ServerOptions {
         cwd: std::env::current_dir().unwrap_or_else(|_| ".".into()),
         model: get_arg("--model"),
@@ -105,7 +125,7 @@ extern "C" fn start(_: StablePluginEvent, _: *mut std::ffi::c_void) -> i32 {
         session_dir: get_arg("--session-dir").map(Into::into),
         saved_session: get_arg("--resume").map(Into::into),
     };
-    let thread = thread::spawn(move || {
+    let thread = thread::Builder::new().spawn(move || {
         let runtime = match tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
             .enable_all()
@@ -114,45 +134,79 @@ extern "C" fn start(_: StablePluginEvent, _: *mut std::ffi::c_void) -> i32 {
             Ok(runtime) => runtime,
             Err(error) => {
                 eprintln!("[rpi-mcp] failed to create runtime: {error}");
-                lifecycle("finish", 1);
+                host.finish(1);
                 return;
             }
         };
+        if *receiver.borrow() {
+            return;
+        }
         let (input, pending) = match take_stdin() {
             Ok(value) => value,
             Err(error) => {
                 eprintln!("[rpi-mcp] failed to take stdin: {error}");
-                lifecycle("finish", 1);
+                host.finish(1);
                 return;
             }
         };
         let code = runtime.block_on(run(input, pending, receiver, options));
-        lifecycle("finish", code);
+        host.finish(code);
     });
-    *running = Some(Running {
-        stop: Some(stop),
-        thread: Some(thread),
-    });
+    match thread {
+        Ok(thread) => worker.thread = Some(thread),
+        Err(error) => {
+            eprintln!("[rpi-mcp] failed to start server thread: {error}");
+            host.finish(1);
+        }
+    }
     0
 }
 
-extern "C" fn stop(_: StablePluginEvent, _: *mut std::ffi::c_void) -> i32 {
-    stop_running();
-    0
+fn find_owner(token: usize) -> Option<Arc<Owner>> {
+    OWNER
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .as_ref()
+        .filter(|owner| owner.token == token)
+        .cloned()
 }
 
-/// Signal and join whichever server is installed right now. Taking the slot
-/// first is what lets a later `SessionStart` install a fresh sender.
-fn stop_running() {
-    let Some(running) = SERVER.lock().unwrap().take() else {
-        return;
-    };
-    if let Some(stop) = running.stop {
-        let _ = stop.send(true);
-    }
-    if let Some(thread) = running.thread {
-        let _ = thread.join();
-    }
+extern "C" fn begin_shutdown(context: *mut c_void) {
+    rpi_plugin_sdk::guard_or((), || {
+        if let Some(owner) = find_owner(context as usize) {
+            owner.stop.send_replace(true);
+        }
+    });
+}
+
+extern "C" fn finish_shutdown(context: *mut c_void) -> i32 {
+    rpi_plugin_sdk::guard_or(1, || {
+        let Some(owner) = find_owner(context as usize) else {
+            return 0;
+        };
+        owner.stop.send_replace(true);
+        // Start holds this lock until it publishes the worker handle. Keep the
+        // slot occupied until the worker has released the process streams.
+        let mut worker = owner
+            .worker
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if let Some(thread) = worker.thread.take() {
+            let _ = thread.join();
+        }
+        let mut slot = OWNER.lock().unwrap_or_else(|error| error.into_inner());
+        if slot
+            .as_ref()
+            .is_some_and(|current| current.token == owner.token)
+        {
+            *slot = None;
+        }
+        0
+    })
+}
+
+extern "C" fn stop(_: StablePluginEvent, context: *mut c_void) -> i32 {
+    finish_shutdown(context)
 }
 
 fn take_stdin() -> Result<(rpi_plugin_sdk::stdio::StdinLines, Option<String>), String> {
@@ -164,10 +218,8 @@ fn take_stdin() -> Result<(rpi_plugin_sdk::stdio::StdinLines, Option<String>), S
     Ok((input, pending))
 }
 
-pub fn register(api: &rpi_plugin_sdk::PluginApi) -> i32 {
-    let _ = RUNTIME_ACTION.set(api.runtime_action);
-    RUNTIME_USER_DATA.store(api.user_data, Ordering::Release);
-    let _ = HOST_FREE_STRING.set(api.free_string);
+pub fn register(api: &PluginApi) -> i32 {
+    let host = Host(*api);
 
     if let Some(register_flag) = api.register_flag {
         if register_flag(
@@ -179,57 +231,67 @@ pub fn register(api: &rpi_plugin_sdk::PluginApi) -> i32 {
         }
     }
 
-    if !flag_is_on(flag(MCP_FLAG).as_ref()) {
+    if !flag_is_on(host.flag(MCP_FLAG).as_ref()) {
         return 0;
     }
-    let Some(declare) = api.declare else {
-        eprintln!("[rpi-mcp] host does not support ownsStdio");
+    if host
+        .action(RuntimeActionId::StdioLifecycle, json!({"op":"status"}))
+        .is_none()
+    {
+        return 1;
+    }
+    let (Some(declare), Some(handler)) = (api.declare, api.register_event_handler) else {
         return 1;
     };
+    #[allow(deprecated)] // `try_update` requires a newer Rust version.
+    let Ok(token) = NEXT_OWNER.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |next| {
+        next.checked_add(1)
+    }) else {
+        return 1;
+    };
+    // The host round-trips this token without dereferencing it. Reusing a
+    // host pointer as the key would let a stale event address a new owner.
+    let context = token as *mut c_void;
+    // Older isolated hosts fall back to SessionShutdown. The shared Host
+    // supplies loader cleanup even when registration fails or reloads.
+    if let Some(lifecycle) = api.register_plugin_lifecycle {
+        let code = lifecycle(begin_shutdown, finish_shutdown, context);
+        if code != 0 {
+            return code;
+        }
+    }
+    for (tag, callback) in [
+        (
+            EventTag::SessionShutdown,
+            stop as rpi_plugin_sdk::EventHandlerFn,
+        ),
+        (EventTag::SessionStart, start),
+    ] {
+        let code = handler(tag, callback, context);
+        if code != 0 {
+            return code;
+        }
+    }
+    let mut slot = OWNER.lock().unwrap_or_else(|error| error.into_inner());
+    if slot.is_some() {
+        return 1;
+    }
     if declare(StbStringRef::from_str(r#"{"ownsStdio":true}"#)) != 0 {
         eprintln!("[rpi-mcp] host rejected stdio ownership");
         return 1;
     }
-    MCP_ENABLED.store(true, Ordering::Release);
-    let Some(register_handler) = api.register_event_handler else {
-        return 1;
-    };
-    if register_handler(EventTag::SessionShutdown, stop, api.user_data) != 0 {
-        return 1;
-    }
-    register_handler(EventTag::SessionStart, start, api.user_data)
+    *slot = Some(Arc::new(Owner {
+        token,
+        host,
+        stop: tokio::sync::watch::channel(false).0,
+        worker: Mutex::new(Worker::default()),
+    }));
+    0
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn install(sender: tokio::sync::watch::Sender<bool>) {
-        *SERVER.lock().unwrap() = Some(Running {
-            stop: Some(sender),
-            thread: None,
-        });
-    }
-
-    #[test]
-    fn each_session_stop_signals_its_own_sender() {
-        // First session stops normally.
-        let (first, mut first_rx) = tokio::sync::watch::channel(false);
-        install(first);
-        stop_running();
-        assert!(*first_rx.borrow_and_update());
-
-        // A second session (host reload) must stop through its own channel; the
-        // previous OnceLock implementation kept the first, dead sender.
-        let (second, mut second_rx) = tokio::sync::watch::channel(false);
-        install(second);
-        stop_running();
-        assert!(*second_rx.borrow_and_update());
-        assert!(SERVER.lock().unwrap().is_none());
-
-        // Stopping with nothing installed is a no-op, not a panic.
-        stop_running();
-    }
 
     #[test]
     fn flag_values_are_parsed_like_the_host() {
