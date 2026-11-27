@@ -1,6 +1,6 @@
 [package]
 name = "rpi-mcp-server"
-version = "0.1.2"
+version = "0.1.3"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
@@ -28,7 +28,7 @@ name = "rpi-mcp-bridge"
 path = "src/main.rs"
 
 [dependencies]
-rpi-extcore = { path = "../rpi-extcore", version = "0.2.17" }
+rpi-extcore = { path = "../rpi-extcore", version = "0.2.18" }
 rpi-plugin-sdk = { workspace = true, features = ["stdio"] }
 serde = { version = "1", features = ["derive"] }
 serde_json.workspace = true
@@ -38,7 +38,7 @@ futures-util = "0.3"
 uuid = { version = "1", features = ["v4"] }
 
 [dev-dependencies]
-rpi-extcore = { path = "../rpi-extcore", version = "0.2.17", features = ["test-support"] }
+rpi-extcore = { path = "../rpi-extcore", version = "0.2.18", features = ["test-support"] }
 reqwest = { workspace = true, features = ["json", "stream"] }
 tokio-tungstenite = "0.29"
 

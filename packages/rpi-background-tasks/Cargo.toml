@@ -1,6 +1,6 @@
 [package]
 name = "rpi-background-tasks"
-version = "0.1.0"
+version = "0.1.4"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
