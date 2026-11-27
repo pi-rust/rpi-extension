@@ -1,6 +1,6 @@
 [package]
 name = "rpi-web"
-version = "0.1.94-preview"
+version = "0.1.95"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true

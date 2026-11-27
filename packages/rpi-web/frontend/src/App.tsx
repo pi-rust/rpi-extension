@@ -2002,6 +2002,7 @@ export default function App() {
 
   const lastSeq = useRef(0);
   const noteSeq = useRef(0);
+  const snapshotMessageIds = useRef(new Set<string>());
   const currentAssistant = useRef<string | null>(null);
   const currentUser = useRef<string | null>(null);
   const credentialRevision = useRef(0);
@@ -2241,6 +2242,14 @@ export default function App() {
 
   const applyEvent = useCallback(
     (event: SeqEvent, seq: number) => {
+      if (
+        typeof event.messageId === "string" &&
+        snapshotMessageIds.current.has(event.messageId) &&
+        (event.type === "message_start" ||
+          event.type === "message_update" ||
+          event.type === "message_end")
+      )
+        return;
       // Presentation only: observe the same deduplicated data, never the protocol cursor.
       traceEvent(event, seq);
       // Dialog controls may already have been shown while transcript I/O was
@@ -3156,6 +3165,7 @@ export default function App() {
     setFirstId("");
     setHasMore(false);
     lastSeq.current = 0;
+    snapshotMessageIds.current.clear();
     currentAssistant.current = null;
     currentUser.current = null;
     streamingAssistant.current = null;
@@ -3234,6 +3244,20 @@ export default function App() {
       }
     };
 
+    const replaySnapshot = (snapshot: Awaited<ReturnType<typeof snapshotOf>>) => {
+      // History can see a committed entry before its final event reaches SSE.
+      // Use native entry IDs across replay and the subsequent live stream.
+      const committed = new Set<string>();
+      for (const message of snapshot.messages) {
+        const entryId = (message as { entryId?: unknown } | null)?.entryId;
+        if (typeof entryId === "string" && entryId) committed.add(entryId);
+      }
+      snapshotMessageIds.current = committed;
+      for (const entry of eventsAfterSnapshot(snapshot.messages, snapshot.events))
+        applyEvent(entry.event, entry.seq);
+      lastSeq.current = snapshot.lastSeq;
+    };
+
     // Direct prompts are persisted by the native harness without user message
     // events. Refresh at run boundaries so every open page sees that input.
     const refreshTranscript = async () => {
@@ -3273,12 +3297,7 @@ export default function App() {
         setRecoveryNoticeDismissed(false);
         setFirstId(earlierPage.current?.firstId ?? snapshot.firstId ?? "");
         setHasMore(earlierPage.current?.hasMore ?? Boolean(snapshot.hasMore));
-        for (const entry of eventsAfterSnapshot(
-          snapshot.messages,
-          snapshot.events,
-        ))
-          applyEvent(entry.event, entry.seq);
-        lastSeq.current = snapshot.lastSeq;
+        replaySnapshot(snapshot);
       } catch (cause) {
         if (!isCurrent()) return;
         if (cause instanceof ApiError && cause.status === 401) {
@@ -3485,13 +3504,7 @@ export default function App() {
         }
         if (snapshot) {
           restoreSnapshotStatus(snapshot);
-          for (const entry of eventsAfterSnapshot(
-            snapshot.messages,
-            snapshot.events,
-          )) {
-            applyEvent(entry.event, entry.seq);
-          }
-          lastSeq.current = snapshot.lastSeq;
+          replaySnapshot(snapshot);
           after = snapshot.lastSeq;
           setSeen(snapshot.events.length);
         }
