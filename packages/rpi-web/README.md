@@ -74,6 +74,14 @@ build that supports local Host RPC and releases the session writer before
 closing its socket. The daemon supplies the agent environment and provider
 credentials for socket-backed sessions.
 
+The ordinary Web backend spawns each child with
+`RPI_RPC_EXECUTION_LIFECYCLE=correlated-v1`. A socket request cannot carry
+process environment, so a socket-backed session only advertises correlated
+execution settlement when the daemon itself runs with that variable. Without
+it the session keeps the legacy admission path, where `agent_settled` is the
+only settlement signal. Set it in the daemon's service environment if you rely
+on correlated per-execution settlement.
+
 ### New-session model preference
 
 A successful **explicit** model choice in the composer, Runtime settings,
