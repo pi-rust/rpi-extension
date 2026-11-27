@@ -7500,6 +7500,8 @@ test("compact commands show a compacting label while other runs keep processing"
     content: "before compact",
   };
   await mockHost(page, { snapshotMessages: [seed] });
+  // The host answers `get_state` with whatever operation is live. A reload must
+  // rebuild the label from this snapshot, not from replayed SSE frames.
   let activeOperation: Record<string, unknown> | null = {
     runId: "run-compact",
     kind: "compact",
@@ -7529,15 +7531,23 @@ test("compact commands show a compacting label while other runs keep processing"
       });
     },
   );
+  // A real host only replays frames past the snapshot cursor, so the compact
+  // acceptance belongs to the first stream only: replaying it after the switch
+  // would claim a compaction that the live session no longer runs.
+  let replayCompact = true;
   await page.route(`**/api/v1/sessions/${sessionId}/events?*`, (route) =>
     route.fulfill({
       contentType: "text/event-stream",
-      body: 'id: 7\nevent: operation_accepted\ndata: {"type":"operation_accepted","command":"compact"}\n\n',
+      body: replayCompact
+        ? 'id: 7\nevent: operation_accepted\ndata: {"type":"operation_accepted","command":"compact"}\n\n'
+        : "retry: 60000\n",
     }),
   );
   await page.goto("/");
   await expect(page.locator(".working-indicator")).toContainText("Compacting…");
 
+  // The compaction settled and an ordinary run started.
+  replayCompact = false;
   activeOperation = { runId: "run-prompt", kind: "run" };
   await page.reload();
   await expect(page.locator(".working-indicator")).toContainText("Processing…");

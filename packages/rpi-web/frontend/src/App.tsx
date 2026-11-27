@@ -1988,7 +1988,12 @@ export default function App() {
     status === "compacting" ||
     status === "starting" ||
     status === "awaiting_input";
-  const activeCompacting = compacting && status === "compacting";
+  // The indicator names the operation kind, not the transport state: a Web
+  // session that is compacting keeps that label while its SSE reconnects,
+  // otherwise a dropped stream relabels an in-flight compaction as an ordinary
+  // run. `compacting` is cleared on settlement, close, rejection and session
+  // switch, so it stays authoritative for the current operation.
+  const activeCompacting = compacting && busy;
   // Agents create linked worktrees while a run is in progress and then report
   // the files they wrote there. Refresh the roots once the run settles so those
   // paths become previewable without a page reload; a failed refresh keeps the
@@ -2300,6 +2305,9 @@ export default function App() {
           );
           break;
         case "host_error":
+          // A host error ends the operation it was running: keeping the
+          // compaction label would name a run that no longer exists.
+          patchCompacting(false);
           setStatus("error");
           setError(String(event.error ?? "Native host error"));
           break;
