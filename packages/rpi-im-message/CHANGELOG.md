@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Add `allowDirectChats` as an opt-in exemption from `allowChats` for confirmed
+  Feishu `p2p` and WeCom `single` conversations.
+
+### Fixed
+
+- Exempt confirmed Feishu `p2p` conversations from `mentionRequired` so direct
+  messages can arrive without a mention.
+
 ## [0.1.18](https://github.com/pi-rust/rpi-extension/compare/rpi-im-message-v0.1.17...rpi-im-message-v0.1.18) - 2026-11-27
 
 ### Other
