@@ -240,7 +240,7 @@ macro_rules! drive {
             let result = (|| {
                 let binding = drive.binding.as_ref().map_err(Clone::clone)?;
                 let _scope = runtime::enter(Some(binding.clone()));
-                runtime::authorize_tool(binding)?;
+                runtime::authorize_tool(binding, &drive.params)?;
                 $run(&drive.params)
             })();
             match result {

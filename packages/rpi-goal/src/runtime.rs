@@ -138,17 +138,18 @@ pub(crate) fn tool<const SLOT: usize>(params: &Value) -> Result<Binding, String>
     Ok(Binding { session, api })
 }
 
-pub(crate) fn authorize_tool(binding: &Binding) -> Result<(), String> {
+pub(crate) fn authorize_tool(binding: &Binding, params: &Value) -> Result<(), String> {
     if binding.session.worker.is_stopping() {
         return Err("goal registration is shutting down".into());
     }
-    if crate::is_subagent() {
+    let independent = params["__rpi"]["independentRun"].as_bool();
+    if crate::is_subagent() || independent == Some(true) {
         return Err("Subagents cannot manage the parent goal".into());
     }
-    if binding.session.api.is_some() {
+    if independent.is_none() && binding.session.api.is_some() {
+        // Older hosts expose the restriction only through execution context.
         let context =
             crate::call_runtime_raw(crate::raw_actions::GET_EXECUTION_CONTEXT, json!({}))?;
-        // childAgent reports whether this execution may spawn a child.
         if context["childAgent"].as_bool() == Some(false) {
             return Err("Subagents cannot manage the parent goal".into());
         }

@@ -232,15 +232,7 @@ fn resolved_operator_budgets_reach_the_native_start_and_final_report() {
     // keyed by runId; the resolved policy must survive that hop unchanged.
     let (action, calls) = scripted(vec![Ok(json!({"runId":"child-policy"})), Ok(completed())]);
     let (tx, rx) = mpsc::channel();
-    run_request(
-        request,
-        "policy-call".into(),
-        &[],
-        &*action,
-        tx,
-        Arc::new(AtomicBool::new(false)),
-    )
-    .unwrap();
+    run_request(request, &[], &*action, tx, Arc::new(AtomicBool::new(false))).unwrap();
     let messages: Vec<_> = rx.try_iter().collect();
     let text = messages
         .into_iter()
@@ -259,6 +251,9 @@ fn resolved_operator_budgets_reach_the_native_start_and_final_report() {
     assert_eq!(calls[0]["actionId"], INDEPENDENT_RUN);
     assert_eq!(calls[0]["args"]["maxTurns"], 0);
     assert_eq!(calls[0]["args"]["timeoutSeconds"], 900);
+    let input = calls[0]["args"]["input"].as_str().unwrap();
+    assert!(input.contains("Complete the task within the host timeout."));
+    assert!(!input.contains("at most 0 turns"));
     assert_eq!(calls.last().unwrap()["args"]["op"], "dispose");
 }
 
@@ -332,7 +327,6 @@ fn forwards_deltas_and_returns_delegation_metadata_then_disposes() {
     let (tx, rx) = mpsc::channel();
     run_request(
         request(),
-        "tool-1".into(),
         &[json!("read"), json!("delegate_task")],
         &*action,
         tx,
@@ -366,62 +360,26 @@ fn forwards_deltas_and_returns_delegation_metadata_then_disposes() {
 
 #[test]
 fn unsupported_host_is_explicit_and_never_spawns_a_process() {
-    let (action, calls) = scripted(vec![
-        Err(ActionError::UnknownAction),
-        Err(ActionError::UnknownAction),
-    ]);
+    let (action, calls) = scripted(vec![Err(ActionError::UnknownAction)]);
     let (tx, _) = mpsc::channel();
     let error = run_request(
         request(),
-        "t".into(),
         &[],
         &*action,
         tx,
         Arc::new(AtomicBool::new(false)),
     )
     .unwrap_err();
-    assert!(error.contains("requires host support for IndependentRun or ChildAgent"));
-    assert_eq!(calls.lock().unwrap().len(), 2);
+    assert!(error.contains("Upgrade to an rpi host supporting IndependentRun"));
+    assert_eq!(calls.lock().unwrap().len(), 1);
 }
 
 #[test]
-fn only_an_unknown_action_can_fall_back_to_the_legacy_lifecycle() {
-    let (action, calls) = scripted(vec![
-        Err(ActionError::UnknownAction),
-        Ok(json!({"childId":"legacy","sessionId":"s"})),
-        Ok(completed()),
-    ]);
-    let (tx, _rx) = mpsc::channel();
-    run_request(
-        request(),
-        "t".into(),
-        &[],
-        &*action,
-        tx,
-        Arc::new(AtomicBool::new(false)),
-    )
-    .unwrap();
-    let calls = calls.lock().unwrap();
-    assert_eq!(
-        calls[1],
-        json!({"actionId":CHILD_AGENT,"args":{
-            "op":"start","task":"inspect","role":"worker","maxTurns":8,"timeoutSeconds":300,"toolCallId":"t"
-        }})
-    );
-    assert_eq!(
-        calls[2],
-        json!({"actionId":CHILD_AGENT,"args":{"op":"poll","childId":"legacy"}})
-    );
-    assert_eq!(
-        calls[3],
-        json!({"actionId":CHILD_AGENT,"args":{"op":"dispose","childId":"legacy"}})
-    );
-
+fn start_errors_are_returned_without_retrying() {
     let (action, calls) = scripted(vec![Err(ActionError::Failed("permission denied".into()))]);
     let (tx, _rx) = mpsc::channel();
     assert!(run_request(
         request(),
-        "t".into(),
         &[],
         &*action,
         tx,
@@ -438,7 +396,6 @@ fn cancellation_before_start_has_no_host_side_effects() {
     let (tx, _) = mpsc::channel();
     assert!(run_request(
         request(),
-        "t".into(),
         &[],
         &*action,
         tx,
@@ -467,11 +424,9 @@ fn cancellation_after_start_cancels_and_disposes() {
         }
     };
     let (tx, _rx) = mpsc::channel();
-    assert!(
-        run_request(request(), "t".into(), &[], &action, tx, cancelled)
-            .unwrap_err()
-            .contains("cancelled")
-    );
+    assert!(run_request(request(), &[], &action, tx, cancelled)
+        .unwrap_err()
+        .contains("cancelled"));
     let ops: Vec<_> = calls
         .lock()
         .unwrap()
@@ -494,7 +449,6 @@ fn errors_and_malformed_replies_always_dispose() {
         let (tx, _rx) = mpsc::channel();
         assert!(run_request(
             request(),
-            "t".into(),
             &[],
             &*action,
             tx,
@@ -518,7 +472,6 @@ fn streamed_and_final_text_share_a_budget() {
     let (tx, _rx) = mpsc::channel();
     assert!(run_request(
         request(),
-        "t".into(),
         &[],
         &*action,
         tx,
@@ -541,7 +494,6 @@ fn partial_count_is_bounded_independently_of_bytes() {
     let (tx, _rx) = mpsc::channel();
     assert!(run_request(
         request(),
-        "t".into(),
         &[],
         &*action,
         tx,

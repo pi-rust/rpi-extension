@@ -5,7 +5,9 @@ mod kit;
 
 use crate::kit::{plugin_free_string, schema};
 use rpi_plugin_sdk::handles::ToolHandles;
-use rpi_plugin_sdk::{StbString, StbStringRef, StepHandle, StepResult, ToolPartialCb};
+use rpi_plugin_sdk::{
+    RuntimeActionId, StbString, StbStringRef, StepHandle, StepResult, ToolPartialCb,
+};
 use serde_json::{json, Value};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
@@ -13,10 +15,8 @@ use std::sync::{Arc, OnceLock};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-// Stable runtime action IDs while this package uses the published SDK.
-const GET_EXECUTION_CONTEXT: u32 = 23;
-const CHILD_AGENT: u32 = 24;
-const INDEPENDENT_RUN: u32 = 33;
+const GET_EXECUTION_CONTEXT: u32 = RuntimeActionId::GetExecutionContext as u32;
+const INDEPENDENT_RUN: u32 = RuntimeActionId::IndependentRun as u32;
 const MAX_OUTPUT_BYTES: usize = 4 * 1024 * 1024;
 const MAX_PARTIAL_EVENTS: usize = 8192;
 static JOBS: ToolHandles<Job> = ToolHandles::new();
@@ -205,25 +205,23 @@ fn validate_context(expected: &Value, actual: &Value) -> Result<(), String> {
 /// Always release the host handle, including malformed replies and local cancellation.
 struct Child<'a> {
     action: &'a Action,
-    action_id: u32,
-    id_key: &'static str,
     id: String,
     session_id: Value,
 }
 impl<'a> Child<'a> {
-    fn start(
-        action: &'a Action,
-        request: &Request,
-        tool_call_id: &str,
-        tools: &[Value],
-    ) -> Result<Self, String> {
+    fn start(action: &'a Action, request: &Request, tools: &[Value]) -> Result<Self, String> {
         let Request {
             task,
             role,
             max_turns,
             timeout_seconds,
         } = request;
-        let input = format!("You are a delegated {role} subagent. Complete the task in at most {max_turns} turns. Do not delegate, spawn, or ask another agent to do work. Work only in the current project and return a concise final report.\n\nTask:\n{task}");
+        let budget = if *max_turns == 0 {
+            "Complete the task within the host timeout.".to_owned()
+        } else {
+            format!("Complete the task in at most {max_turns} turns.")
+        };
+        let input = format!("You are a delegated {role} subagent. {budget} Do not delegate, spawn, or ask another agent to do work. Work only in the current project and return a concise final report.\n\nTask:\n{task}");
         // The extension owns its tool selection. The host checks the subset and
         // also prevents re-entry through aliases using invocation provenance.
         let tools: Vec<_> = tools
@@ -231,48 +229,37 @@ impl<'a> Child<'a> {
             .filter_map(Value::as_str)
             .filter(|name| *name != "delegate_task")
             .collect();
-        let generic = action(
+        let mut reply = action(
             INDEPENDENT_RUN,
             json!({
                 "op": "start", "input": input, "tools": tools,
                 "maxTurns": max_turns, "timeoutSeconds": timeout_seconds,
             }),
-        );
-        let (action_id, id_key, reply) = match generic {
-            // An unknown action is rejected before admission. Other errors may
-            // have come from an admitted run and must never trigger a retry.
-            Err(ActionError::UnknownAction) => (
-                CHILD_AGENT,
-                "childId",
-                action(
-                    CHILD_AGENT,
-                    json!({
-                        "op": "start", "task": task, "role": role, "maxTurns": max_turns,
-                        "timeoutSeconds": timeout_seconds, "toolCallId": tool_call_id,
-                    }),
-                ),
-            ),
-            reply => (INDEPENDENT_RUN, "runId", reply),
-        };
-        let mut reply = reply.map_err(|error| format!("Cannot start a host-managed subagent: {error}. This plugin requires host support for IndependentRun or ChildAgent."))?;
+        )
+        .map_err(|error| match error {
+            ActionError::UnknownAction => {
+                "Upgrade to an rpi host supporting IndependentRun to use delegate_task.".into()
+            }
+            ActionError::Failed(message) => {
+                format!("Cannot start a host-managed subagent: {message}")
+            }
+        })?;
         let id = reply
-            .get(id_key)
+            .get("runId")
             .and_then(Value::as_str)
             .filter(|id| !id.is_empty())
-            .ok_or_else(|| format!("run start returned no {id_key}"))?
+            .ok_or("run start returned no runId")?
             .to_owned();
         let session_id = reply.get_mut("sessionId").map_or(Value::Null, Value::take);
         Ok(Self {
             action,
-            action_id,
-            id_key,
             id,
             session_id,
         })
     }
 
     fn call(&self, op: &str) -> Result<Value, String> {
-        (self.action)(self.action_id, json!({"op":op,(self.id_key):self.id}))
+        (self.action)(INDEPENDENT_RUN, json!({"op":op,"runId":self.id}))
             .map_err(|error| error.to_string())
     }
 }
@@ -284,7 +271,6 @@ impl Drop for Child<'_> {
 
 fn run_request(
     request: Request,
-    tool_call_id: String,
     tools: &[Value],
     action: &Action,
     output: Sender<JobMessage>,
@@ -293,7 +279,7 @@ fn run_request(
     if cancelled.load(Ordering::Acquire) {
         return Err("subagent cancelled".into());
     }
-    let child = Child::start(action, &request, &tool_call_id, tools)?;
+    let child = Child::start(action, &request, tools)?;
     let deadline = Instant::now() + Duration::from_secs(request.timeout_seconds + 3);
     let mut bytes = 0usize;
     let mut events = 0usize;
@@ -365,10 +351,9 @@ fn tool_result(text: &str) -> String {
     json!({"content":[{"type":"text","text":text}]}).to_string()
 }
 
-rpi_plugin_sdk::execute_handler!(fn execute(tool_call_id, params, free_params) {
+rpi_plugin_sdk::execute_handler!(fn execute(_tool_call_id, params, free_params) {
     rpi_plugin_sdk::guard(|| {
         let text = rpi_plugin_sdk::stb_take!(params, free_params);
-        let id = tool_call_id.to_owned();
         let value = serde_json::from_str::<Value>(&text).unwrap_or(Value::Null);
         let expected_context = value.get("__rpi").cloned().unwrap_or(Value::Null);
         // The worker uses its invocation handle through disposal.
@@ -383,18 +368,18 @@ rpi_plugin_sdk::execute_handler!(fn execute(tool_call_id, params, free_params) {
                         let host = host.ok_or("subagent host runtime is unavailable")?;
                         let runtime_handle = expected_context.get("runtimeHandle").and_then(Value::as_u64)
                             .and_then(|id| usize::try_from(id).ok()).filter(|id| *id != 0)
-                            .ok_or("ChildAgent requires a host-provided tool invocation runtimeHandle; upgrade the host")?;
+                            .ok_or("IndependentRun requires a host-provided tool invocation runtimeHandle; upgrade the host")?;
                         let actual = host_action(&host, runtime_handle, GET_EXECUTION_CONTEXT, json!({})).map_err(|error|
                             format!("Cannot read execution context: {error}; upgrade to a host supporting GetExecutionContext"))?;
                         validate_context(&expected_context, &actual)?;
                         let runtime_key = expected_context.get("runtimeKey").and_then(Value::as_str)
-                            .ok_or("ChildAgent requires a host-provided invocation runtimeKey; upgrade the host")?.to_owned();
+                            .ok_or("IndependentRun requires a host-provided invocation runtimeKey; upgrade the host")?.to_owned();
                         let action = move |action_id, mut args: Value| {
                             args["__rpiRuntimeKey"] = json!(runtime_key);
                             host_action(&host, runtime_handle, action_id, args)
                         };
                         let tools = actual["tools"].as_array().map(Vec::as_slice).unwrap_or_default();
-                        run_request(request, id, tools, &action, sender.clone(), token)
+                        run_request(request, tools, &action, sender.clone(), token)
                     });
                     match result {
                         Ok(Ok(())) => {},
@@ -484,7 +469,7 @@ fn delegate_schema() -> rpi_plugin_sdk::StableToolSchema {
 fn delegate_schema_with_budget_policy(policy: BudgetPolicy) -> rpi_plugin_sdk::StableToolSchema {
     let mut registered = schema(
         "delegate_task",
-        "Delegate one bounded, non-recursive task to a host-managed in-memory child session, not a subagent subprocess or isolated worktree. The child inherits the current model/provider, tools, cwd and approval hooks; it shares the workspace and extension state. Supply necessary context, exact scope/file ownership, constraints, acceptance checks and expected report in task; do not assume the child knows the parent conversation. Coordinate overlapping writes. role is a label, not a tool/permission profile. The child cannot delegate further. Streams progress and returns a JSON report; review the report and verify acceptance, including turnLimited. Requires a host supporting independent runs or legacy delegation.",
+        "Delegate one bounded, non-recursive task to a host-managed in-memory child session, not a subagent subprocess or isolated worktree. The child inherits the current model/provider, tools, cwd and approval hooks; it shares the workspace and extension state. Supply necessary context, exact scope/file ownership, constraints, acceptance checks and expected report in task; do not assume the child knows the parent conversation. Coordinate overlapping writes. role is a label, not a tool/permission profile. The child cannot delegate further. Streams progress and returns a JSON report; review the report and verify acceptance, including turnLimited. Requires a host supporting IndependentRun.",
         r#"{
             "type": "object",
             "properties": {
