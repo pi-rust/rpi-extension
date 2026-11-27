@@ -2595,6 +2595,8 @@ export default function App() {
     setSettingsOpen(false);
     setDraft("");
     clearDrafts();
+    // Signing out drops every other composer field; the ring must not survive.
+    setComposerActionPending(null);
   }, [clearDrafts, clearTrace]);
 
   const refreshSessions = useCallback(
@@ -3110,6 +3112,10 @@ export default function App() {
     setHostCommands(null);
     setInterrupted(false);
     setFailedRun(false);
+    // The progress ring belongs to the session that started the action. A
+    // switch increments the navigation revision, so the in-flight action's
+    // own finalizer is ignored; clearing here is what stops the spinner.
+    setComposerActionPending(null);
     setRecoveryNoticeDismissed(false);
     setDialog(null);
     setDialogAnswer("");

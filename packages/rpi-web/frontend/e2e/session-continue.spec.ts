@@ -1430,3 +1430,35 @@ test("Continue shows a spinning progress ring until resume settles", async ({
   await ticket.finished;
   await expect(progress(page)).toHaveCount(0);
 });
+
+test("a session switch during a gated prompt does not strand the progress ring", async ({
+  page,
+  host,
+}) => {
+  await open(page, host);
+  await ready(page, host);
+  await input(page).fill("Navigate away while this is in flight");
+  const ticket = host.expectCommand(
+    A,
+    "prompt",
+    { json: envelope("prompt", {}) },
+    true,
+  );
+  await sendButton(page).click();
+  await ticket.arrived;
+  await expect(progress(page)).toHaveCount(1);
+
+  // Leaving the session invalidates the in-flight action's finalizer, so the
+  // ring must be cleared by the session reset instead of the abandoned call.
+  await select(page, B);
+  ticket.release();
+  await ticket.finished;
+  await rendered(page);
+
+  await expect(progress(page)).toHaveCount(0);
+  await expect(pendingButton(page)).toHaveCount(0);
+  await expect(controls(page).locator(".send-button")).toHaveAttribute(
+    "aria-busy",
+    "false",
+  );
+});
