@@ -1,7 +1,7 @@
 # rpi-subagents
 
 Registers `delegate_task`, a bounded subagent runner. It uses the host's
-`ChildAgent` runtime action (24), streams text via the normal tool-progress
+`IndependentRun` runtime action (33), streams text via the normal tool-progress
 callback, and returns a final JSON report with `kind: "rpi-delegation"`.
 Progress callbacks carry the **cumulative text snapshot**, not an individual
 child delta: consumers replace the displayed tool result on each update. The
@@ -111,16 +111,17 @@ Top-level `additionalProperties: true` accepts reserved `__rpi` invocation
 capabilities without exposing them as model schema properties. Execution requires
 valid host-injected capabilities and matching session/project context.
 
-Requires a host implementing `RuntimeActionId::ChildAgent` (24), with per-call
-`__rpi.runtimeHandle` and `runtimeKey` capabilities. Unsupported
-hosts fail with an upgrade diagnostic. There is deliberately **no legacy RPC
-subprocess fallback**, because it could silently switch models, cwd, provider
-loading scope or permission behavior. `RPI_SUBAGENT_BIN` is no longer used.
+The extension builds the delegation prompt and sends it as input to
+`RuntimeActionId::IndependentRun` (33). It also selects the active tool subset,
+excluding `delegate_task`. Both the new action and the compatibility action
+require the per-call `__rpi.runtimeHandle` and `runtimeKey` capabilities.
+
+When the host explicitly rejects action 33 as unknown, the extension uses the
+existing `ChildAgent` action (24). Other start errors are returned to the caller.
+Both paths run in memory with the host's active execution bindings.
 `RPI_SUBAGENT_CHILD=1` still suppresses registration for external legacy launches.
 
-The package retains the workspace's published SDK pin. Its documented action ID
-is a small compatibility shim, following `rpi-ask-user`, until that SDK enum is
-published. Host-side SDK validation remains authoritative; the vtable is unchanged.
+The package retains the workspace's published SDK pin. Its runtime action IDs are declared locally until the SDK publishes the enum variant. Host-side SDK validation remains authoritative; the vtable is unchanged.
 
 ## Verification
 
