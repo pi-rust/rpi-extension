@@ -205,7 +205,13 @@ repository-scoped GitHub App token or fine-grained personal access token with
 Contents and Pull requests write permissions. This token is used for the PR
 API only; it does not bypass `main` protection. A version-PR push triggered by
 that token is skipped by the release workflow because the original run already
-publishes the merged commit. `workflow_dispatch` can always retry that commit.
+publishes the merged commit.
+
+To resume a partial Cargo release after `main` has advanced, dispatch
+`release-cargo.yml` on `main` with `mode=publish` and `source_ref` set to the
+full SHA of the original release commit. The retry validates that commit and
+publishes its remaining crates using the existing versions and tags. Platform
+assets are selected from tags pointing to that commit.
 
 The build pipeline preserves Actions artifacts for 14 days. GNU bundle
 assembly and per-package target matrices verify source commit, package

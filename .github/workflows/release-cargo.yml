@@ -10,6 +10,10 @@ on:
         options: [dry-run, publish]
         default: dry-run
         required: true
+      source_ref:
+        description: 'Exact main-history release commit to retry in publish mode'
+        type: string
+        required: false
 
 permissions:
   contents: write
@@ -77,6 +81,22 @@ jobs:
           ref: main
           fetch-depth: 0
 
+      - name: Check out the original release commit for a retry
+        if: inputs.source_ref != ''
+        env:
+          MODE: ${{ inputs.mode }}
+          SOURCE_REF: ${{ inputs.source_ref }}
+        run: |
+          if [[ "$MODE" != publish || ! "$SOURCE_REF" =~ ^[0-9a-f]{40}$ ]]; then
+            echo '::error::An exact-source retry requires publish mode and a full commit SHA.'
+            exit 1
+          fi
+          if ! git merge-base --is-ancestor "$SOURCE_REF" HEAD; then
+            echo '::error::The retry commit must belong to reviewed main history.'
+            exit 1
+          fi
+          git checkout --detach "$SOURCE_REF"
+
       - name: Check publishing credentials
         if: inputs.mode == 'publish'
         env:
@@ -124,12 +144,15 @@ jobs:
           key: native-speech-1.13.8-${{ runner.os }}-${{ runner.arch }}
 
       - name: Resolve registry dependencies
+        if: inputs.source_ref == ''
         run: cargo update --workspace
 
       - name: Exclude historical checkouts requiring an external SDK
+        if: inputs.source_ref == ''
         run: python3 .github/scripts/prepare-release-history.py
 
       - name: Prepare a valid release comparison checkout
+        if: inputs.source_ref == ''
         run: |
           python3 - <<'PY'
           import os
@@ -193,9 +216,11 @@ jobs:
           PY
 
       - name: Generate versions and changelogs for unpublished changes
+        if: inputs.source_ref == ''
         run: release-plz update --registry-manifest-path "$RELEASE_REGISTRY_MANIFEST"
 
       - name: Synchronize package catalog versions
+        if: inputs.source_ref == ''
         run: python3 .github/scripts/sync-release-catalog.py
 
       - name: Install Node.js for the embedded frontend
@@ -252,11 +277,21 @@ jobs:
       - name: Verify crate packages before publishing
         run: cargo publish --workspace --dry-run --allow-dirty --locked
 
-      - name: Merge tested release metadata through a version PR
+      - name: Select release source and merge new metadata through a version PR
         id: version
         env:
           GH_TOKEN: ${{ secrets.RELEASE_GITHUB_TOKEN || github.token }}
-        run: bash .github/scripts/release-version-pr.sh
+          SOURCE_REF: ${{ inputs.source_ref }}
+        run: |
+          if [[ -n "$SOURCE_REF" ]]; then
+            if [[ "$(git rev-parse HEAD)" != "$SOURCE_REF" ]] || ! git diff --quiet HEAD; then
+              echo '::error::The retry checkout no longer matches the original release commit.'
+              exit 1
+            fi
+            echo "source_ref=$SOURCE_REF" >> "$GITHUB_OUTPUT"
+          else
+            bash .github/scripts/release-version-pr.sh
+          fi
 
       # GITHUB_TOKEN commits do not trigger push workflows. Publish in this
       # same run so the version commit cannot leave crates unpublished.
