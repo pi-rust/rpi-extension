@@ -117,7 +117,8 @@ pub fn start(options: StartOptions) -> Result<Goal, String> {
     goal.deadline_ms = options.deadline_ms.filter(|ms| *ms > 0).map(|ms| now + ms);
     goal.token_budget = options.token_budget.filter(|n| *n > 0);
     {
-        let _guard = state::lock();
+        let session = crate::runtime::state();
+        let _guard = state::lock(&session);
         let mut goals = state::read()?;
         if let Some(mut old) = goals.active.take() {
             if old.status.is_active() {
@@ -139,7 +140,8 @@ pub fn update(notes: Option<&str>, new_status: Option<Status>) -> Result<Goal, S
         return Err("update requires `notes` and/or `status`".into());
     }
     let (goal, notice) = {
-        let _guard = state::lock();
+        let session = crate::runtime::state();
+        let _guard = state::lock(&session);
         let goals = state::read()?;
         let mut goal = require_active(&goals)?;
         let now = state::now_ms();
@@ -197,7 +199,8 @@ pub fn resume() -> Result<Goal, String> {
 
 pub fn set_status(new_status: Status) -> Result<Goal, String> {
     let (goal, notice) = {
-        let _guard = state::lock();
+        let session = crate::runtime::state();
+        let _guard = state::lock(&session);
         let goals = state::read()?;
         let mut goal = require_active(&goals)?;
         let now = state::now_ms();
@@ -234,7 +237,8 @@ pub fn complete_by_model() -> Result<Goal, String> {
 
 fn complete_from(source: TerminationSource) -> Result<Goal, String> {
     let goal = {
-        let _guard = state::lock();
+        let session = crate::runtime::state();
+        let _guard = state::lock(&session);
         let mut goals = state::read()?;
         let mut goal = require_active(&goals)?;
         let now = state::now_ms();
@@ -256,7 +260,8 @@ pub fn clear() -> Result<Option<Goal>, String> {
     inject::discard();
     state::remove_legacy_file();
     let removed = {
-        let _guard = state::lock();
+        let session = crate::runtime::state();
+        let _guard = state::lock(&session);
         let mut goals = state::read()?;
         let removed = goals.active.take();
         let now = state::now_ms();
@@ -281,7 +286,8 @@ pub fn set_limits(
     token_budget: Option<Option<u64>>,
 ) -> Result<Goal, String> {
     let goal = {
-        let _guard = state::lock();
+        let session = crate::runtime::state();
+        let _guard = state::lock(&session);
         let goals = state::read()?;
         let mut goal = require_active(&goals)?;
         let now = state::now_ms();
@@ -309,7 +315,8 @@ pub fn set_limits(
 pub fn complete_with(goal_id: &str, summary: &str) -> Result<Goal, String> {
     let summary = bounded(summary, state::MAX_SUMMARY_CHARS, "completion summary")?;
     let goal = {
-        let _guard = state::lock();
+        let session = crate::runtime::state();
+        let _guard = state::lock(&session);
         let mut goals = state::read()?;
         let mut goal = require_current(goal_id, &goals)?;
         if goal.status.is_stopped() {
@@ -349,7 +356,8 @@ pub fn block(
         return Err("blocked requires the same blocker across at least 3 turns".into());
     }
     let goal = {
-        let _guard = state::lock();
+        let session = crate::runtime::state();
+        let _guard = state::lock(&session);
         let mut goals = state::read()?;
         let mut goal = require_current(goal_id, &goals)?;
         if goal.status.is_stopped() {
@@ -381,7 +389,8 @@ pub fn block(
 pub fn wait(goal_id: &str, reason: &str, resume_after_ms: Option<i64>) -> Result<Goal, String> {
     let reason = bounded(reason, state::MAX_REASON_CHARS, "wait reason")?;
     let (goal, notice) = {
-        let _guard = state::lock();
+        let session = crate::runtime::state();
+        let _guard = state::lock(&session);
         let goals = state::read()?;
         let mut goal = require_current(goal_id, &goals)?;
         if goal.status.is_stopped() {
@@ -458,7 +467,8 @@ pub fn record_verification(input: VerdictInput) -> Result<Goal, String> {
         .map(str::to_string);
 
     let (goal, notice, wake) = {
-        let _guard = state::lock();
+        let session = crate::runtime::state();
+        let _guard = state::lock(&session);
         let mut goals = state::read()?;
         let now = state::now_ms();
         let verdict = GoalVerification {

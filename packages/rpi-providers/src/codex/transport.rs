@@ -8,7 +8,7 @@ use rpi_ai::types::ThinkingLevel;
 use serde_json::{json, Value};
 use std::{
     collections::BTreeMap,
-    sync::{Arc, Mutex, OnceLock},
+    sync::{Arc, Mutex},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
@@ -86,26 +86,29 @@ impl driver::Body for LiveBody {
     }
 }
 
-/// One Codex "session id" per host session id, matching Pi's stable codex session id.
-fn codex_session_id(session_id: &str) -> String {
-    static SESSIONS: OnceLock<Mutex<BTreeMap<String, String>>> = OnceLock::new();
-    let sessions = SESSIONS.get_or_init(|| Mutex::new(BTreeMap::new()));
-    let mut sessions = sessions.lock().unwrap();
-    if sessions.len() > 64 {
-        sessions.clear();
+/// One Codex conversation ID per host session ID within a registration.
+#[derive(Default)]
+pub(super) struct Sessions(Mutex<BTreeMap<String, String>>);
+impl Sessions {
+    fn get(&self, session_id: &str) -> String {
+        let mut sessions = self.0.lock().unwrap();
+        if sessions.len() > 64 {
+            sessions.clear();
+        }
+        sessions
+            .entry(session_id.to_owned())
+            .or_insert_with(super::mod_uuid_v4)
+            .clone()
     }
-    sessions
-        .entry(session_id.to_owned())
-        .or_insert_with(super::mod_uuid_v4)
-        .clone()
 }
 
 /// The per-request source: resolves the account from the access JWT, builds the body
 /// and performs one send.
-pub struct Live {
+pub(super) struct Live {
     pub net: Arc<Net>,
     pub root: String,
     pub idle: Option<Duration>,
+    pub(super) state: Arc<super::State>,
 }
 impl driver::Source for Live {
     type Body = LiveBody;
@@ -137,7 +140,7 @@ impl driver::Source for Live {
         let session_id = options["sessionId"]
             .as_str()
             .filter(|id| !id.is_empty())
-            .map(codex_session_id);
+            .map(|id| self.state.sessions.get(id));
         let temperature = options["temperature"].as_f64();
         let body = convert::build_request_body(
             model,

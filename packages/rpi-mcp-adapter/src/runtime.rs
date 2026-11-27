@@ -2,52 +2,31 @@
 use crate::{Control, DiscoveredServer, ResourceUpdate, ServerInfo};
 use rpi_mcp_core::{ClientIdentity, CoreRequestContext, McpRuntime};
 use serde_json::{json, Value};
-use std::{
-    path::PathBuf,
-    sync::{Mutex, OnceLock},
-};
+use std::{path::PathBuf, sync::OnceLock};
+
+pub(crate) fn new_runtime() -> McpRuntime {
+    McpRuntime::with_identity(ClientIdentity::new(
+        "rpi-mcp-adapter",
+        env!("CARGO_PKG_VERSION"),
+    ))
+}
+
 fn default_runtime() -> &'static McpRuntime {
     static DEFAULT: OnceLock<McpRuntime> = OnceLock::new();
-    DEFAULT.get_or_init(|| {
-        McpRuntime::with_identity(ClientIdentity::new(
-            "rpi-mcp-adapter",
-            env!("CARGO_PKG_VERSION"),
-        ))
-    })
+    DEFAULT.get_or_init(new_runtime)
 }
-static CURRENT_SCOPE: OnceLock<Mutex<Option<String>>> = OnceLock::new();
-fn current_scope_slot() -> &'static Mutex<Option<String>> {
-    CURRENT_SCOPE.get_or_init(|| Mutex::new(None))
+
+pub(crate) fn session_scope(context: &Value) -> Option<String> {
+    context["sessionId"]
+        .as_str()
+        .filter(|id| !id.trim().is_empty())
+        .map(|id| format!("session:{id}"))
 }
-fn remember_scope(scope: &str) {
-    *current_scope_slot()
-        .lock()
-        .unwrap_or_else(|p| p.into_inner()) = Some(scope.to_string());
-}
-pub(crate) fn current_scope() -> Option<String> {
-    if let Some(id) = std::env::var_os(rpi_plugin_sdk::SESSION_ID_ENV) {
-        // A present but invalid id must fail closed, never reuse the old scope
-        // or fall back to the unscoped queue drain.
-        return Some(
-            id.to_str()
-                .map(str::trim)
-                .filter(|id| !id.is_empty())
-                .map(|id| format!("session:{id}"))
-                .unwrap_or_default(),
-        );
-    }
-    current_scope_slot()
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .clone()
-}
+
 fn host_scope(params: &Value) -> String {
     let host = params.get(rpi_plugin_sdk::HOST_CONTEXT_KEY);
-    if let Some(id) = host
-        .and_then(|v| v.get("sessionId"))
-        .and_then(Value::as_str)
-    {
-        return format!("session:{id}");
+    if let Some(scope) = host.and_then(session_scope) {
+        return scope;
     }
     if let Some(cwd) = host.and_then(|v| v.get("cwd")).and_then(Value::as_str) {
         return format!(
@@ -67,11 +46,9 @@ fn host_cwd(params: &Value) -> PathBuf {
         .map(PathBuf::from)
         .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")))
 }
-fn context(params: &Value) -> CoreRequestContext {
-    let scope = host_scope(params);
-    remember_scope(&scope);
+pub(crate) fn context(params: &Value) -> CoreRequestContext {
     CoreRequestContext {
-        scope,
+        scope: host_scope(params),
         cwd: host_cwd(params),
     }
 }
@@ -80,9 +57,6 @@ pub(crate) fn call(params: &Value, control: &Control) -> Result<Value, String> {
 }
 pub(crate) fn list(params: &Value, control: &Control) -> Result<Value, String> {
     default_runtime().list(&context(params), params, control)
-}
-pub(crate) fn resources(params: &Value, control: &Control) -> Result<Value, String> {
-    default_runtime().resources(&context(params), params, control)
 }
 pub fn call_from_config(
     config_path: &str,
@@ -148,7 +122,7 @@ pub fn resources_from_config(
     if let Some(uri) = uri {
         params["uri"] = json!(uri);
     }
-    resources(&params, &Control::default())
+    default_runtime().resources(&context(&params), &params, &Control::default())
 }
 pub fn take_resource_updates(scope: Option<&str>) -> Vec<ResourceUpdate> {
     default_runtime().take_resource_updates(scope)
@@ -156,18 +130,13 @@ pub fn take_resource_updates(scope: Option<&str>) -> Vec<ResourceUpdate> {
 pub fn shutdown_connections() {
     default_runtime().shutdown_connections()
 }
-pub(crate) fn flush_resource_updates(
-    append: impl FnOnce(Value) -> Result<(), String>,
-) -> Result<(), String> {
-    flush_resource_updates_with(default_runtime(), append)
-}
-
 pub(crate) fn flush_resource_updates_with(
     runtime: &McpRuntime,
+    scope: &str,
     append: impl FnOnce(Value) -> Result<(), String>,
+    retry: impl FnOnce() -> bool,
 ) -> Result<(), String> {
-    let scope = current_scope();
-    let updates = runtime.take_resource_update_batch(scope.as_deref());
+    let updates = runtime.take_resource_update_batch(Some(scope));
     if updates.is_empty() {
         return Ok(());
     }
@@ -189,7 +158,7 @@ pub(crate) fn flush_resource_updates_with(
         "data": {"customType": "mcp-resources", "display": true},
         "timestamp": timestamp,
     }));
-    if result.is_err() && current_scope() == scope {
+    if result.is_err() && retry() {
         updates.retry();
     }
     result

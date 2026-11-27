@@ -1,4 +1,7 @@
 //! `goal.json` limits: defaults, invalid files, and the read-only view.
+
+#![forbid(unsafe_code)]
+
 mod support;
 
 use serde_json::json;

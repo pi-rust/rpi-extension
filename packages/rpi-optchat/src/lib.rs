@@ -20,10 +20,11 @@
 //! `memory.rs`).
 #![forbid(unsafe_code)]
 // The pinned SDK exports safe C entrypoints around its internal raw ABI reads.
-#![allow(clippy::not_unsafe_ptr_arg_deref)]
 
 mod compact;
 mod import;
+mod lifecycle;
+pub use lifecycle::rpi_plugin_register;
 mod memory;
 mod runtime;
 mod store;
@@ -39,8 +40,8 @@ use serde_json::{json, Value};
 use std::ffi::c_void;
 use std::fs;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Mutex;
+use std::sync::atomic::Ordering;
+use std::sync::{Arc, TryLockError, Weak};
 
 /// Session custom-entry type holding one whole message.
 const ENTRY_TYPE: &str = "optchat-entry";
@@ -68,22 +69,6 @@ const DUPLICATE_WINDOW_MS: i64 = 10_000;
 /// must not write its own turns into the parent's memory.
 const ORCHESTRATOR_SUBAGENT_ENV: &str = "RPI_ORCHESTRATOR_SUBAGENT";
 
-type Runtime = PluginApi;
-
-static PROCESS_IS_SUBAGENT: AtomicBool = AtomicBool::new(false);
-
-fn capture_process_role() {
-    PROCESS_IS_SUBAGENT.store(
-        std::env::var_os(ORCHESTRATOR_SUBAGENT_ENV).is_some()
-            || std::env::var_os(rpi_plugin_sdk::SUBAGENT_PARENT_TRACE_ID_ENV).is_some(),
-        Ordering::Relaxed,
-    );
-}
-
-fn is_subagent() -> bool {
-    PROCESS_IS_SUBAGENT.load(Ordering::Relaxed)
-}
-
 // ---------------------------------------------------------------------------
 // Host runtime actions
 // ---------------------------------------------------------------------------
@@ -92,10 +77,41 @@ fn call_runtime(id: RuntimeActionId, args: Value) -> Result<Value, String> {
     call_action(id as u32, args)
 }
 
+// SDK 0.3.20 predates the enum variant. See HOST-REQUIREMENTS.md.
+const GET_EXECUTION_CONTEXT: u32 = 23;
+
+fn project_dir() -> Result<PathBuf, String> {
+    // Hosts predating GetExecutionContext (or its cwd field) provide only the
+    // process directory. Other failures can indicate a retired registration.
+    // Do not redirect its project files to the process directory in that case.
+    match call_action(GET_EXECUTION_CONTEXT, json!({})) {
+        Ok(context) if !context["cwd"].is_null() => {
+            return context["cwd"]
+                .as_str()
+                .map(PathBuf::from)
+                .filter(|path| path.is_absolute())
+                .ok_or_else(|| "host execution context did not provide an absolute cwd".into());
+        }
+        Ok(_) => {}
+        Err(error) if error.contains("unknown runtime action id 23") => {}
+        Err(error) => return Err(error),
+    }
+    if runtime::current().is_some_and(|registration| registration.has_cleanup) {
+        return Err("host execution context did not provide a project cwd".into());
+    }
+    std::env::current_dir()
+        .map_err(|error| format!("cannot resolve the project directory: {error}"))
+}
+
+fn store_directory() -> Result<PathBuf, String> {
+    store::directory(project_dir)
+}
+
 /// Call a runtime action by ABI id, for host actions the published SDK does not
 /// declare yet (`GetExecutionContext`).
 fn call_action(id: u32, args: Value) -> Result<Value, String> {
-    let runtime = runtime::snapshot().ok_or("optchat runtime is unavailable")?;
+    let registration = runtime::current().ok_or("optchat runtime is unavailable")?;
+    let runtime = &registration.api;
     let input = args.to_string();
     let mut output = StbString::empty();
     let rc = (runtime.runtime_action)(
@@ -104,8 +120,7 @@ fn call_action(id: u32, args: Value) -> Result<Value, String> {
         &mut output,
         runtime.user_data,
     );
-    let text = output.to_string_lossy();
-    (runtime.free_string)(output);
+    let text = rpi_plugin_sdk::stb_take!(output, Some(runtime.free_string));
     if rc != 0 {
         return Err(if text.trim().is_empty() {
             format!("runtime action {id} failed")
@@ -124,7 +139,7 @@ fn call_action(id: u32, args: Value) -> Result<Value, String> {
 // ---------------------------------------------------------------------------
 
 struct State {
-    session: String,
+    mark: BranchMark,
     memory: Memory,
     /// Model-written summaries are enabled for this session.
     compact: bool,
@@ -137,20 +152,28 @@ struct State {
     last: Option<(Kind, String, i64)>,
 }
 
-static STATE: Mutex<Option<State>> = Mutex::new(None);
-/// Serialize local append preparation, host persistence, and local commit so
-/// two callbacks cannot persist the same message index or reorder the log.
-static APPEND_GATE: Mutex<()> = Mutex::new(());
+#[derive(Default)]
+struct StateCache {
+    state: Option<State>,
+    /// Changes when the cached branch or its newest entry changes.
+    revision: u64,
+}
 
-fn current_session() -> String {
-    std::env::var(rpi_plugin_sdk::SESSION_ID_ENV)
-        .ok()
-        .filter(|id| !id.trim().is_empty())
-        .unwrap_or_else(|| "default".to_string())
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct BranchMark {
+    session: Option<String>,
+    newest: Option<(u64, Option<String>)>,
+}
+
+impl BranchMark {
+    fn observe_entry(&mut self, record: &Value, id: u64) {
+        self.newest = Some((id, record["id"].as_str().map(str::to_owned)));
+    }
 }
 
 /// What one branch read yields: the log plus the lines and settings stored with it.
 struct Hydrated {
+    mark: BranchMark,
     memory: Memory,
     compact: bool,
     profile: String,
@@ -160,6 +183,7 @@ struct Hydrated {
 /// are requested, and a host that cannot filter them is refused rather than
 /// reading the whole branch.
 fn hydrate() -> Result<Hydrated, String> {
+    let mut mark = BranchMark::default();
     let mut entries: Vec<memory::Entry> = Vec::new();
     let mut nodes: Vec<(u32, u64, String)> = Vec::new();
     let mut compact: Option<bool> = None;
@@ -189,6 +213,7 @@ fn hydrate() -> Result<Hydrated, String> {
                     .into(),
             );
         }
+        mark.session = value["sessionId"].as_str().map(str::to_owned);
         let page = value
             .get("entries")
             .and_then(Value::as_array)
@@ -218,6 +243,7 @@ fn hydrate() -> Result<Hydrated, String> {
             match custom_type {
                 ENTRY_TYPE => {
                     if let Ok(entry) = serde_json::from_value::<memory::Entry>(data.clone()) {
+                        mark.observe_entry(record, entry.i);
                         entries.push(entry);
                     }
                 }
@@ -283,6 +309,7 @@ fn hydrate() -> Result<Hydrated, String> {
         memory.restore_view(&parts, merging);
     }
     Ok(Hydrated {
+        mark,
         memory,
         compact: compact.unwrap_or_else(compact::env_enabled),
         profile: profile
@@ -300,102 +327,132 @@ fn default_profile() -> String {
         .unwrap_or_else(|| "default".to_string())
 }
 
-/// The id of the newest message the branch holds, read in one cheap query.
-/// `None` means the branch holds no memory entry at all.
-fn branch_mark() -> Result<Option<u64>, String> {
+/// Read one latest entry and the host's branch identity for this session.
+fn latest(custom_type: &str) -> Result<Value, String> {
     let value = call_runtime(
         RuntimeActionId::GetSessionBranch,
-        json!({
-            "customTypes": [ENTRY_TYPE],
-            "limit": 1,
-            "order": "newestFirst",
-        }),
+        json!({"customTypes": [custom_type], "limit": 1, "order": "newestFirst"}),
     )?;
-    if value.get("filtered").and_then(Value::as_bool) != Some(true) {
+    if value["filtered"].as_bool() != Some(true) {
         return Err("This rpi host answered GetSessionBranch without `filtered: true`".into());
     }
-    let Some(record) = value
-        .get("entries")
-        .and_then(Value::as_array)
-        .and_then(|entries| entries.first())
-    else {
-        return Ok(None);
-    };
-    Ok(record
-        .get("data")
-        .and_then(|data| data.get("i"))
-        .and_then(Value::as_u64))
+    Ok(value)
 }
 
-/// Whether a cached state still describes the branch it was loaded from: the
-/// newest message in the branch must be the newest one this state holds. A
-/// branch switch inside one session keeps `RPI_SESSION_ID`, so identity — not a
-/// timestamp or a session name — decides whether the cache is still valid.
-fn state_is_current(session: &str, state: &State) -> bool {
-    if state.session != session {
-        return false;
-    }
-    let expected = if state.memory.len() == 0 {
-        None
-    } else {
-        Some(state.memory.end() - 1)
+fn memory_mark(value: &Value) -> BranchMark {
+    let mut mark = BranchMark {
+        session: value["sessionId"].as_str().map(str::to_owned),
+        newest: None,
     };
-    match branch_mark() {
-        Ok(actual) => actual == expected,
-        // A failed identity probe must not destroy a working cache: the next
-        // capture still appends, and a later probe repairs the view.
-        Err(_) => true,
+    let record = &value["entries"][0];
+    if let Some(id) = record["data"]["i"].as_u64() {
+        mark.observe_entry(record, id);
     }
+    mark
 }
 
-/// Run `f` against the state of the session this process is serving, reloading
-/// the log when the host switched sessions or moved to another branch. Both the
-/// hydration and the identity probe call the host, which must never happen while
-/// `STATE` is held: a host call can re-enter a callback.
+fn append_custom(
+    custom_type: &str,
+    data: Value,
+    generation: u64,
+    mark: Option<&BranchMark>,
+) -> Result<Value, String> {
+    let registration = runtime::current().ok_or("optchat runtime is unavailable")?;
+    let snapshot = latest(custom_type)?;
+    if registration.branch_generation() != generation
+        || mark.is_some_and(|mark| *mark != memory_mark(&snapshot))
+    {
+        return Err("OptChat branch changed before appending an entry".into());
+    }
+    let mut args = json!({"customType": custom_type, "data": data});
+    if snapshot["scopedAppend"].as_bool() == Some(true) {
+        let session = snapshot["sessionId"]
+            .as_str()
+            .ok_or("missing OptChat branch session id")?;
+        let leaf = snapshot
+            .get("leafId")
+            .ok_or("missing OptChat branch leaf id")?;
+        let head = &snapshot["entries"][0];
+        let entry = if head.is_null() {
+            None
+        } else {
+            Some(
+                head["id"]
+                    .as_str()
+                    .ok_or("missing OptChat branch entry id")?,
+            )
+        };
+        args["expected"] = json!({"sessionId": session, "leafId": leaf, "customType": custom_type, "entryId": entry});
+    }
+    call_runtime(RuntimeActionId::AppendEntry, args)
+}
+
+/// Run `f` against the current session's branch cache. Host calls run outside
+/// the cache lock because they can re-enter a callback. Retry when another callback
+/// resets, replaces, or appends to the cache during either host query.
 fn with_state<T>(f: impl FnOnce(&mut State) -> T) -> Result<T, String> {
-    let session = current_session();
-    let stale = {
-        let guard = STATE.lock().unwrap_or_else(|error| error.into_inner());
-        match guard.as_ref() {
-            Some(state) => !state_is_current(&session, state),
-            None => true,
+    let registration = runtime::current().ok_or("optchat runtime is unavailable")?;
+    loop {
+        let (revision, expected) = {
+            let cache = registration
+                .state
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            let expected = cache.state.as_ref().map(|state| state.mark.clone());
+            (cache.revision, expected)
+        };
+        let current = match expected {
+            Some(expected) => memory_mark(&latest(ENTRY_TYPE)?) == expected,
+            None => false,
+        };
+        {
+            let mut cache = registration
+                .state
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            if cache.revision != revision {
+                continue;
+            }
+            if let Some(state) = cache.state.as_mut().filter(|_| current) {
+                return Ok(f(state));
+            }
         }
-    };
-    if stale {
+
         let Hydrated {
+            mark,
             memory,
             compact,
             profile,
         } = hydrate()?;
-        if compact {
-            compact::bind_session(&call_action);
+        let mut cache = registration
+            .state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if cache.revision != revision {
+            continue;
         }
-        let mut guard = STATE.lock().unwrap_or_else(|error| error.into_inner());
-        let still_stale = match guard.as_ref() {
-            Some(state) => !state_is_current(&session, state),
-            None => true,
-        };
-        if still_stale {
-            *guard = Some(State {
-                session,
-                memory,
-                compact,
-                profile,
-                last: None,
-            });
-        }
+        cache.revision += 1;
+        registration.invalidate_compaction();
+        let state = cache.state.insert(State {
+            mark,
+            memory,
+            compact,
+            profile,
+            last: None,
+        });
+        return Ok(f(state));
     }
-    let mut guard = STATE.lock().unwrap_or_else(|error| error.into_inner());
-    let state = guard
-        .as_mut()
-        .ok_or("OptChat memory state is unavailable")?;
-    Ok(f(state))
 }
 
 /// Drop the cached log: the session or its branch changed.
-fn reset_state() {
-    let mut guard = STATE.lock().unwrap_or_else(|error| error.into_inner());
-    *guard = None;
+fn reset_state(registration: &runtime::Registration) {
+    let mut cache = registration
+        .state
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    cache.state = None;
+    cache.revision += 1;
+    registration.invalidate_compaction();
 }
 
 fn with_memory<T>(f: impl FnOnce(&mut Memory) -> T) -> Result<T, String> {
@@ -404,65 +461,107 @@ fn with_memory<T>(f: impl FnOnce(&mut Memory) -> T) -> Result<T, String> {
 
 /// Persist the current view shape so a resumed session shows the same lines.
 fn persist_view() {
-    let Ok(shape) = with_state(|state| state.memory.view_shape()) else {
+    let Some(registration) = runtime::current() else {
+        return;
+    };
+    let Ok((shape, generation)) =
+        with_state(|state| (state.memory.view_shape(), registration.branch_generation()))
+    else {
         return;
     };
     let parts: Vec<Value> = shape.0.iter().map(|(l, i)| json!([l, i])).collect();
-    if let Err(error) = call_action(
-        RuntimeActionId::AppendEntry as u32,
-        json!({
-            "customType": VIEW_TYPE,
-            "data": {"parts": parts, "merging": shape.1},
-        }),
+    if let Err(error) = append_custom(
+        VIEW_TYPE,
+        json!({"parts": parts, "merging": shape.1}),
+        generation,
+        None,
     ) {
         debug(&format!("could not persist the view shape: {error}"));
     }
 }
 
-/// Install finished lines, persist them, and queue merges the view still shows
-/// as extractive cuts. Runs on paths that already talk to the host, so it never
-/// adds a host call of its own to a hot path.
+/// Persist only completed work that still belongs to this registration's
+/// active branch. A worker never makes host calls itself.
 fn service_compaction() {
+    let Some(registration) = runtime::current()
+        .filter(|registration| registration.has_cleanup && !registration.is_subagent)
+    else {
+        return;
+    };
+    let _gate = match registration.append_gate.try_lock() {
+        Ok(guard) => guard,
+        Err(TryLockError::Poisoned(error)) => error.into_inner(),
+        Err(TryLockError::WouldBlock) => return,
+    };
+    let done = registration
+        .compactor
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .as_mut()
+        .map(compact::Engine::drain)
+        .unwrap_or_default();
     let mut installed = false;
-    for node in compact::drain() {
-        if node.text.is_empty() {
+    for node in done.into_iter().filter(|node| !node.text.is_empty()) {
+        let valid = with_state(|state| {
+            state.compact && registration.branch_generation() == node.generation
+        })
+        .unwrap_or(false);
+        if !valid {
             continue;
         }
-        let applied =
-            with_state(|state| state.memory.install_node(node.l, node.i, node.text.clone()))
-                .unwrap_or(false);
-        if !applied {
-            continue;
-        }
-        installed = true;
-        if let Err(error) = call_action(
-            RuntimeActionId::AppendEntry as u32,
-            json!({
-                "customType": compact::NODE_TYPE,
-                "data": {"l": node.l, "i": node.i, "text": node.text},
-            }),
-        ) {
+        let data = json!({"l": node.l, "i": node.i, "text": node.text});
+        if let Err(error) = append_custom(compact::NODE_TYPE, data, node.generation, None) {
             debug(&format!("could not persist a summary line: {error}"));
+            continue;
         }
+        installed |= with_state(|state| {
+            registration.branch_generation() == node.generation
+                && state.memory.install_node(node.l, node.i, node.text)
+        })
+        .unwrap_or(false);
     }
     if installed {
         persist_view();
     }
-    let Ok((enabled, parts)) = with_state(|state| {
+    let Ok((parts, generation)) = with_state(|state| {
         let parts = if state.compact {
             state.memory.extractive_parts(2)
         } else {
             Vec::new()
         };
-        (state.compact, parts)
+        (parts, registration.branch_generation())
     }) else {
         return;
     };
-    if !enabled {
+    if parts.is_empty() {
         return;
     }
-    for (part, source) in &parts {
-        compact::enqueue(part.l, part.i, source.clone());
+    let Ok(context) = call_action(GET_EXECUTION_CONTEXT, json!({})) else {
+        return;
+    };
+    let Some(binding) = compact::Binding::from_context(&context) else {
+        return;
+    };
+    let mut engine = registration
+        .compactor
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    if runtime::current().is_none() || registration.branch_generation() != generation {
+        return;
+    }
+    if engine.is_none() {
+        match compact::Engine::new(
+            registration.stopping.clone(),
+            registration.branch_generation.clone(),
+        ) {
+            Ok(worker) => *engine = Some(worker),
+            Err(error) => debug(&format!("could not start compaction worker: {error}")),
+        }
+    }
+    if let Some(engine) = engine.as_mut() {
+        for (part, source) in parts {
+            engine.enqueue(generation, part.l, part.i, source, binding.clone());
+        }
     }
 }
 
@@ -503,14 +602,6 @@ fn clear_status() {
     }
 }
 
-fn persist(entry: &memory::Entry) -> Result<(), String> {
-    call_runtime(
-        RuntimeActionId::AppendEntry,
-        json!({"customType": ENTRY_TYPE, "data": entry}),
-    )
-    .map(|_| ())
-}
-
 /// Diagnostics for a capture path that must never fail a turn. Enabled with
 /// `RPI_OPTCHAT_DEBUG=1`; otherwise a failed write is silently skipped and the
 /// next turn retries through normal capture.
@@ -528,37 +619,50 @@ fn now_ms() -> i64 {
 }
 
 /// Persist an entry before committing it to the in-memory log. The host call
-/// intentionally happens outside `STATE`; the append gate serializes local
+/// intentionally happens outside the cache lock; the append gate serializes local
 /// writers without holding the state lock across the foreign call.
 fn persist_then_commit(
+    registration: &runtime::Registration,
     entry: memory::Entry,
-    session: &str,
+    mark: BranchMark,
+    generation: u64,
     last: Option<(Kind, String, i64)>,
 ) -> Result<u64, String> {
-    persist(&entry)?;
-    // Commit into the state this entry was prepared from, without the branch
-    // identity probe `with_state` runs: the probe would see the entry this call
-    // just appended as a foreign change and reload the log underneath it.
-    let mut guard = STATE.lock().unwrap_or_else(|error| error.into_inner());
-    (|| {
-        let state = guard
+    let directory = store_directory();
+    let receipt = append_custom(ENTRY_TYPE, json!(entry), generation, Some(&mark))?;
+    let id = entry.i;
+    let profile = {
+        let mut cache = registration
+            .state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let state = cache
+            .state
             .as_mut()
             .ok_or("OptChat memory state is unavailable")?;
-        if state.session != session {
-            return Err("OptChat session changed while persisting an entry".to_string());
+        if registration.branch_generation() != generation || state.mark != mark {
+            return Err("OptChat branch changed while persisting an entry".into());
         }
-        let committed = state.memory.append_prepared(entry)?;
-        // Retaining a window, not a prefix: past the cap the oldest messages
-        // fall out instead of new ones being dropped. Trimming in batches keeps
-        // the tree rebuild off the per-message path.
+        state.memory.append_prepared(entry.clone())?;
+        state.mark.newest = Some((
+            id,
+            receipt["entryId"]
+                .as_str()
+                .map(str::to_owned)
+                .filter(|_| receipt["scoped"].as_bool() == Some(true)),
+        ));
         if state.memory.len() > MAX_ENTRIES {
             state.memory.trim_to(MAX_ENTRIES - TRIM_SLACK);
         }
         if let Some(last) = last {
             state.last = Some(last);
         }
-        Ok(committed.i)
-    })()
+        let profile = state.profile.clone();
+        cache.revision += 1;
+        profile
+    };
+    mirror(directory, &profile, &entry);
+    Ok(id)
 }
 
 /// Log one message, then store it as a session custom entry. The entry is only
@@ -571,16 +675,23 @@ fn capture(
     receipt: Option<String>,
     origin: Option<Origin>,
 ) -> Result<(), String> {
-    if is_subagent() || text.trim().is_empty() {
+    let registration = runtime::current().ok_or("optchat runtime is unavailable")?;
+    if registration.is_subagent || text.trim().is_empty() {
         return Ok(());
     }
+    // The writer may be waiting for a host action that re-enters an observer.
+    // An automatic capture is best effort and must not wait on that writer.
+    let _gate = match registration.append_gate.try_lock() {
+        Ok(guard) => guard,
+        Err(TryLockError::Poisoned(error)) => error.into_inner(),
+        Err(TryLockError::WouldBlock) => {
+            debug("skipped automatic capture while an OptChat append was in progress");
+            return Ok(());
+        }
+    };
     let millis = stamp.unwrap_or_else(now_ms);
     let date = iso8601(millis);
     let dedupe_text = text.clone();
-    let _gate = APPEND_GATE
-        .lock()
-        .unwrap_or_else(|error| error.into_inner());
-    let session = current_session();
     let candidate = with_state(|state| {
         let duplicate = state
             .last
@@ -593,13 +704,23 @@ fn capture(
         if duplicate {
             return None;
         }
-        Some(state.memory.prepare(kind, text, date, receipt, origin))
+        Some((
+            state.memory.prepare(kind, text, date, receipt, origin),
+            state.mark.clone(),
+            registration.branch_generation(),
+        ))
     })?;
-    let Some(entry) = candidate else {
+    let Some((entry, mark, generation)) = candidate else {
         return Ok(());
     };
-    match persist_then_commit(entry, &session, Some((kind, dedupe_text, millis))) {
-        Ok(id) => mirror(id),
+    match persist_then_commit(
+        &registration,
+        entry,
+        mark,
+        generation,
+        Some((kind, dedupe_text, millis)),
+    ) {
+        Ok(_) => {}
         Err(error) => debug(&format!("could not persist message: {error}")),
     }
     Ok(())
@@ -607,16 +728,11 @@ fn capture(
 
 /// Copy one committed entry into the project profile store, where another
 /// session can attach it. Best effort: the branch is authoritative.
-fn mirror(id: u64) {
-    let Ok((profile, entry)) =
-        with_state(|state| (state.profile.clone(), state.memory.get(id).cloned()))
-    else {
-        return;
-    };
-    let Some(entry) = entry else { return };
-    if let Err(error) = store::append(&profile, &entry) {
+fn mirror(directory: Result<PathBuf, String>, profile: &str, entry: &memory::Entry) {
+    if let Err(error) = directory.and_then(|base| store::append_in(&base, profile, entry)) {
         debug(&format!(
-            "could not mirror message {id} into `{profile}`: {error}"
+            "could not mirror message {} into `{profile}`: {error}",
+            entry.i
         ));
     }
 }
@@ -650,14 +766,19 @@ fn record_note_at(
     date: Option<String>,
 ) -> Result<u64, String> {
     let date = normalize_entry_date(date);
-    let _gate = APPEND_GATE
+    let registration = runtime::current().ok_or("optchat runtime is unavailable")?;
+    let _gate = registration
+        .append_gate
         .lock()
         .unwrap_or_else(|error| error.into_inner());
-    let session = current_session();
-    let entry = with_state(|state| state.memory.prepare(kind, text, date, None, origin))?;
-    let id = persist_then_commit(entry, &session, None)?;
-    mirror(id);
-    Ok(id)
+    let (entry, mark, generation) = with_state(|state| {
+        (
+            state.memory.prepare(kind, text, date, None, origin),
+            state.mark.clone(),
+            registration.branch_generation(),
+        )
+    })?;
+    persist_then_commit(&registration, entry, mark, generation, None)
 }
 
 // ---------------------------------------------------------------------------
@@ -732,7 +853,10 @@ fn capture_tool_result(result: &rpi_plugin_sdk::events::ToolResult) {
 
 rpi_plugin_sdk::event_handler! {
 fn on_message_end(event, data) {
-    let _scope = runtime::enter(runtime::callback(data));
+    let Some(registration) = runtime::callback(data) else {
+        return 1;
+    };
+    let _scope = runtime::enter(&registration);
     let Some(raw) = event.message_text() else {
         return 0;
     };
@@ -743,7 +867,10 @@ fn on_message_end(event, data) {
 
 rpi_plugin_sdk::event_handler! {
 fn on_tool_start(event, data) {
-    let _scope = runtime::enter(runtime::callback(data));
+    let Some(registration) = runtime::callback(data) else {
+        return 1;
+    };
+    let _scope = runtime::enter(&registration);
     let Some(call) = event.tool_call() else {
         debug("tool_execution_start without a tool-call payload");
         return 0;
@@ -758,7 +885,10 @@ fn on_tool_start(event, data) {
 
 rpi_plugin_sdk::event_handler! {
 fn on_tool_end(event, data) {
-    let _scope = runtime::enter(runtime::callback(data));
+    let Some(registration) = runtime::callback(data) else {
+        return 1;
+    };
+    let _scope = runtime::enter(&registration);
     let Some(result) = event.tool_result() else {
         debug("tool_execution_end without a tool-result payload");
         return 0;
@@ -777,7 +907,10 @@ rpi_plugin_sdk::event_handler! {
 /// the reset is deliberately idempotent because both before/after tree events
 /// may be observed by a plugin.
 fn on_session_lifecycle(event, data) {
-    let _scope = runtime::enter(runtime::callback(data));
+    let Some(registration) = runtime::callback(data) else {
+        return 1;
+    };
+    let _scope = runtime::enter(&registration);
     debug(&format!("{:?}", event.tag()));
     match event.tag() {
         EventTag::SessionStart | EventTag::SessionShutdown => {
@@ -787,7 +920,7 @@ fn on_session_lifecycle(event, data) {
                 persist_view();
                 clear_status();
             }
-            reset_state();
+            reset_state(&registration);
         }
         EventTag::SessionBeforeSwitch
         | EventTag::SessionBeforeFork
@@ -804,12 +937,10 @@ fn on_session_lifecycle(event, data) {
                 persist_view();
                 clear_status();
             }
-            reset_state();
+            reset_state(&registration);
         }
         EventTag::SessionBeforeCompact | EventTag::SessionCompact => {
-            // Compaction changes native transcript state, not the branch id;
-            // the next boundary probe still provides a safe fallback for older
-            // hosts that do not dispatch these lifecycle events.
+            reset_state(&registration);
         }
         _ => {}
     }
@@ -847,7 +978,10 @@ fn memory_hint(memory: &Memory) -> Option<String> {
 
 rpi_plugin_sdk::string_handler! {
 fn before_agent_start(input, out, data) {
-    let _scope = runtime::enter(runtime::callback(data));
+    let Some(registration) = runtime::callback(data) else {
+        return 1;
+    };
+    let _scope = runtime::enter(&registration);
     let envelope: Value = serde_json::from_str(input).unwrap_or(Value::Null);
     let prompt = envelope
         .get("systemPrompt")
@@ -891,30 +1025,40 @@ enum Op {
 }
 
 struct Drive {
-    runtime: Option<Runtime>,
+    registration: Weak<runtime::Registration>,
     op: Op,
     params: Value,
     done: bool,
 }
 
-fn submit(op: Op, params: StbString, free: Option<FreeStringFn>) -> StepHandle {
-    let text = params.to_string_lossy();
-    params.free_with(free);
+fn submit<const SLOT: usize>(op: Op, params: StbString, free: Option<FreeStringFn>) -> StepHandle {
+    let text = rpi_plugin_sdk::stb_take!(params, free);
+    let Some(registration) = runtime::tool::<SLOT>() else {
+        return std::ptr::null_mut();
+    };
     HANDLES.insert(Drive {
-        runtime: runtime::snapshot(),
+        registration: Arc::downgrade(&registration),
         op,
         params: serde_json::from_str(&text).unwrap_or(Value::Null),
         done: false,
     })
 }
 
-rpi_plugin_sdk::execute_handler! { fn zoom_execute(_id, params, free) {
-    submit(Op::Zoom, params, free)
-} }
+extern "C" fn zoom_execute<const SLOT: usize>(
+    _: StbStringRef,
+    params: StbString,
+    free: Option<FreeStringFn>,
+) -> StepHandle {
+    submit::<SLOT>(Op::Zoom, params, free)
+}
 
-rpi_plugin_sdk::execute_handler! { fn search_execute(_id, params, free) {
-    submit(Op::Search, params, free)
-} }
+extern "C" fn search_execute<const SLOT: usize>(
+    _: StbStringRef,
+    params: StbString,
+    free: Option<FreeStringFn>,
+) -> StepHandle {
+    submit::<SLOT>(Op::Search, params, free)
+}
 
 extern "C" fn poll(handle: StepHandle, _: Option<ToolPartialCb>, _: *mut c_void) -> StepResult {
     if handle.is_null() {
@@ -926,7 +1070,6 @@ extern "C" fn poll(handle: StepHandle, _: Option<ToolPartialCb>, _: *mut c_void)
         ));
     };
     let mut drive = entry.lock();
-    let _scope = runtime::enter(drive.runtime);
     if entry.cancelled.load(Ordering::SeqCst) {
         drive.done = true;
         return StepResult::err(StbString::from_string("optchat cancelled".into()));
@@ -937,6 +1080,16 @@ extern "C" fn poll(handle: StepHandle, _: Option<ToolPartialCb>, _: *mut c_void)
         ));
     }
     drive.done = true;
+    let Some(registration) = drive
+        .registration
+        .upgrade()
+        .filter(|registration| !registration.is_stopping())
+    else {
+        return StepResult::err(StbString::from_string(
+            "optchat registration is unavailable".into(),
+        ));
+    };
+    let _scope = runtime::enter_tool(&registration, handle);
     service_compaction();
     publish_status();
     let tool = match drive.op {
@@ -947,6 +1100,9 @@ extern "C" fn poll(handle: StepHandle, _: Option<ToolPartialCb>, _: *mut c_void)
         Op::Zoom => run_zoom(&drive.params),
         Op::Search => run_search(&drive.params),
     };
+    if entry.cancelled.load(Ordering::SeqCst) || registration.is_stopping() {
+        return StepResult::err(StbString::from_string("optchat cancelled".into()));
+    }
     match result {
         Ok(text) => StepResult::done(StbString::from_string(
             json!({
@@ -1109,12 +1265,12 @@ fn status() -> String {
         kinds[4],
         kinds[5],
         with_state(|state| if state.compact { "on" } else { "off" }).unwrap_or("off"),
-        with_state(|state| {
-            let profile = state.profile.clone();
-            (profile, store::count(&state.profile))
-        })
-        .map(|(profile, count)| format!("`{profile}` ({count} stored)"))
-        .unwrap_or_else(|_| "unavailable".to_string())
+        with_state(|state| state.profile.clone())
+            .and_then(|profile| {
+                let count = store::count_in(&store_directory()?, &profile);
+                Ok(format!("`{profile}` ({count} stored)"))
+            })
+            .unwrap_or_else(|_| "unavailable".to_string())
     )
 }
 
@@ -1173,7 +1329,7 @@ fn view_command(rest: &str) -> Result<String, String> {
 /// `/optchat profile`: show or switch the cross-session profile.
 fn profile_command(rest: &str) -> Result<String, String> {
     if rest.is_empty() {
-        let (profile, mirrored, in_store) = with_state(|state| {
+        let (profile, mirrored) = with_state(|state| {
             let profile = state.profile.clone();
             let mirrored = state
                 .memory
@@ -1187,10 +1343,11 @@ fn profile_command(rest: &str) -> Result<String, String> {
                         .unwrap_or(false)
                 })
                 .count();
-            let stored = store::count(&profile);
-            (profile, mirrored, stored)
+            (profile, mirrored)
         })?;
-        let location = store::path(&profile)
+        let base = store_directory()?;
+        let in_store = store::count_in(&base, &profile);
+        let location = store::path_in(&base, &profile)
             .map(|path| path.display().to_string())
             .unwrap_or_else(|| "(unusable name)".to_string());
         return Ok(format!(
@@ -1203,12 +1360,15 @@ fn profile_command(rest: &str) -> Result<String, String> {
     let name = store::normalize(rest).ok_or_else(|| {
         format!("`{rest}` is not a profile name: use letters, digits, `-`, `_`, `.`")
     })?;
-    with_state(|state| state.profile = name.clone())?;
-    call_action(
-        RuntimeActionId::AppendEntry as u32,
-        json!({"customType": PROFILE_TYPE, "data": {"name": name}}),
-    )
-    .map_err(|error| format!("could not persist the profile binding: {error}"))?;
+    let registration = runtime::current().ok_or("optchat runtime is unavailable")?;
+    let generation = with_state(|_| registration.branch_generation())?;
+    append_custom(PROFILE_TYPE, json!({"name": name}), generation, None)
+        .map_err(|error| format!("could not persist the profile binding: {error}"))?;
+    with_state(|state| {
+        if registration.branch_generation() == generation {
+            state.profile = name.clone();
+        }
+    })?;
     Ok(format!(
         "OptChat profile is now `{name}`; new messages mirror into it. \
          `/optchat attach` imports what it already holds."
@@ -1242,10 +1402,10 @@ fn recall_command(rest: &str) -> Result<String, String> {
         return Err("Usage: /optchat recall <text>".to_string());
     }
     let profile = with_state(|state| state.profile.clone())?;
-    recall_from(&store::directory(), &profile, rest)
+    recall_from(&store_directory()?, &profile, rest)
 }
 
-/// `/optchat attach`: copy the profile store into this session as imported notes,/// `/optchat attach`: copy the profile store into this session as imported notes,
+/// `/optchat attach`: copy the profile store into this session as imported notes,
 /// skipping anything this session already logged.
 fn attach_command(rest: &str) -> Result<String, String> {
     let profile = with_state(|state| state.profile.clone())?;
@@ -1254,7 +1414,7 @@ fn attach_command(rest: &str) -> Result<String, String> {
     } else {
         store::normalize(rest).ok_or_else(|| format!("`{rest}` is not a profile name"))?
     };
-    let stored = store::read(&name)?;
+    let stored = store::read_in(&store_directory()?, &name)?;
     if stored.is_empty() {
         return Ok(format!("Profile `{name}` holds nothing yet."));
     }
@@ -1302,17 +1462,29 @@ fn compact_status() -> String {
 }
 
 fn set_compaction(enabled: bool) -> Result<String, String> {
-    with_state(|state| state.compact = enabled)?;
-    call_action(
-        RuntimeActionId::AppendEntry as u32,
-        json!({
-            "customType": compact::CONFIG_TYPE,
-            "data": {"compact": enabled},
-        }),
+    let registration = runtime::current().ok_or("optchat runtime is unavailable")?;
+    if enabled && !registration.has_cleanup {
+        return Err(
+            "OptChat model compaction requires a host with plugin lifecycle cleanup".into(),
+        );
+    }
+    let generation = with_state(|_| registration.branch_generation())?;
+    append_custom(
+        compact::CONFIG_TYPE,
+        json!({"compact": enabled}),
+        generation,
+        None,
     )
     .map_err(|error| format!("could not persist the compaction setting: {error}"))?;
+    with_state(|state| {
+        if registration.branch_generation() == generation {
+            state.compact = enabled;
+            if !enabled {
+                registration.invalidate_compaction();
+            }
+        }
+    })?;
     if enabled {
-        compact::bind_session(&call_action);
         service_compaction();
     }
     Ok(if enabled {
@@ -1389,6 +1561,11 @@ fn import_command(rest: &str) -> Result<String, String> {
     let target =
         target.ok_or("Usage: /optchat import <file> [--format claude|chatgpt|jsonl|text]")?;
     let path = PathBuf::from(&target);
+    let path = if path.is_absolute() {
+        path
+    } else {
+        project_dir()?.join(path)
+    };
     let metadata = fs::metadata(&path)
         .map_err(|error| format!("cannot read `{}`: {error}", path.display()))?;
     if !metadata.is_file() {
@@ -1485,7 +1662,11 @@ fn command_output(out: &mut rpi_plugin_sdk::callbacks::Output<'_>, value: Value)
 
 rpi_plugin_sdk::string_handler! {
 fn optchat_command(input, out, data) {
-    let _scope = runtime::enter(runtime::callback(data));
+    let registration = runtime::callback(data);
+    let Some(registration) = registration else {
+        return 1;
+    };
+    let _scope = runtime::enter(&registration);
     let envelope: Value = serde_json::from_str(input).unwrap_or(Value::Null);
     let args = envelope
         .get("args")
@@ -1522,9 +1703,26 @@ fn optchat_entry_renderer(input, out, _data) {
 }
 }
 
-rpi_plugin_sdk::export_plugin!(|api| {
-    capture_process_role();
-    runtime::install(*api);
+fn register(api: &PluginApi, cleanup: Option<lifecycle::Register>) -> i32 {
+    let slot = match cleanup {
+        Some(cleanup) => match runtime::reserve(*api, cleanup) {
+            Ok(slot) => slot,
+            Err(rc) => return rc,
+        },
+        None => runtime::SLOTS,
+    };
+    let zoom_table: [rpi_plugin_sdk::ToolExecuteFn; runtime::SLOTS] =
+        lifecycle::execute_table!(zoom_execute);
+    let search_table: [rpi_plugin_sdk::ToolExecuteFn; runtime::SLOTS] =
+        lifecycle::execute_table!(search_execute);
+    let zoom_execute = zoom_table
+        .get(slot)
+        .copied()
+        .unwrap_or(zoom_execute::<{ runtime::SLOTS }>);
+    let search_execute = search_table
+        .get(slot)
+        .copied()
+        .unwrap_or(search_execute::<{ runtime::SLOTS }>);
     let Some(register_event) = api.register_event_handler else {
         return 1;
     };
@@ -1591,14 +1789,20 @@ rpi_plugin_sdk::export_plugin!(|api| {
         return rc;
     }
     if let Some(register_command) = api.register_command {
-        let _ = register_command(
+        let rc = register_command(
             StbStringRef::from_str("optchat"),
             StbStringRef::from_str("Show or search this session's persistent OptChat memory"),
             optchat_command,
         );
+        if rc != 0 {
+            return rc;
+        }
+    }
+    if cleanup.is_none() {
+        runtime::install_legacy(*api);
     }
     0
-});
+}
 
 #[cfg(test)]
 mod tests {
@@ -1682,8 +1886,7 @@ mod tests {
                 &mut out,
                 std::ptr::null_mut(),
             );
-            let text = out.to_string_lossy();
-            free_string(out);
+            let text = rpi_plugin_sdk::stb_take!(out, Some(free_string));
             (rc, text)
         };
         for custom_type in [
@@ -1745,8 +1948,7 @@ mod tests {
             ),
             0
         );
-        let rendered = out.to_string_lossy();
-        free_string(out);
+        let rendered = rpi_plugin_sdk::stb_take!(out, Some(free_string));
         assert_eq!(
             serde_json::from_str::<Value>(&rendered).unwrap(),
             json!({"display": false})
@@ -1756,9 +1958,9 @@ mod tests {
     #[test]
     fn tool_schemas_advertise_canonical_arguments_without_host_context() {
         let zoom = zoom_schema();
-        assert_eq!(zoom.name.to_string_lossy(), "zoom");
-        assert!(zoom.description.to_string_lossy().contains("zoom(id, n)"));
-        let params: Value = serde_json::from_str(&zoom.parameters.to_string_lossy())
+        assert_eq!(rpi_plugin_sdk::stb_text!(zoom.name), "zoom");
+        assert!(rpi_plugin_sdk::stb_text!(zoom.description).contains("zoom(id, n)"));
+        let params: Value = serde_json::from_str(&rpi_plugin_sdk::stb_text!(zoom.parameters))
             .expect("zoom parameters are JSON");
         assert_eq!(params["type"], "object");
         assert_eq!(params["additionalProperties"], Value::Bool(true));
@@ -1770,8 +1972,8 @@ mod tests {
         assert!(!params.to_string().contains("__rpi"));
 
         let search = search_schema();
-        assert_eq!(search.name.to_string_lossy(), "search");
-        let params: Value = serde_json::from_str(&search.parameters.to_string_lossy())
+        assert_eq!(rpi_plugin_sdk::stb_text!(search.name), "search");
+        let params: Value = serde_json::from_str(&rpi_plugin_sdk::stb_text!(search.parameters))
             .expect("search parameters are JSON");
         assert_eq!(params["required"], json!(["text"]));
         assert_eq!(params["properties"]["text"]["minLength"], 1);
@@ -1801,9 +2003,8 @@ mod tests {
             receipt: None,
             origin: None,
         };
-        store::append_in_for_tests(&base, "work", &entry(0, "the parser bug was fixed"))
-            .expect("append");
-        store::append_in_for_tests(&base, "work", &entry(1, "unrelated note")).expect("append");
+        store::append_in(&base, "work", &entry(0, "the parser bug was fixed")).expect("append");
+        store::append_in(&base, "work", &entry(1, "unrelated note")).expect("append");
 
         let hits = recall_from(&base, "work", "PARSER").expect("recall");
         assert!(hits.contains("Profile `work` store"), "{hits}");

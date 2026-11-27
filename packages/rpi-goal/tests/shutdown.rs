@@ -2,6 +2,9 @@
 //!
 //! This test file is deliberately the only test in its binary: the worker's
 //! shutdown is process-wide and cannot be undone.
+
+#![forbid(unsafe_code)]
+
 mod support;
 
 use serde_json::json;

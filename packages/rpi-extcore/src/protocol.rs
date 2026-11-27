@@ -17,6 +17,7 @@ pub const SUPPORTED_COMMANDS: &[&str] = &[
     "resume_pending",
     "compact",
     "abort",
+    "stop_run",
     "get_available_models",
     "get_auth_status",
     "get_provider_models",
@@ -52,7 +53,7 @@ pub fn capabilities() -> Value {
         "piCompatibilityTarget": "1.2.0",
         "supportedCommands": SUPPORTED_COMMANDS,
         "optionalCommands": ["get_session_branch", "append_entry"],
-        "supportedActions": ["history", "queue", "queue_status", "fork", "clone", "stats", "stats_breakdown", "history_mutation", "provider_auth", "oauth", "session_metadata", "projects", "create_project", "session_organization", "files", "git_diff"],
+        "supportedActions": ["history", "queue", "queue_status", "fork", "clone", "stats", "stats_breakdown", "history_mutation", "provider_auth", "oauth", "session_metadata", "session_bulk_metadata", "projects", "create_project", "session_organization", "files", "git_diff"],
         "optionalActions": [],
         "semantics": {
             "promptResponse": "accepted",

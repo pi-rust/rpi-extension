@@ -9,11 +9,12 @@
 use crate::control::Control;
 use crate::graph::{Graph, Status};
 use crate::kit::{progress, result_with_details, Progress};
+use crate::runtime::Registration;
 use crate::spawn::{self, POLL_SLICE};
 use crate::{lock_graph, lock_graph_for_wave};
 use serde_json::Value;
+use std::path::Path;
 use std::time::{Duration, Instant};
-use wait_timeout::ChildExt;
 
 const DEFAULT_MAX_PARALLEL: usize = 4;
 const MAX_PARALLEL_CAP: usize = 16;
@@ -24,14 +25,16 @@ const RESULT_SUMMARY_BYTES: usize = 2_000;
 const MIN_VERIFY_SECS: u64 = 10;
 
 pub fn dispatch(
+    registration: &Registration,
     params: &Value,
     control: &Control,
     progress_tx: &Progress,
 ) -> Result<String, String> {
-    dispatch_with(params, control, progress_tx, run_wave)
+    dispatch_with(registration, params, control, progress_tx, run_wave)
 }
 
 pub(super) fn dispatch_with(
+    registration: &Registration,
     params: &Value,
     control: &Control,
     progress_tx: &Progress,
@@ -42,6 +45,7 @@ pub(super) fn dispatch_with(
         &Control,
         &Progress,
         &crate::host::Selection,
+        Option<&Path>,
     ) -> Vec<(String, Result<String, String>)>,
 ) -> Result<String, String> {
     control.check()?;
@@ -51,7 +55,7 @@ pub(super) fn dispatch_with(
         .unwrap_or(DEFAULT_MAX_PARALLEL as u64)
         .clamp(1, MAX_PARALLEL_CAP as u64) as usize;
 
-    let mut guard = lock_graph(params);
+    let mut guard = lock_graph(registration, params);
     if guard.is_running() {
         return Err("dispatch is already running: wait for the current wave to finish".into());
     }
@@ -88,7 +92,8 @@ pub(super) fn dispatch_with(
     drop(guard);
     // Nodes that name neither a provider nor a model run on this session's
     // binding, exactly like a standalone `subagent` call.
-    let parent = crate::host::parent_selection(params);
+    let parent = crate::host::parent_selection(registration.host.as_ref(), params);
+    let cwd = crate::host::tool_cwd(params);
     let outcomes = run(
         &snapshot,
         &ready,
@@ -96,12 +101,13 @@ pub(super) fn dispatch_with(
         control,
         progress_tx,
         &parent,
+        cwd,
     );
 
     // Reject an already stale wave before running acceptance commands, then
     // keep verification outside the graph lock so plan/show and session
     // switches remain responsive. Validate again before applying any results.
-    drop(lock_graph_for_wave(params, generation)?);
+    drop(lock_graph_for_wave(registration, params, generation)?);
     let outcomes: Vec<_> = outcomes
         .into_iter()
         .map(|(id, outcome)| {
@@ -113,13 +119,14 @@ pub(super) fn dispatch_with(
                     spec.map(|node| node.timeout_secs)
                         .unwrap_or(MIN_VERIFY_SECS),
                     control,
+                    cwd,
                 ),
                 Err(_) => Ok(()),
             };
             (id, outcome, verified)
         })
         .collect();
-    let mut guard = lock_graph_for_wave(params, generation)?;
+    let mut guard = lock_graph_for_wave(registration, params, generation)?;
     let graph = guard.graph_mut();
 
     // A cancelled wave may not have reached every chunk. Those nodes never
@@ -168,6 +175,7 @@ pub(super) fn run_wave(
     control: &Control,
     progress_tx: &Progress,
     parent: &crate::host::Selection,
+    cwd: Option<&Path>,
 ) -> Vec<(String, Result<String, String>)> {
     let mut out = Vec::with_capacity(ids.len());
     for chunk in ids.chunks(max_parallel.max(1)) {
@@ -202,6 +210,7 @@ pub(super) fn run_wave(
                             selection.provider(),
                             selection.model(),
                             &control,
+                            cwd,
                         )
                     });
                     (id, handle)
@@ -232,22 +241,16 @@ fn verify_node(
     verify: Option<&str>,
     timeout_secs: u64,
     control: &Control,
+    cwd: Option<&Path>,
 ) -> Result<(), String> {
     if let Some(file) = expect_file {
-        let path = std::path::Path::new(file);
-        let resolved = if path.is_absolute() {
-            path.to_path_buf()
-        } else {
-            std::env::current_dir()
-                .map(|dir| dir.join(path))
-                .unwrap_or_else(|_| path.to_path_buf())
-        };
+        let resolved = cwd.unwrap_or_else(|| Path::new(".")).join(file);
         if !resolved.exists() {
             return Err(format!("expected file was not produced: {file}"));
         }
     }
     if let Some(command) = verify {
-        run_verify_command(command, timeout_secs, control)?;
+        run_verify_command(command, timeout_secs, control, cwd)?;
     }
     Ok(())
 }
@@ -259,7 +262,12 @@ fn verify_node(
 /// `dispatch` (and the graph lock) forever, and an inherited stdout/stderr could
 /// corrupt the host's own stdio. Output is now captured and bounded, so a
 /// timeout or a failed command surfaces as a clear node result.
-fn run_verify_command(command: &str, timeout_secs: u64, control: &Control) -> Result<(), String> {
+fn run_verify_command(
+    command: &str,
+    timeout_secs: u64,
+    control: &Control,
+    cwd: Option<&Path>,
+) -> Result<(), String> {
     control.check()?;
     #[cfg(windows)]
     let mut command_builder = {
@@ -277,6 +285,9 @@ fn run_verify_command(command: &str, timeout_secs: u64, control: &Control) -> Re
         cmd.arg("-c").arg(command);
         cmd
     };
+    if let Some(cwd) = cwd {
+        command_builder.current_dir(cwd);
+    }
     command_builder
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
@@ -297,7 +308,7 @@ fn run_verify_command(command: &str, timeout_secs: u64, control: &Control) -> Re
             spawn::kill_and_reap(&mut child, &tree);
             return Err(format!("verification timed out after {timeout_secs}s"));
         }
-        match child.wait_timeout(remaining.min(POLL_SLICE)) {
+        match spawn::wait_child(&mut child, remaining.min(POLL_SLICE)) {
             Ok(Some(status)) => {
                 let out = match spawn::collect_reader(stdout, deadline, control) {
                     Ok(text) => text,
@@ -365,7 +376,7 @@ mod tests {
         let path =
             std::env::temp_dir().join(format!("rpi verify quoted {}.txt", std::process::id()));
         let command = format!("echo verified>\"{}\"", path.display());
-        let result = run_verify_command(&command, 5, &Control::default());
+        let result = run_verify_command(&command, 5, &Control::default(), None);
         let contents = std::fs::read_to_string(&path);
         let _ = std::fs::remove_file(path);
         assert!(result.is_ok(), "quoted verification failed: {result:?}");
@@ -383,13 +394,14 @@ mod tests {
 
     #[test]
     fn verify_node_checks_declared_files() {
-        assert!(verify_node(None, None, 5, &Control::default()).is_ok());
-        assert!(verify_node(Some("Cargo.toml"), None, 5, &Control::default()).is_ok());
+        assert!(verify_node(None, None, 5, &Control::default(), None).is_ok());
+        assert!(verify_node(Some("Cargo.toml"), None, 5, &Control::default(), None).is_ok());
         assert!(verify_node(
             Some("no-such-file-orchestrator.txt"),
             None,
             5,
-            &Control::default()
+            &Control::default(),
+            None
         )
         .is_err());
     }
@@ -397,8 +409,8 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn verify_node_runs_declared_commands() {
-        assert!(verify_node(None, Some("true"), 5, &Control::default()).is_ok());
-        assert!(verify_node(None, Some("false"), 5, &Control::default()).is_err());
+        assert!(verify_node(None, Some("true"), 5, &Control::default(), None).is_ok());
+        assert!(verify_node(None, Some("false"), 5, &Control::default(), None).is_err());
     }
 
     /// Regression: a hanging acceptance command used to block `dispatch` — and
@@ -407,7 +419,7 @@ mod tests {
     #[test]
     fn verify_command_times_out_instead_of_blocking_forever() {
         let started = Instant::now();
-        let error = verify_node(None, Some("sleep 30"), 1, &Control::default()).unwrap_err();
+        let error = verify_node(None, Some("sleep 30"), 1, &Control::default(), None).unwrap_err();
         assert!(error.contains("timed out"), "got: {error}");
         assert!(
             started.elapsed() < Duration::from_secs(10),
@@ -427,7 +439,7 @@ mod tests {
             canceller.cancel();
         });
         let started = Instant::now();
-        let error = verify_node(None, Some("sleep 30"), 30, &control).unwrap_err();
+        let error = verify_node(None, Some("sleep 30"), 30, &control, None).unwrap_err();
         let _ = handle.join();
         assert!(error.contains("cancelled"), "got: {error}");
         assert!(
@@ -442,8 +454,14 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn verify_command_reports_captured_output() {
-        let error =
-            verify_node(None, Some("echo boom >&2; exit 3"), 5, &Control::default()).unwrap_err();
+        let error = verify_node(
+            None,
+            Some("echo boom >&2; exit 3"),
+            5,
+            &Control::default(),
+            None,
+        )
+        .unwrap_err();
         assert!(error.contains("boom"), "stderr not captured: {error}");
     }
 

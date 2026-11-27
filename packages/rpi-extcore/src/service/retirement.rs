@@ -15,17 +15,21 @@ impl Service {
     /// filtering: treating a deleting host as absent could spawn a replacement.
     pub(crate) async fn check_session_admission(&self, id: &str) -> ServiceResult<()> {
         let registry = self.registry.read().await;
-        if registry.deletion(id).is_some() {
-            return Err(deleting_error());
-        }
-        if registry.preferences(id).archived {
-            return Err((
-                ReplyKind::Conflict,
-                json!({"error":"Session is archived; restore it before opening", "code":"session_archived"}),
-            ));
-        }
-        Ok(())
+        check_session_admission(&registry, id)
     }
+}
+
+pub(super) fn check_session_admission(registry: &Registry, id: &str) -> ServiceResult<()> {
+    if registry.deletion(id).is_some() {
+        return Err(deleting_error());
+    }
+    if registry.preferences(id).archived {
+        return Err((
+            ReplyKind::Conflict,
+            json!({"error":"Session is archived; restore it before opening", "code":"session_archived"}),
+        ));
+    }
+    Ok(())
 }
 
 fn owner_error() -> (ReplyKind, Value) {
@@ -38,6 +42,12 @@ fn owner_error() -> (ReplyKind, Value) {
 async fn idle_close(state: &Service, id: &str) -> ServiceResult<()> {
     let session = state.sessions.read().await.get(id).cloned();
     if let Some(session) = session {
+        if session.is_shared_area() {
+            return Err((
+                ReplyKind::Conflict,
+                json!({"error":"Session lifetime belongs to its native Host area", "code":"shared_host_session"}),
+            ));
+        }
         session.shutdown_if_idle().await.map_err(|error| match error {
             crate::host::IdleCloseError::Busy => (ReplyKind::Conflict, json!({"error":"Session is busy", "code":"session_busy"})),
             crate::host::IdleCloseError::Unavailable(_) => (ReplyKind::Unavailable, json!({"error":"Session idle state could not be confirmed", "code":"session_idle_unknown"})),
@@ -79,7 +89,12 @@ pub(super) async fn reap_idle(state: &Service, timeout: Duration) {
             .await
             .get(&id)
             .is_some_and(|last| last.elapsed() >= timeout);
-        if !expired {
+        if !expired
+            || state
+                .live_session(&id)
+                .await
+                .is_some_and(|session| session.is_shared_area())
+        {
             continue;
         }
         match idle_close(state, &id).await {
@@ -186,6 +201,151 @@ pub(super) async fn metadata(
             Err(_) => (ReplyKind::Internal, json!({"error":"Session preferences could not be saved"})),
         }
     }).await.unwrap_or_else(|_| owner_error())
+}
+
+fn bulk_skip(id: &str, error: (ReplyKind, Value)) -> Value {
+    let mut entry = serde_json::Map::new();
+    entry.insert("sessionId".into(), json!(id));
+    entry.insert(
+        "code".into(),
+        json!(match error.1.get("code").and_then(Value::as_str) {
+            Some(code) => code.to_string(),
+            None => match error.0 {
+                ReplyKind::NotFound => "session_not_found".to_string(),
+                ReplyKind::Conflict => "session_conflict".to_string(),
+                ReplyKind::Unavailable => "session_unavailable".to_string(),
+                _ => "session_metadata_failed".to_string(),
+            },
+        }),
+    );
+    entry.insert(
+        "error".into(),
+        error
+            .1
+            .get("error")
+            .cloned()
+            .unwrap_or_else(|| json!("Session metadata could not be updated")),
+    );
+    Value::Object(entry)
+}
+
+pub(super) async fn bulk_metadata(
+    state: &Service,
+    mut request: super::BulkMetadataRequest,
+) -> (ReplyKind, Value) {
+    if request.session_ids.is_empty() {
+        return (
+            ReplyKind::InvalidInput,
+            json!({"error":"sessionIds must not be empty", "code":"invalid_session_ids"}),
+        );
+    }
+    if request.session_ids.len() > super::MAX_BULK_METADATA_SESSIONS {
+        return (
+            ReplyKind::InvalidInput,
+            json!({"error":"Too many sessions in one metadata request", "code":"bulk_metadata_limit"}),
+        );
+    }
+    let mut seen = std::collections::HashSet::with_capacity(request.session_ids.len());
+    request.session_ids.retain(|id| seen.insert(id.clone()));
+    if let Some(tags) = request.patch.tags.take() {
+        request.patch.tags = match crate::registry::normalize_tags(tags) {
+            Ok(tags) => Some(tags),
+            Err(_) => {
+                return (
+                    ReplyKind::InvalidInput,
+                    json!({"error":"Invalid session tags", "code":"invalid_session_tags"}),
+                )
+            }
+        };
+    }
+    let owner = state.clone();
+    let ids = request.session_ids;
+    let patch = request.patch;
+    tokio::spawn(async move {
+        let _lifecycle = owner.session_lifecycle.lock().await;
+        if owner.closing.load(std::sync::atomic::Ordering::Acquire) {
+            return owner_error();
+        }
+        let mut updated_ids = Vec::with_capacity(ids.len());
+        let mut updated = Vec::with_capacity(ids.len());
+        let mut skipped = Vec::new();
+        let mut skipped_ids = std::collections::HashSet::new();
+        {
+            let registry = owner.registry.read().await;
+            for id in &ids {
+                let skip = if registry.get(id).is_none() {
+                    Some(bulk_skip(
+                        id,
+                        (ReplyKind::NotFound, json!({"error":"session not found"})),
+                    ))
+                } else if registry.deletion(id).is_some() {
+                    Some(bulk_skip(id, deleting_error()))
+                } else {
+                    None
+                };
+                if let Some(entry) = skip {
+                    skipped_ids.insert(id.clone());
+                    skipped.push(entry);
+                }
+            }
+        }
+        if patch.archived == Some(true) {
+            let close_ids: Vec<String> = ids
+                .iter()
+                .filter(|id| !skipped_ids.contains(*id))
+                .cloned()
+                .collect();
+            for id in close_ids {
+                if let Err(error) = idle_close(&owner, &id).await {
+                    skipped_ids.insert(id.clone());
+                    skipped.push(bulk_skip(&id, error));
+                }
+            }
+        }
+        let candidates: Vec<String> = ids
+            .iter()
+            .filter(|id| !skipped_ids.contains(*id))
+            .cloned()
+            .collect();
+        if candidates.is_empty() {
+            return (
+                ReplyKind::Success,
+                json!({"updated":[], "updatedSessions":[], "skipped":skipped}),
+            );
+        }
+        let prefs = {
+            let mut registry = owner.registry.write().await;
+            match registry.update_preferences_bulk(
+                &candidates,
+                patch.pinned,
+                patch.archived,
+                patch.tags,
+            ) {
+                Ok(prefs) => prefs,
+                Err(_) => {
+                    return (
+                        ReplyKind::Internal,
+                        json!({"error":"Session preferences could not be saved"}),
+                    )
+                }
+            }
+        };
+        for (id, prefs) in candidates.into_iter().zip(prefs) {
+            updated_ids.push(id.clone());
+            updated.push(json!({
+                "sessionId": id,
+                "pinned": prefs.pinned,
+                "archived": prefs.archived,
+                "tags": prefs.tags,
+            }));
+        }
+        (
+            ReplyKind::Success,
+            json!({"updated":updated_ids, "updatedSessions":updated, "skipped":skipped}),
+        )
+    })
+    .await
+    .unwrap_or_else(|_| owner_error())
 }
 
 pub(super) async fn delete(state: &Service, id: String) -> ServiceReply {

@@ -10,27 +10,9 @@ use rpi_mcp_core::{CoreRequestContext, McpRuntime};
 use serde_json::{json, Value};
 use std::{
     path::PathBuf,
-    sync::Mutex,
     time::{Duration, Instant},
 };
 
-static ENV_LOCK: Mutex<()> = Mutex::new(());
-struct SessionEnvGuard(Option<std::ffi::OsString>);
-impl SessionEnvGuard {
-    fn new(id: &str) -> Self {
-        let previous = std::env::var_os(rpi_plugin_sdk::SESSION_ID_ENV);
-        std::env::set_var(rpi_plugin_sdk::SESSION_ID_ENV, id);
-        Self(previous)
-    }
-}
-impl Drop for SessionEnvGuard {
-    fn drop(&mut self) {
-        match &self.0 {
-            Some(value) => std::env::set_var(rpi_plugin_sdk::SESSION_ID_ENV, value),
-            None => std::env::remove_var(rpi_plugin_sdk::SESSION_ID_ENV),
-        }
-    }
-}
 struct Fixture {
     runtime: McpRuntime,
     context: CoreRequestContext,
@@ -93,7 +75,7 @@ impl Fixture {
         self.wait(1, text);
     }
     fn flush(&self, append: impl FnOnce(Value) -> Result<(), String>) -> Result<(), String> {
-        facade::flush_resource_updates_with(&self.runtime, append)
+        facade::flush_resource_updates_with(&self.runtime, &self.context.scope, append, || true)
     }
 }
 impl Drop for Fixture {
@@ -105,8 +87,6 @@ impl Drop for Fixture {
 
 #[test]
 fn failed_host_append_preserves_resource_updates_for_the_next_boundary() {
-    let _serial = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-    let _env = SessionEnvGuard::new("delivery-retry");
     let f = Fixture::new("delivery-retry");
     f.queue("mem://delivery", "current content");
     assert!(f.flush(|_| Err("host unavailable".into())).is_err());
@@ -141,8 +121,6 @@ fn failed_host_append_preserves_resource_updates_for_the_next_boundary() {
 
 #[test]
 fn failed_delivery_cannot_revive_retired_or_superseded_resource_content() {
-    let _serial = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-    let _env = SessionEnvGuard::new("delivery-lifetime");
     for action in [
         "unsubscribe",
         "close",
@@ -198,8 +176,6 @@ fn failed_delivery_cannot_revive_retired_or_superseded_resource_content() {
 
 #[test]
 fn failed_delivery_drops_updates_after_a_session_switch() {
-    let _serial = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-    let _env = SessionEnvGuard::new("delivery-a");
     let f = Fixture::new("delivery-a");
     f.queue("mem://session", "A content");
     // A second scope on the same caller-owned runtime, without touching A's connection.
@@ -207,13 +183,12 @@ fn failed_delivery_drops_updates_after_a_session_switch() {
         scope: "session:delivery-b".into(),
         cwd: f.context.cwd.clone(),
     };
-    assert!(f.flush(|_| {
-        std::env::set_var(rpi_plugin_sdk::SESSION_ID_ENV,"delivery-b");
+    assert!(facade::flush_resource_updates_with(&f.runtime, &f.context.scope, |_| {
         f.runtime.call(&context_b,&json!({"configPath":f.path,"server":"fake","tool":"echo","arguments":{"value":"B content","quiet":true}}),&Control::default()).unwrap();
         f.runtime.resources(&context_b,&json!({"configPath":f.path,"server":"fake","action":"subscribe","uri":"mem://b"}),&Control::default()).unwrap();
         f.wait(1,"B content");
         Err("host switched session".into())
-    }).is_err());
+    }, || false).is_err());
     let updates = f.runtime.take_resource_updates(None);
     assert_eq!(updates.len(), 1, "old session was requeued: {updates:?}");
     assert!(updates[0].text.contains("B content"));
@@ -221,8 +196,6 @@ fn failed_delivery_drops_updates_after_a_session_switch() {
 
 #[test]
 fn failed_delivery_keeps_the_queue_bounded_and_prefers_new_updates() {
-    let _serial = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-    let _env = SessionEnvGuard::new("delivery-bounds");
     let f = Fixture::new("delivery-bounds");
     f.queue("mem://old", "old content");
     assert!(f.flush(|_| {
@@ -240,41 +213,29 @@ fn failed_delivery_keeps_the_queue_bounded_and_prefers_new_updates() {
 
 #[test]
 fn hot_switch_without_an_mcp_call_does_not_deliver_previous_session_updates() {
-    let _serial = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-    let _env = SessionEnvGuard::new("a");
     let mut f = Fixture::new("a");
     f.queue("mem://secret", "A secret");
-    // Seed only the adapter's older-embedder fallback scope.
-    let _ = facade::resources(&json!({"__rpi":{"sessionId":"a"}}), &Control::default());
-    std::env::set_var(rpi_plugin_sdk::SESSION_ID_ENV, "b");
-    let scope = facade::current_scope();
-    assert_eq!(scope.as_deref(), Some("session:b"));
-    assert!(f.runtime.take_resource_updates(scope.as_deref()).is_empty());
+    let scope = facade::session_scope(&json!({"sessionId":"b"})).unwrap();
+    assert!(f.runtime.take_resource_updates(Some(&scope)).is_empty());
     assert!(f
         .runtime
-        .take_resource_updates(Some("session:a"))
+        .take_resource_updates(Some(&f.context.scope))
         .is_empty());
-    f.context.scope = "session:b".into();
+    f.context.scope = scope;
     f.queue("mem://b", "B");
-    let served = f
-        .runtime
-        .take_resource_updates(facade::current_scope().as_deref());
+    let served = f.runtime.take_resource_updates(Some(&f.context.scope));
     assert_eq!(served.len(), 1);
     assert!(served[0].text.contains('B'));
 }
 
 #[test]
-fn invalid_current_session_never_reuses_cached_scope() {
-    let _serial = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-    let _env = SessionEnvGuard::new("a");
-    let f = Fixture::new("a");
-    f.queue("mem://a", "A");
-    let _ = facade::resources(&json!({"__rpi":{"sessionId":"a"}}), &Control::default());
-    std::env::set_var(rpi_plugin_sdk::SESSION_ID_ENV, "  ");
-    assert!(f
-        .runtime
-        .take_resource_updates(facade::current_scope().as_deref())
-        .is_empty());
-    std::env::remove_var(rpi_plugin_sdk::SESSION_ID_ENV);
-    assert_eq!(facade::current_scope().as_deref(), Some("session:a"));
+fn missing_or_invalid_event_context_cannot_select_a_scope() {
+    for context in [
+        Value::Null,
+        json!({}),
+        json!({"sessionId":"  "}),
+        json!({"sessionId":3}),
+    ] {
+        assert!(facade::session_scope(&context).is_none());
+    }
 }

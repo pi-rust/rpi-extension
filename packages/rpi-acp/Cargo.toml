@@ -1,8 +1,8 @@
 [package]
 name = "rpi-acp"
-version = "0.2.19"
+version = "0.2.20"
 edition.workspace = true
-rust-version = "1.85"
+rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
@@ -56,3 +56,6 @@ name = "configuration_fixture"
 path = "examples/configuration_fixture.rs"
 crate-type = ["cdylib"]
 test = false
+
+[lints]
+workspace = true

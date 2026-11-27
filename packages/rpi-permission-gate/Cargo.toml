@@ -1,6 +1,6 @@
 [package]
 name = "rpi-permission-gate"
-version = "0.1.5"
+version = "0.1.6"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
@@ -26,3 +26,6 @@ crate-type = ["cdylib", "rlib"]
 [dependencies]
 rpi-plugin-sdk = { workspace = true }
 serde_json = { workspace = true }
+
+[lints]
+workspace = true

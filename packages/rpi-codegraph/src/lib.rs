@@ -40,7 +40,10 @@ fn project_root(params: &Value) -> Result<PathBuf, String> {
         .get("projectPath")
         .and_then(Value::as_str)
         .filter(|value| !value.trim().is_empty());
-    let root = match requested {
+    let host_cwd = params[rpi_plugin_sdk::HOST_CONTEXT_KEY]["cwd"]
+        .as_str()
+        .filter(|value| !value.is_empty());
+    let root = match requested.or(host_cwd) {
         Some(value) => PathBuf::from(value.trim()),
         None => std::env::current_dir()
             .map_err(|err| format!("cannot resolve current directory: {err}"))?,
@@ -395,8 +398,7 @@ fn call_codegraph(tool: &str, params: &Value, cancelled: &AtomicBool) -> Result<
 }
 
 fn execute_tool(tool: &'static str, params: StbString, free: Option<FreeStringFn>) -> StepHandle {
-    let text = params.to_string_lossy();
-    params.free_with(free);
+    let text = rpi_plugin_sdk::stb_take!(params, free);
     HANDLES.insert(Drive {
         tool,
         params: serde_json::from_str(&text).unwrap_or(Value::Null),
@@ -467,7 +469,7 @@ fn parameters(mut properties: serde_json::Map<String, Value>, required: &[&str])
         "projectPath".into(),
         json!({
             "type": "string",
-            "description": "Optional absolute project path; omitted or blank defaults to the current working directory."
+            "description": "Use an absolute project path. Blank or omitted uses the session workspace, then the current working directory."
         }),
     );
     // Extra host metadata (including __rpi) must remain accepted.
@@ -568,7 +570,9 @@ fn tool_specs() -> Vec<ToolSpec> {
         },
     ]
 }
-rpi_plugin_sdk::export_plugin!(|api| {
+// Each call owns its request, child process, and cancellation handle.
+
+rpi_plugin_sdk::export_shared_plugin!(|api| {
     let Some(register) = api.register_tool else {
         return 1;
     };

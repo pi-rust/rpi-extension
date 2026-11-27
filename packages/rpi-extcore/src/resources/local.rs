@@ -132,7 +132,7 @@ impl Drop for CaptureSpool {
         let _ = std::fs::remove_file(&self.path);
     }
 }
-pub(super) fn invoke(
+pub(crate) fn invoke(
     bin: &Path,
     cwd: &Path,
     args: &[OsString],

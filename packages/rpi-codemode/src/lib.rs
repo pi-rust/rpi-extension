@@ -1,25 +1,24 @@
-#![deny(unsafe_code)]
-#![allow(clippy::not_unsafe_ptr_arg_deref)]
+#![forbid(unsafe_code)]
 
 mod engine;
-// The only unsafe module: validated delegation to the pinned QuickJS allocator.
-#[allow(unsafe_code)]
-mod heap;
 use engine::{Action, Request};
 use rpi_plugin_sdk::handles::ToolHandles;
-use rpi_plugin_sdk::{StbString, StbStringRef, StepHandle, StepResult, ToolPartialCb};
+#[cfg(test)]
+use rpi_plugin_sdk::StbStringRef;
+use rpi_plugin_sdk::{
+    FreeStringFn, RuntimeActionFn, RuntimeActionId, StbString, StepHandle, StepResult,
+    ToolPartialCb,
+};
 use serde_json::{json, Value};
 use std::sync::atomic::AtomicBool;
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 
-// Compatibility shim: published workspace SDK 0.3.20 predates ToolProgram.
-const TOOL_PROGRAM: u32 = 30;
 #[derive(Clone, Copy)]
 struct RuntimeFns {
-    action: extern "C" fn(u32, StbStringRef, *mut StbString, *mut std::ffi::c_void) -> i32,
-    free: extern "C" fn(StbString),
+    action: RuntimeActionFn,
+    free: FreeStringFn,
 }
 // Process-lifetime functions only, never registration user_data or capabilities.
 static HOST: Mutex<Option<RuntimeFns>> = Mutex::new(None);
@@ -45,15 +44,17 @@ fn bind(host: Option<RuntimeFns>, params: &Value) -> Result<Arc<Action>, String>
             .and_then(Value::as_str)
             .map(str::to_owned);
         let encoded = args.to_string();
-        let mut out = StbString::empty();
-        let rc = (host.action)(
-            TOOL_PROGRAM,
-            StbStringRef::from_str(&encoded),
-            &mut out,
-            handle as *mut std::ffi::c_void,
-        );
-        let text = out.to_string_lossy();
-        (host.free)(out);
+        struct RuntimeCall {
+            runtime_action: RuntimeActionFn,
+            free_string: FreeStringFn,
+            user_data: *mut std::ffi::c_void,
+        }
+        let call = RuntimeCall {
+            runtime_action: host.action,
+            free_string: host.free,
+            user_data: handle as *mut std::ffi::c_void,
+        };
+        let (rc, text) = rpi_plugin_sdk::call_action!(call, RuntimeActionId::ToolProgram, &encoded);
         // Never echo malformed host frames or authentication capabilities.
         if text.len() > engine::MAX_JSON {
             return Err("ToolProgram response exceeds 1 MiB".into());
@@ -186,10 +187,10 @@ fn tool_result(mut value: Value) -> String {
     .to_string()
 }
 
-rpi_plugin_sdk::execute_handler!(fn execute(_tool_call_id, params, free_params) {
+rpi_plugin_sdk::execute_handler!(fn execute(_tool_call_id, params) {
     rpi_plugin_sdk::guard(|| {
         let text = params.to_string_lossy();
-        params.free_with(free_params);
+        drop(params);
         let params: Value = serde_json::from_str(&text).unwrap_or(Value::Null);
         let request = engine::parse_request(&params);
         let host = *HOST.lock().unwrap_or_else(|e|e.into_inner());
@@ -283,7 +284,9 @@ fn schema() -> rpi_plugin_sdk::StableToolSchema {
         }).to_string()),
     }
 }
-rpi_plugin_sdk::export_plugin!(|api| {
+// The worker owns its invocation capability and QuickJS runtime. Destroy
+// cancels and joins it while the host still keeps this image loaded.
+rpi_plugin_sdk::export_shared_plugin!(|api| {
     let Some(register) = api.register_tool else {
         return 1;
     };

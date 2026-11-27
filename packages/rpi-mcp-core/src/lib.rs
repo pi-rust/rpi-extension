@@ -1,6 +1,5 @@
-#![deny(unsafe_code)]
+#![forbid(unsafe_code)]
 #![doc = include_str!("../README.md")]
-// The sole audited platform-FFI boundary. Runtime/protocol modules inherit deny.
 pub mod config;
 mod configured;
 pub mod connection;
@@ -8,7 +7,6 @@ pub mod control;
 pub mod http;
 pub mod jsonrpc;
 mod kit;
-#[allow(unsafe_code)]
 mod process;
 /// Owned platform primitives for trusted local native operations.
 pub use process::{ProcessTree, SharedFileLock};

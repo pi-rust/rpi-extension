@@ -1,6 +1,6 @@
 //! Continuation dispatcher.
 //!
-//! One process-wide worker serializes every Goal-owned automatic run:
+//! One worker per registration serializes that session’s automatic runs:
 //!
 //! * `AgentSettled` only *wakes* the worker. Sending from the dispatch thread
 //!   would block the event fan-out, and `SendMessage` blocks for the whole run.
@@ -12,7 +12,8 @@
 //! * State is only read and queued under [`state::lock`]. Host calls happen after
 //!   the lock is released, so a re-entrant callback cannot deadlock.
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Condvar, Mutex, OnceLock};
+use std::sync::{Arc, Condvar, Mutex};
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use rpi_plugin_sdk::RuntimeActionId;
@@ -25,101 +26,136 @@ use crate::runtime;
 use crate::settings;
 use crate::state::{self, Goal, Goals, Status};
 
-/// Set while a Goal-owned automatic run is in flight. Turn accounting reads it
-/// to distinguish automatic work from user work.
-static AUTOMATIC: AtomicBool = AtomicBool::new(false);
-
-/// The rejection is reported once. It is not latched into "never try again":
-/// a stop is rare, and a host that gains the action (or a reload) must not stay
-/// permanently degraded because of one early failure.
-static ABORT_WARNED: AtomicBool = AtomicBool::new(false);
-
-/// Cancel the in-flight run so a stop takes effect now instead of after the
-/// current turn. Hosts without the action reject it; the goal then stops at the
-/// next boundary exactly as before.
+/// Cancel the in-flight run so a stop takes effect at the current boundary.
 pub fn request_abort() {
     if crate::is_subagent() || !crate::events::is_run_active() {
         return;
     }
-    let Some(runtime) = runtime::snapshot() else {
+    let Some(current) = runtime::current() else {
         return;
     };
-    // The action runs asynchronously in the host and reclaims the queue; sending
-    // it from this thread would block the caller that is trying to stop the goal.
-    let _ = std::thread::Builder::new()
+    let session = current.session.clone();
+    let binding = session.registration_binding().unwrap_or(current);
+    let mut inner = session
+        .worker
+        .inner
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    if inner.shutdown {
+        return;
+    }
+    let mut index = 0;
+    while index < inner.aborts.len() {
+        if inner.aborts[index].is_finished() {
+            let _ = inner.aborts.swap_remove(index).join();
+        } else {
+            index += 1;
+        }
+    }
+    let spawned = std::thread::Builder::new()
         .name("rpi-goal-abort".into())
         .spawn(move || {
-            let _scope = runtime::enter(Some(runtime));
-            if let Err(error) =
-                crate::call_runtime_raw(crate::raw_actions::ABORT, json!({}))
-            {
-                if !ABORT_WARNED.swap(true, Ordering::SeqCst) {
+            let _scope = runtime::enter(Some(binding));
+            if let Err(error) = crate::call_runtime_raw(crate::raw_actions::ABORT, json!({})) {
+                if !runtime::state().worker.abort_warned.swap(true, Ordering::SeqCst) {
                     eprintln!(
                         "rpi-goal: this host cannot abort the current run ({error}); a stop takes effect at the next turn boundary"
                     );
                 }
             }
         });
+    if let Ok(thread) = spawned {
+        inner.aborts.push(thread);
+    }
 }
 
 pub fn is_automatic() -> bool {
-    AUTOMATIC.load(Ordering::SeqCst)
+    runtime::state().worker.automatic.load(Ordering::SeqCst)
 }
 
-struct Worker {
+#[derive(Default)]
+pub(crate) struct Worker {
     inner: Mutex<Inner>,
     ready: Condvar,
+    automatic: AtomicBool,
+    abort_warned: AtomicBool,
 }
 
+#[derive(Default)]
 struct Inner {
-    /// Level-triggered wake counter. The worker re-evaluates state on every
-    /// wake, so a coalesced or repeated signal cannot dispatch twice.
+    // Level-triggered wake counter. Repeated signals can be coalesced.
     seq: u64,
     shutdown: bool,
+    thread: Option<JoinHandle<()>>,
+    aborts: Vec<JoinHandle<()>>,
 }
 
-fn worker() -> &'static Worker {
-    static WORKER: OnceLock<Worker> = OnceLock::new();
-    WORKER.get_or_init(|| Worker {
-        inner: Mutex::new(Inner {
-            seq: 0,
-            shutdown: false,
-        }),
-        ready: Condvar::new(),
-    })
-}
+impl Worker {
+    pub(crate) fn is_stopping(&self) -> bool {
+        self.inner
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .shutdown
+    }
 
-/// Start the worker if it is not running yet. Safe to call from any thread.
-pub fn ensure_started() {
-    static STARTED: OnceLock<()> = OnceLock::new();
-    STARTED.get_or_init(|| {
-        let spawned = std::thread::Builder::new()
-            .name("rpi-goal-worker".into())
-            .spawn(run);
-        if let Err(error) = spawned {
-            eprintln!("rpi-goal: unable to start the goal worker: {error}");
+    pub(crate) fn stop(&self) {
+        let mut inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        inner.shutdown = true;
+        self.ready.notify_all();
+    }
+
+    pub(crate) fn finish(&self) {
+        self.stop();
+        let (thread, aborts) = {
+            let mut inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+            (inner.thread.take(), std::mem::take(&mut inner.aborts))
+        };
+        for thread in thread.into_iter().chain(aborts) {
+            let _ = thread.join();
         }
-    });
+    }
 }
 
-/// Ask the worker to re-evaluate: a settle boundary, a goal mutation, a wait
-/// deadline change, or new user input.
+/// Start this registration's worker on its first live use.
+pub fn ensure_started() {
+    if crate::is_subagent() || runtime::snapshot().is_none() {
+        return;
+    }
+    let session = runtime::state();
+    let mut inner = session
+        .worker
+        .inner
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    if inner.shutdown || inner.thread.is_some() {
+        return;
+    }
+    let owned = session.clone();
+    match std::thread::Builder::new()
+        .name("rpi-goal-worker".into())
+        .spawn(move || run(owned))
+    {
+        Ok(thread) => inner.thread = Some(thread),
+        Err(error) => eprintln!("rpi-goal: unable to start the goal worker: {error}"),
+    }
+}
+
+/// Ask this worker to re-evaluate a settle boundary or a goal mutation.
 pub fn wake() {
-    let worker = worker();
+    let session = runtime::state();
+    let worker = &session.worker;
     let mut inner = worker.inner.lock().unwrap_or_else(|p| p.into_inner());
     inner.seq = inner.seq.wrapping_add(1);
     worker.ready.notify_all();
 }
 
 pub fn shutdown() {
-    let worker = worker();
-    let mut inner = worker.inner.lock().unwrap_or_else(|p| p.into_inner());
-    inner.shutdown = true;
-    worker.ready.notify_all();
+    runtime::state().worker.stop();
 }
 
-fn run() {
-    let worker = worker();
+fn run(session: Arc<runtime::Session>) {
+    let _scope = runtime::enter(session.registration_binding());
+    let worker = &session.worker;
     let mut seen = 0u64;
     let mut deadline: Option<Instant> = None;
     loop {
@@ -171,7 +207,10 @@ enum Plan {
 /// One evaluation pass. Returns the next absolute deadline the worker should
 /// wake itself for (a `goal_wait` safety wake), if any.
 fn step() -> Option<Instant> {
-    if runtime::snapshot().is_none() || crate::is_subagent() {
+    if runtime::snapshot().is_none()
+        || crate::is_subagent()
+        || runtime::state().worker.is_stopping()
+    {
         return None;
     }
     // Read host-backed state and settings before taking the mutation lock. A
@@ -186,7 +225,8 @@ fn step() -> Option<Instant> {
     let settings = settings::load();
     let tools_available = required_tools_available();
     let plan = {
-        let _guard = state::lock();
+        let session = crate::runtime::state();
+        let _guard = state::lock(&session);
         if state::revision() != after {
             return None;
         }
@@ -326,12 +366,19 @@ fn dispatch(goal: &Goal, revision: u64, verdict_prompt: Option<(String, u64)>) {
         None if first => prompts::kickoff(goal),
         None => prompts::continuation(goal, goal.iteration),
     };
-    AUTOMATIC.store(true, Ordering::SeqCst);
+    let session = runtime::state();
+    if session.worker.is_stopping() {
+        return;
+    }
+    session.worker.automatic.store(true, Ordering::SeqCst);
     let result = crate::call_runtime(
         RuntimeActionId::SendMessage,
         json!({"text": prompt, "triggerTurn": true}),
     );
-    AUTOMATIC.store(false, Ordering::SeqCst);
+    session.worker.automatic.store(false, Ordering::SeqCst);
+    if session.worker.is_stopping() {
+        return;
+    }
 
     // A stop (pause, budget, safety, usage limit) may have aborted this run while
     // it was in flight; that state is already committed and needs no fold-back.
@@ -364,7 +411,8 @@ fn dispatch(goal: &Goal, revision: u64, verdict_prompt: Option<(String, u64)>) {
                     // Read-modify-write in one critical section: a stale clone
                     // carried across two sections could overwrite a newer state.
                     let queued = {
-                        let _guard = state::lock();
+                        let session = crate::runtime::state();
+                        let _guard = state::lock(&session);
                         let mut goals = state::read_lenient();
                         match goals.active.clone() {
                             Some(active) if active.id == goal.id => {
@@ -428,7 +476,8 @@ pub fn stop(status: Status, reason: &str, cause: Option<&str>) {
 /// no-op, so a delayed continuation cannot pause a newer goal.
 pub fn stop_current(expected_id: &str, status: Status, reason: &str, cause: Option<&str>) {
     let stopped = {
-        let _guard = state::lock();
+        let session = crate::runtime::state();
+        let _guard = state::lock(&session);
         let mut goals = state::read_lenient();
         let Some(mut goal) = goals.active.clone() else {
             return;
@@ -458,7 +507,8 @@ pub fn stop_current(expected_id: &str, status: Status, reason: &str, cause: Opti
 
 pub fn wait_current(expected_id: &str, waiting: crate::state::Waiting) {
     let goal = {
-        let _guard = state::lock();
+        let session = crate::runtime::state();
+        let _guard = state::lock(&session);
         let mut goals = state::read_lenient();
         let Some(mut goal) = goals.active.clone() else {
             return;
@@ -483,7 +533,8 @@ pub fn wait_current(expected_id: &str, waiting: crate::state::Waiting) {
 
 /// Compact `active` view used by the tests and the status line.
 pub fn is_running() -> bool {
-    let _guard = state::lock();
+    let session = crate::runtime::state();
+    let _guard = state::lock(&session);
     let state: Goals = state::read_lenient();
     state.active.is_some()
 }

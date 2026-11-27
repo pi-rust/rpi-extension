@@ -13,7 +13,7 @@ Unknown top-level keys (including host-injected `__rpi`) remain allowed.
 | Parameter | Default | Contract |
 | --- | --- | --- |
 | `check` | `"diff"` | One of `diff`, `cargo`, `fmt`, `clippy`, mapped to the commands above. `diff` checks whitespace errors in unstaged tracked changes, not staged/untracked files or a full diff. |
-| `cwd` | Plugin process directory | Existing directory appropriate for the command. Empty also uses the process directory; relative values resolve from there. **Host `__rpi.cwd` is ignored**; pass an absolute project directory explicitly. |
+| `cwd` | Host session workspace, with the process working directory as fallback | Existing directory appropriate for the command. Empty values use the default and relative values resolve from it. |
 | `timeoutSeconds` | `60` | Integer from 1 to 120. Runtime clamps unsigned integers to that interval and falls back to 60 for other types/values. |
 
 Requires the selected executable on PATH, a Git repository or Cargo project as
@@ -25,9 +25,8 @@ Success text is `check=<selector> exit=<code>` followed by stdout and then stder
 (not interleaved). Nonzero exit codes still return normal diagnostic output.
 Spawn, wait, collection and timeout failures return tool errors. Output is
 buffered in full and then capped at 40,000 bytes plus `\n[truncated]`; this is
-not a bound on subprocess output production or memory use. The current byte
-truncation is not UTF-8-boundary-aware, so non-ASCII output crossing the cap may
-fail instead of yielding a clean truncation.
+not a bound on subprocess output production or memory use. Truncation preserves
+whole UTF-8 characters.
 
 ## Execution limits
 

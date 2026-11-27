@@ -26,8 +26,7 @@ pub fn execute(
     free_params: Option<FreeStringFn>,
     builder: Builder,
 ) -> StepHandle {
-    let text = params.to_string_lossy();
-    params.free_with(free_params);
+    let text = rpi_plugin_sdk::stb_take!(params, free_params);
     let params = serde_json::from_str(&text).unwrap_or(Value::Null);
     HANDLES.insert(Drive {
         params,
@@ -129,7 +128,7 @@ macro_rules! export_single_tool_plugin {
         extern "C" fn package_destroy(handle: rpi_plugin_sdk::StepHandle) {
             $crate::kit::destroy(handle)
         }
-        rpi_plugin_sdk::export_plugin!(|api| {
+        rpi_plugin_sdk::export_shared_plugin!(|api| {
             let Some(register) = api.register_tool else {
                 return 1;
             };

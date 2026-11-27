@@ -14,7 +14,10 @@ mod transport;
 mod entry {
     use crate::{antigravity, codex, deepseek, llama_cpp, openrouter, proxy};
 
-    rpi_plugin_sdk::export_plugin!(|api| {
+    // The shared-image Host provides registration lifecycle hooks. Legacy Hosts
+    // still call the standard SDK entrypoint and can use isolated images.
+
+    rpi_plugin_sdk::export_shared_plugin!(|api| {
         for register in [
             deepseek::register,
             openrouter::register,

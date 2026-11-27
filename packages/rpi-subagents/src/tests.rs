@@ -9,12 +9,15 @@ fn completed() -> Value {
     json!({"status":"done","result":{"status":"completed","text":"report","turns":1,"turnLimited":false}})
 }
 
-fn scripted(replies: Vec<Result<Value, String>>) -> (Box<Action>, Arc<Mutex<Vec<Value>>>) {
+fn scripted(replies: Vec<Result<Value, ActionError>>) -> (Box<Action>, Arc<Mutex<Vec<Value>>>) {
     let calls = Arc::new(Mutex::new(Vec::new()));
     let saved = calls.clone();
     let replies = Mutex::new(VecDeque::from(replies));
-    let action = Box::new(move |value: Value| {
-        saved.lock().unwrap().push(value.clone());
+    let action = Box::new(move |action_id, value: Value| {
+        saved
+            .lock()
+            .unwrap()
+            .push(json!({"actionId":action_id,"args":value}));
         if value["op"] == "dispose" || value["op"] == "cancel" {
             return Ok(json!({}));
         }
@@ -31,8 +34,8 @@ fn scripted(replies: Vec<Result<Value, String>>) -> (Box<Action>, Arc<Mutex<Vec<
 fn registered_schema_is_valid_json_with_only_model_fields_and_task_required() {
     // This is the builder passed to register_tool, not a duplicate schema fixture.
     let registered = delegate_schema();
-    assert_eq!(registered.name.to_string_lossy(), "delegate_task");
-    let description = registered.description.to_string_lossy();
+    assert_eq!(rpi_plugin_sdk::stb_text!(registered.name), "delegate_task");
+    let description = rpi_plugin_sdk::stb_text!(registered.description);
     for guidance in [
         "host-managed in-memory",
         "not a subagent subprocess",
@@ -45,7 +48,8 @@ fn registered_schema_is_valid_json_with_only_model_fields_and_task_required() {
             "missing guidance: {guidance}"
         );
     }
-    let parameters: Value = serde_json::from_str(&registered.parameters.to_string_lossy()).unwrap();
+    let parameters: Value =
+        serde_json::from_str(&rpi_plugin_sdk::stb_text!(registered.parameters)).unwrap();
     assert_eq!(parameters["type"], "object");
     assert_eq!(parameters["required"], json!(["task"]));
     assert_eq!(parameters["additionalProperties"], true);
@@ -76,7 +80,8 @@ fn registered_schema_is_valid_json_with_only_model_fields_and_task_required() {
 #[test]
 fn registered_schema_defaults_match_runtime_and_budgets_are_normalized_not_rejected() {
     let registered = delegate_schema();
-    let parameters: Value = serde_json::from_str(&registered.parameters.to_string_lossy()).unwrap();
+    let parameters: Value =
+        serde_json::from_str(&rpi_plugin_sdk::stb_text!(registered.parameters)).unwrap();
     let defaults = request();
     let properties = &parameters["properties"];
     assert_eq!(properties["role"]["default"], defaults.role);
@@ -85,12 +90,12 @@ fn registered_schema_defaults_match_runtime_and_budgets_are_normalized_not_rejec
         properties["timeoutSeconds"]["default"],
         defaults.timeout_seconds
     );
-    for (name, minimum, maximum) in [("maxTurns", 1, 32), ("timeoutSeconds", 10, 1800)] {
+    for (name, minimum, maximum) in [("maxTurns", 0, 32), ("timeoutSeconds", 10, 1800)] {
         assert_eq!(properties[name]["minimum"], minimum);
         assert_eq!(properties[name]["maximum"], maximum);
     }
     for (value, turns, timeout) in [
-        (json!(0), 1, 10),
+        (json!(0), 0, 10),
         (json!(1), 1, 10),
         (json!(32), 32, 32),
         (json!(1800), 32, 1800),
@@ -115,6 +120,146 @@ fn registered_schema_defaults_match_runtime_and_budgets_are_normalized_not_rejec
             "timeoutSeconds for {value}"
         );
     }
+}
+
+#[test]
+fn operator_can_disable_the_turn_guard_even_for_cached_model_arguments() {
+    for input in [
+        json!({"task":"inspect"}),
+        json!({"task":"inspect","maxTurns":24}),
+        json!({"task":"inspect","maxTurns":999}),
+    ] {
+        let request = parse_request_with_budget_policy(
+            &input,
+            BudgetPolicy {
+                max_turns: Some(0),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(request.max_turns, 0);
+        assert_eq!(request.timeout_seconds, 300);
+    }
+    let request = parse_request_with_budget_policy(
+        &json!({"task":"inspect","maxTurns":0}),
+        BudgetPolicy::default(),
+    )
+    .unwrap();
+    assert_eq!(request.max_turns, 0);
+    let registered = delegate_schema_with_budget_policy(BudgetPolicy {
+        max_turns: Some(0),
+        ..Default::default()
+    });
+    let parameters: Value =
+        serde_json::from_str(&rpi_plugin_sdk::stb_text!(registered.parameters)).unwrap();
+    assert_eq!(parameters["properties"]["maxTurns"]["enum"], json!([0]));
+    assert_eq!(parameters["properties"]["timeoutSeconds"]["default"], 300);
+}
+
+#[test]
+fn timeout_policy_is_independent_and_overrides_cached_model_arguments() {
+    let policy = BudgetPolicy {
+        max_turns: Some(0),
+        timeout_seconds: Some(900),
+    };
+    for input in [
+        json!({"task":"inspect"}),
+        json!({"task":"inspect","maxTurns":24,"timeoutSeconds":10}),
+        json!({"task":"inspect","timeoutSeconds":0}),
+    ] {
+        let request = parse_request_with_budget_policy(&input, policy).unwrap();
+        assert_eq!((request.max_turns, request.timeout_seconds), (0, 900));
+    }
+    let parameters: Value = serde_json::from_str(&rpi_plugin_sdk::stb_text!(
+        delegate_schema_with_budget_policy(policy).parameters
+    ))
+    .unwrap();
+    assert_eq!(
+        parameters["properties"]["timeoutSeconds"]["enum"],
+        json!([900])
+    );
+    assert_eq!(parameters["properties"]["timeoutSeconds"]["default"], 900);
+    let request = parse_request_with_budget_policy(
+        &json!({"task":"inspect","maxTurns":24}),
+        BudgetPolicy {
+            max_turns: None,
+            timeout_seconds: Some(600),
+        },
+    )
+    .unwrap();
+    assert_eq!((request.max_turns, request.timeout_seconds), (24, 600));
+    let request = parse_request_with_budget_policy(
+        &json!({"task":"inspect","timeoutSeconds":600}),
+        BudgetPolicy {
+            max_turns: Some(0),
+            timeout_seconds: None,
+        },
+    )
+    .unwrap();
+    assert_eq!((request.max_turns, request.timeout_seconds), (0, 600));
+}
+
+#[test]
+fn operator_limits_reject_invalid_configuration_without_changing_the_environment() {
+    for value in ["", "-1", "1.0", "abc", "18446744073709551616"] {
+        assert!(parse_operator_limit("turns", value, 0, 32).is_err());
+        assert!(parse_operator_limit("timeout", value, 10, 1800).is_err());
+    }
+    for value in ["0", "9", "1801"] {
+        assert!(parse_operator_limit("timeout", value, 10, 1800).is_err());
+    }
+    assert!(parse_operator_limit("turns", "33", 0, 32).is_err());
+    for seconds in [10, 300, 1800] {
+        assert_eq!(
+            parse_operator_limit("timeout", &format!(" {seconds} "), 10, 1800).unwrap(),
+            seconds
+        );
+    }
+    assert_eq!(parse_operator_limit("turns", "0", 0, 32).unwrap(), 0);
+}
+
+#[test]
+fn resolved_operator_budgets_reach_the_native_start_and_final_report() {
+    let request = parse_request_with_budget_policy(
+        &json!({"task":"inspect","maxTurns":24,"timeoutSeconds":10}),
+        BudgetPolicy {
+            max_turns: Some(0),
+            timeout_seconds: Some(900),
+        },
+    )
+    .unwrap();
+    // The merged host protocol starts an independent run, so the start reply is
+    // keyed by runId; the resolved policy must survive that hop unchanged.
+    let (action, calls) = scripted(vec![Ok(json!({"runId":"child-policy"})), Ok(completed())]);
+    let (tx, rx) = mpsc::channel();
+    run_request(
+        request,
+        "policy-call".into(),
+        &[],
+        &*action,
+        tx,
+        Arc::new(AtomicBool::new(false)),
+    )
+    .unwrap();
+    let messages: Vec<_> = rx.try_iter().collect();
+    let text = messages
+        .into_iter()
+        .find_map(|message| {
+            if let JobMessage::Done(text) = message {
+                Some(text)
+            } else {
+                None
+            }
+        })
+        .unwrap();
+    let result: Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(result["maxTurns"], 0);
+    assert_eq!(result["timeoutSeconds"], 900);
+    let calls = calls.lock().unwrap();
+    assert_eq!(calls[0]["actionId"], INDEPENDENT_RUN);
+    assert_eq!(calls[0]["args"]["maxTurns"], 0);
+    assert_eq!(calls[0]["args"]["timeoutSeconds"], 900);
+    assert_eq!(calls.last().unwrap()["args"]["op"], "dispose");
 }
 
 #[test]
@@ -180,7 +325,7 @@ fn validates_and_clamps_limits_while_accepting_host_context() {
 #[test]
 fn forwards_deltas_and_returns_delegation_metadata_then_disposes() {
     let (action, calls) = scripted(vec![
-        Ok(json!({"childId":"child-1","sessionId":"child-1"})),
+        Ok(json!({"runId":"child-1","sessionId":"child-1"})),
         Ok(json!({"status":"running","deltas":["hello"]})),
         Ok(completed()),
     ]);
@@ -188,6 +333,7 @@ fn forwards_deltas_and_returns_delegation_metadata_then_disposes() {
     run_request(
         request(),
         "tool-1".into(),
+        &[json!("read"), json!("delegate_task")],
         &*action,
         tx,
         Arc::new(AtomicBool::new(false)),
@@ -202,23 +348,87 @@ fn forwards_deltas_and_returns_delegation_metadata_then_disposes() {
     assert_eq!(result["report"], "report");
     assert_eq!(result["sessionId"], "child-1");
     let calls = calls.lock().unwrap();
-    assert_eq!(calls[0]["toolCallId"], "tool-1");
-    assert_eq!(calls.last().unwrap()["op"], "dispose");
+    assert_eq!(calls[0]["actionId"], INDEPENDENT_RUN);
+    assert_eq!(
+        calls[0]["args"],
+        json!({
+            "op":"start", "tools":["read"], "maxTurns":8, "timeoutSeconds":300,
+            "input":"You are a delegated worker subagent. Complete the task in at most 8 turns. Do not delegate, spawn, or ask another agent to do work. Work only in the current project and return a concise final report.\n\nTask:\ninspect"
+        })
+    );
+    assert_eq!(
+        calls.last().unwrap(),
+        &json!({
+            "actionId":INDEPENDENT_RUN,"args":{"op":"dispose","runId":"child-1"}
+        })
+    );
 }
 
 #[test]
 fn unsupported_host_is_explicit_and_never_spawns_a_process() {
-    let (action, calls) = scripted(vec![Err("unknown runtime action id 24".into())]);
+    let (action, calls) = scripted(vec![
+        Err(ActionError::UnknownAction),
+        Err(ActionError::UnknownAction),
+    ]);
     let (tx, _) = mpsc::channel();
     let error = run_request(
         request(),
         "t".into(),
+        &[],
         &*action,
         tx,
         Arc::new(AtomicBool::new(false)),
     )
     .unwrap_err();
-    assert!(error.contains("requires a host supporting ChildAgent"));
+    assert!(error.contains("requires host support for IndependentRun or ChildAgent"));
+    assert_eq!(calls.lock().unwrap().len(), 2);
+}
+
+#[test]
+fn only_an_unknown_action_can_fall_back_to_the_legacy_lifecycle() {
+    let (action, calls) = scripted(vec![
+        Err(ActionError::UnknownAction),
+        Ok(json!({"childId":"legacy","sessionId":"s"})),
+        Ok(completed()),
+    ]);
+    let (tx, _rx) = mpsc::channel();
+    run_request(
+        request(),
+        "t".into(),
+        &[],
+        &*action,
+        tx,
+        Arc::new(AtomicBool::new(false)),
+    )
+    .unwrap();
+    let calls = calls.lock().unwrap();
+    assert_eq!(
+        calls[1],
+        json!({"actionId":CHILD_AGENT,"args":{
+            "op":"start","task":"inspect","role":"worker","maxTurns":8,"timeoutSeconds":300,"toolCallId":"t"
+        }})
+    );
+    assert_eq!(
+        calls[2],
+        json!({"actionId":CHILD_AGENT,"args":{"op":"poll","childId":"legacy"}})
+    );
+    assert_eq!(
+        calls[3],
+        json!({"actionId":CHILD_AGENT,"args":{"op":"dispose","childId":"legacy"}})
+    );
+
+    let (action, calls) = scripted(vec![Err(ActionError::Failed("permission denied".into()))]);
+    let (tx, _rx) = mpsc::channel();
+    assert!(run_request(
+        request(),
+        "t".into(),
+        &[],
+        &*action,
+        tx,
+        Arc::new(AtomicBool::new(false))
+    )
+    .unwrap_err()
+    .contains("permission denied"));
     assert_eq!(calls.lock().unwrap().len(), 1);
 }
 
@@ -229,6 +439,7 @@ fn cancellation_before_start_has_no_host_side_effects() {
     assert!(run_request(
         request(),
         "t".into(),
+        &[],
         &*action,
         tx,
         Arc::new(AtomicBool::new(true))
@@ -243,10 +454,11 @@ fn cancellation_after_start_cancels_and_disposes() {
     let token = cancelled.clone();
     let calls = Arc::new(Mutex::new(Vec::new()));
     let saved = calls.clone();
-    let action = move |value: Value| {
+    let action = move |action_id, value: Value| {
+        assert_eq!(action_id, INDEPENDENT_RUN);
         saved.lock().unwrap().push(value.clone());
         match value["op"].as_str().unwrap() {
-            "start" => Ok(json!({"childId":"c"})),
+            "start" => Ok(json!({"runId":"c"})),
             "poll" => {
                 token.store(true, Ordering::Release);
                 Ok(json!({"status":"running"}))
@@ -255,9 +467,11 @@ fn cancellation_after_start_cancels_and_disposes() {
         }
     };
     let (tx, _rx) = mpsc::channel();
-    assert!(run_request(request(), "t".into(), &action, tx, cancelled)
-        .unwrap_err()
-        .contains("cancelled"));
+    assert!(
+        run_request(request(), "t".into(), &[], &action, tx, cancelled)
+            .unwrap_err()
+            .contains("cancelled")
+    );
     let ops: Vec<_> = calls
         .lock()
         .unwrap()
@@ -270,30 +484,34 @@ fn cancellation_after_start_cancels_and_disposes() {
 #[test]
 fn errors_and_malformed_replies_always_dispose() {
     for reply in [
-        Err("lost bridge".into()),
+        Err(ActionError::Failed("lost bridge".into())),
         Ok(json!({"status":"failed","error":"permission denied"})),
         Ok(json!({"status":"invalid"})),
         Ok(json!({"status":"done"})),
         Ok(json!({"status":"done","result":{"status":"failed","error":"provider failed"}})),
     ] {
-        let (action, calls) = scripted(vec![Ok(json!({"childId":"c"})), reply]);
+        let (action, calls) = scripted(vec![Ok(json!({"runId":"c"})), reply]);
         let (tx, _rx) = mpsc::channel();
         assert!(run_request(
             request(),
             "t".into(),
+            &[],
             &*action,
             tx,
             Arc::new(AtomicBool::new(false))
         )
         .is_err());
-        assert_eq!(calls.lock().unwrap().last().unwrap()["op"], "dispose");
+        assert_eq!(
+            calls.lock().unwrap().last().unwrap()["args"]["op"],
+            "dispose"
+        );
     }
 }
 
 #[test]
 fn streamed_and_final_text_share_a_budget() {
     let (action, calls) = scripted(vec![
-        Ok(json!({"childId":"c"})),
+        Ok(json!({"runId":"c"})),
         Ok(json!({"status":"running","deltas":["a".repeat(MAX_OUTPUT_BYTES)]})),
         Ok(completed()),
     ]);
@@ -301,25 +519,30 @@ fn streamed_and_final_text_share_a_budget() {
     assert!(run_request(
         request(),
         "t".into(),
+        &[],
         &*action,
         tx,
         Arc::new(AtomicBool::new(false))
     )
     .unwrap_err()
     .contains("output limit"));
-    assert_eq!(calls.lock().unwrap().last().unwrap()["op"], "dispose");
+    assert_eq!(
+        calls.lock().unwrap().last().unwrap()["args"]["op"],
+        "dispose"
+    );
 }
 
 #[test]
 fn partial_count_is_bounded_independently_of_bytes() {
     let (action, _) = scripted(vec![
-        Ok(json!({"childId":"c"})),
+        Ok(json!({"runId":"c"})),
         Ok(json!({"status":"running","deltas":vec!["";MAX_PARTIAL_EVENTS+1]})),
     ]);
     let (tx, _rx) = mpsc::channel();
     assert!(run_request(
         request(),
         "t".into(),
+        &[],
         &*action,
         tx,
         Arc::new(AtomicBool::new(false))
@@ -333,8 +556,7 @@ thread_local! {
 }
 
 extern "C" fn collect_progress(partial: StbString, _: *mut std::ffi::c_void) {
-    let text = partial.to_string_lossy();
-    plugin_free_string(partial);
+    let text = rpi_plugin_sdk::stb_take!(partial, Some(plugin_free_string));
     PROGRESS.with(|progress| progress.borrow_mut().push(text));
 }
 

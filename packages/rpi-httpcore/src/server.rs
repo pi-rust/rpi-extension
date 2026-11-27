@@ -7,6 +7,7 @@ use tokio::sync::watch;
 
 mod auth;
 mod children;
+mod delegations;
 mod events;
 mod middleware;
 mod projects;
@@ -54,6 +55,16 @@ pub async fn serve_until(
     on_listen: impl FnOnce(Listening),
     stop: impl std::future::Future<Output = ()> + Send + 'static,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    serve_until_with_host_area(config, frontend, on_listen, stop, None).await
+}
+
+pub async fn serve_until_with_host_area(
+    config: crate::config::AppConfig,
+    frontend: Router,
+    on_listen: impl FnOnce(Listening),
+    stop: impl std::future::Future<Output = ()> + Send + 'static,
+    area: Option<&str>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let mut config = config;
     let requested = SocketAddr::new(config.bind.parse()?, config.port);
     let listener = tokio::net::TcpListener::bind(requested)
@@ -74,6 +85,12 @@ pub async fn serve_until(
         session_dir: config.session_dir.clone(),
         registry: config.registry.clone(),
     })?;
+    if let Some(area) = area {
+        backend
+            .attach_host_area(area)
+            .await
+            .map_err(std::io::Error::other)?;
+    }
     // Warm the cached native host version so the first `/api/v1/capabilities`
     // request does not pay for the probe. It is best-effort: a host that cannot
     // report a version just leaves the field out.
@@ -226,6 +243,7 @@ fn routes(state: AppState) -> Router {
         .merge(auth::routes())
         .merge(sessions::routes())
         .merge(children::routes())
+        .merge(delegations::routes())
         .merge(events::routes())
         .layer(from_fn_with_state(state.clone(), admit_owner))
         .layer(from_fn_with_state(state.clone(), touch_session_activity))

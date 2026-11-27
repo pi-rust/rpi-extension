@@ -1,4 +1,5 @@
 //! Session and workspace operations shared by protocol adapters.
+pub mod delegations;
 pub use crate::run_timing::RunTimingsQuery;
 mod message_queries;
 mod tool_program_access;
@@ -15,7 +16,9 @@ pub use tool_program_queries::{
 pub use tool_program_snapshot::{
     child_snapshot, child_snapshot_for_host, ChildSnapshot, ChildSnapshotQuery,
 };
+mod preview;
 mod resources;
+pub use preview::session_preview;
 mod retirement;
 #[cfg(test)]
 #[path = "service_retirement_tests.rs"]
@@ -71,7 +74,11 @@ pub async fn run_timings(state: &Service, id: String, query: RunTimingsQuery) ->
         Ok(project) => project,
         Err(error) => return (ReplyKind::Unavailable, json!({"error":error})).into_reply(),
     };
-    let configured = state.config.session_dir.clone();
+    let configured = state
+        .live_session(&id)
+        .await
+        .and_then(|session| session.area_session_dir())
+        .or_else(|| state.config.session_dir.clone());
     let cache = state.run_timing_cache.clone();
     let permit = match state.run_timing_workers.clone().acquire_owned().await {
         Ok(permit) => permit,
@@ -145,6 +152,7 @@ pub struct Service {
     run_timing_cache: Arc<std::sync::Mutex<crate::run_timing::RunTimingCache>>,
     run_timing_workers: Arc<tokio::sync::Semaphore>,
     resource_workers: Arc<tokio::sync::Semaphore>,
+    preview_workers: Arc<tokio::sync::Semaphore>,
     retirement_workers: Arc<tokio::sync::Semaphore>,
     closing: Arc<std::sync::atomic::AtomicBool>,
     resource_storage_failed: Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
@@ -188,6 +196,7 @@ impl Service {
             run_timing_cache: Arc::new(std::sync::Mutex::new(Default::default())),
             run_timing_workers: Arc::new(tokio::sync::Semaphore::new(2)),
             resource_workers: Arc::new(tokio::sync::Semaphore::new(2)),
+            preview_workers: Arc::new(tokio::sync::Semaphore::new(2)),
             retirement_workers: Arc::new(tokio::sync::Semaphore::new(16)),
             closing: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             resource_storage_failed: Arc::new(std::sync::Mutex::new(
@@ -207,6 +216,62 @@ impl Service {
             .get_or_init(|| async { probe_host_version(&self.config.rpi_bin).await })
             .await
             .clone()
+    }
+
+    /// Join a native area using the same entry point as the terminal. This
+    /// service retains only a client to the Session selected by the Host.
+    pub async fn attach_host_area(&self, area: &str) -> Result<(), String> {
+        let _lifecycle = self.session_lifecycle.lock().await;
+        self.attach_host_area_locked(area, None).await.map(|_| ())
+    }
+
+    async fn attach_host_area_locked(
+        &self,
+        area: &str,
+        expected: Option<&str>,
+    ) -> Result<String, String> {
+        let session = HostSession::attach_area(
+            self.config.rpi_bin.clone(),
+            self.config.project.clone(),
+            self.config.registry.with_extension("tool-timings"),
+            area,
+        )
+        .await?;
+        let id = session.ready()["sessionId"]
+            .as_str()
+            .ok_or("native area did not select a Session")?
+            .to_owned();
+        if expected.is_some_and(|expected| expected != id) {
+            session.shutdown().await;
+            return Err("native area selected another Session".into());
+        }
+        let snapshot = session.snapshot().await;
+        let saved = self.registry.write().await.attach(RegistryEntry {
+            session_id: id.clone(),
+            project_id: Some(self.default_project_id.clone()),
+            title: None,
+            parent_session_id: None,
+            fork_entry_id: None,
+            relation: None,
+            created_at: snapshot.created_at,
+            updated_at: snapshot.updated_at,
+            last_turn_ended_at: None,
+        });
+        if let Err(error) = saved {
+            session.shutdown().await;
+            return Err(error);
+        }
+        let previous = self
+            .sessions
+            .write()
+            .await
+            .insert(id.clone(), session.clone());
+        if let Some(previous) = previous {
+            previous.shutdown().await;
+        }
+        self.watch_turn_ends(&id, &session);
+        self.touch_session(&id).await;
+        Ok(id)
     }
 
     pub async fn live_session(&self, id: &str) -> Option<Arc<HostSession>> {
@@ -324,6 +389,10 @@ impl Service {
             .map(|(id, session)| (id.clone(), session.clone()))
             .collect();
         futures_util::future::join_all(sessions.iter().map(|(id, session)| async move {
+            if session.is_shared_area() {
+                session.shutdown().await;
+                return;
+            }
             if let Ok(fence) = session.resource_fence() {
                 // Native runtime setters are not persisted. Only a fresh idle
                 // owned-stop capture may be replayed on a later ordinary open.
@@ -639,7 +708,7 @@ async fn create_session_owned(
             return resources::reply_error(error);
         }
     }
-    match spawn_host(state, &id, &project).await {
+    match spawn_host(state, &id, &project, false).await {
         Ok((session, record)) => {
             let ready = session.ready();
             let snapshot = session.snapshot().await;
@@ -683,6 +752,7 @@ async fn spawn_host(
     state: &Service,
     id: &str,
     project: &Project,
+    reopening: bool,
 ) -> Result<
     (
         Arc<HostSession>,
@@ -693,7 +763,11 @@ async fn spawn_host(
     let options = resources::host_options(state, id, project)
         .await
         .map_err(|e| e.to_string())?;
-    let session = HostSession::spawn_options(options).await?;
+    let session = if reopening {
+        HostSession::reopen_options(options).await?
+    } else {
+        HostSession::spawn_options(options).await?
+    };
     match resources::prepare_open_observation(state, id, &session).await {
         Ok(record) => Ok((session, record)),
         Err(error) => {
@@ -763,11 +837,20 @@ pub async fn rename_session(state: &Service, id: String, request: RenameRequest)
     (ReplyKind::Success, json!({"sessionId": id, "title": title})).into_reply()
 }
 
-#[derive(Deserialize)]
+#[derive(Default, Deserialize)]
 pub struct MetadataRequest {
     pub pinned: Option<bool>,
     pub archived: Option<bool>,
     pub tags: Option<Vec<String>>,
+}
+
+pub const MAX_BULK_METADATA_SESSIONS: usize = 64;
+
+#[derive(Default, Deserialize)]
+pub struct BulkMetadataRequest {
+    #[serde(rename = "sessionIds")]
+    pub session_ids: Vec<String>,
+    pub patch: MetadataRequest,
 }
 
 pub async fn session_metadata(
@@ -776,6 +859,13 @@ pub async fn session_metadata(
     request: MetadataRequest,
 ) -> (ReplyKind, Value) {
     retirement::metadata(state, id, request).await
+}
+
+pub async fn bulk_session_metadata(
+    state: &Service,
+    request: BulkMetadataRequest,
+) -> (ReplyKind, Value) {
+    retirement::bulk_metadata(state, request).await
 }
 
 pub async fn fork_session(state: &Service, id: String, request: ForkRequest) -> ServiceReply {
@@ -1088,6 +1178,12 @@ async fn open_session_owned(state: &Service, id: String) -> (ReplyKind, Value) {
                 }),
             );
         }
+        if let Some(area) = session.ready()["sharedHostArea"].as_str() {
+            return match state.attach_host_area_locked(area, Some(&id)).await {
+                Ok(_) => (ReplyKind::Success, json!({"sessionId":id,"status":"ready"})),
+                Err(error) => (ReplyKind::HostUnavailable, json!({"error":error})),
+            };
+        }
         // The native child exited (crash, kill, or `stop`); drop the corpse so
         // the branch can be reopened from its persisted session file.
         if let Err(error) = session.await_resource_exit().await {
@@ -1107,7 +1203,7 @@ async fn open_session_owned(state: &Service, id: String) -> (ReplyKind, Value) {
         Ok(project) => project,
         Err(error) => return (ReplyKind::InvalidInput, json!({"error":error})),
     };
-    match spawn_host(state, &id, &project).await {
+    match spawn_host(state, &id, &project, true).await {
         Ok((session, record)) => {
             let snapshot = session.snapshot().await;
             // Configuration publication preserves the latest stored metadata,
@@ -1910,6 +2006,7 @@ mod run_timing_service_tests {
         let query = || RunTimingsQuery {
             entry_ids: vec!["actual".into()],
             cursor: None,
+            all: false,
         };
         assert_eq!(
             run_timings(&state, "../escape".into(), query()).await.kind,

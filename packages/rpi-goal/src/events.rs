@@ -15,30 +15,17 @@ use crate::runtime;
 use crate::state::{self, Status};
 use crate::status;
 
-/// Did this run attempt a tool? Attempted tools reset the no-progress heuristic.
-static TOOL_ATTEMPTED: AtomicBool = AtomicBool::new(false);
-
-/// Is a main-lane run in flight? The worker waits for the settled boundary
-/// instead of injecting a continuation into the live run. Hosts that do not
-/// deliver `AgentStart`/`AgentEnd` leave this false, and the continuation then
-/// rides the host's own follow-up queue instead of being lost.
-static RUN_ACTIVE: AtomicBool = AtomicBool::new(false);
-
-pub fn is_run_active() -> bool {
-    RUN_ACTIVE.load(Ordering::SeqCst)
+#[derive(Default)]
+pub(crate) struct RunEvents {
+    tool_attempted: AtomicBool,
+    run_active: AtomicBool,
+    // Assistant output for the no-progress check and timestamp for deduplication.
+    last_text: Mutex<Option<String>>,
+    last_accounted: Mutex<Option<i64>>,
 }
 
-/// Last assistant message text of the current turn, used only to compute the
-/// no-progress fingerprint. Cleared on every `turn_end`.
-static LAST_TEXT: Mutex<Option<String>> = Mutex::new(None);
-
-/// Assistant-message timestamp of the last accounted response. `MessageEnd` and
-/// `AfterProviderResponse` can describe the same response on hosts that deliver
-/// both; accounting it twice would double a token budget.
-static LAST_ACCOUNTED: Mutex<Option<i64>> = Mutex::new(None);
-
-fn last_text() -> &'static Mutex<Option<String>> {
-    &LAST_TEXT
+pub fn is_run_active() -> bool {
+    runtime::state().events.run_active.load(Ordering::SeqCst)
 }
 
 /// Record one finished turn against the goal, then let the next settled boundary
@@ -51,7 +38,8 @@ pub fn account_turn_end(output: &str, used_tool: bool) {
     }
     let automatic = dispatch::is_automatic();
     let goal = {
-        let _guard = state::lock();
+        let session = crate::runtime::state();
+        let _guard = state::lock(&session);
         let mut goals = state::read_lenient();
         let Some(mut goal) = goals.active.clone() else {
             return;
@@ -138,7 +126,12 @@ pub fn account_response(value: &serde_json::Value) {
     // One response, one accounting pass: `MessageEnd` is the reliable carrier on
     // every host, `AfterProviderResponse` is an optional duplicate.
     if let Some(timestamp) = value.get("timestamp").and_then(|v| v.as_i64()) {
-        let mut last = LAST_ACCOUNTED.lock().unwrap_or_else(|p| p.into_inner());
+        let session = runtime::state();
+        let mut last = session
+            .events
+            .last_accounted
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
         if *last == Some(timestamp) {
             return;
         }
@@ -150,7 +143,8 @@ pub fn account_response(value: &serde_json::Value) {
     let error = policy::error_message(value).to_string();
 
     let goal = {
-        let _guard = state::lock();
+        let session = crate::runtime::state();
+        let _guard = state::lock(&session);
         let mut goals = state::read_lenient();
         let Some(mut goal) = goals.active.clone() else {
             return;
@@ -198,7 +192,8 @@ pub fn account_response(value: &serde_json::Value) {
 /// A new run started. Any wait is over: whatever woke the goal is now working.
 pub fn wake_goal() {
     let woke = {
-        let _guard = state::lock();
+        let session = crate::runtime::state();
+        let _guard = state::lock(&session);
         let mut goals = state::read_lenient();
         let Some(mut goal) = goals.active.clone() else {
             return;
@@ -226,7 +221,8 @@ pub fn after_compaction() {
         return;
     }
     let goal = {
-        let _guard = state::lock();
+        let session = crate::runtime::state();
+        let _guard = state::lock(&session);
         let goals = state::read_lenient();
         let Some(goal) = goals.active.clone() else {
             return;
@@ -245,7 +241,8 @@ pub fn after_compaction() {
 pub fn before_shutdown() {
     state::flush();
     {
-        let _guard = state::lock();
+        let session = crate::runtime::state();
+        let _guard = state::lock(&session);
         let mut goals = state::read_lenient();
         if let Some(mut goal) = goals.active.clone() {
             goal.stop_clock(state::now_ms());
@@ -282,7 +279,8 @@ pub fn registrations() -> Vec<(EventTag, rpi_plugin_sdk::EventHandlerFn)> {
 
 rpi_plugin_sdk::event_handler! {
 fn on_session_start(_event, data) {
-    let _scope = runtime::enter(runtime::callback(data));
+    let Some(binding) = runtime::event(data) else { return 0; };
+    let _scope = runtime::enter(Some(binding));
     dispatch::ensure_started();
     dispatch::wake();
     0
@@ -291,8 +289,9 @@ fn on_session_start(_event, data) {
 
 rpi_plugin_sdk::event_handler! {
 fn on_before_agent_start(_event, data) {
-    let _scope = runtime::enter(runtime::callback(data));
-    TOOL_ATTEMPTED.store(false, Ordering::SeqCst);
+    let Some(binding) = runtime::event(data) else { return 0; };
+    let _scope = runtime::enter(Some(binding));
+    runtime::state().events.tool_attempted.store(false, Ordering::SeqCst);
     wake_goal();
     0
 }
@@ -300,25 +299,28 @@ fn on_before_agent_start(_event, data) {
 
 rpi_plugin_sdk::event_handler! {
 fn on_agent_start(_event, data) {
-    let _scope = runtime::enter(runtime::callback(data));
-    RUN_ACTIVE.store(true, Ordering::SeqCst);
+    let Some(binding) = runtime::event(data) else { return 0; };
+    let _scope = runtime::enter(Some(binding));
+    runtime::state().events.run_active.store(true, Ordering::SeqCst);
     0
 }
 }
 
 rpi_plugin_sdk::event_handler! {
 fn on_agent_end(_event, data) {
-    let _scope = runtime::enter(runtime::callback(data));
-    RUN_ACTIVE.store(false, Ordering::SeqCst);
+    let Some(binding) = runtime::event(data) else { return 0; };
+    let _scope = runtime::enter(Some(binding));
+    runtime::state().events.run_active.store(false, Ordering::SeqCst);
     0
 }
 }
 
 rpi_plugin_sdk::event_handler! {
 fn on_agent_settled(_event, data) {
-    let _scope = runtime::enter(runtime::callback(data));
-    RUN_ACTIVE.store(false, Ordering::SeqCst);
-    TOOL_ATTEMPTED.store(false, Ordering::SeqCst);
+    let Some(binding) = runtime::event(data) else { return 0; };
+    let _scope = runtime::enter(Some(binding));
+    runtime::state().events.run_active.store(false, Ordering::SeqCst);
+    runtime::state().events.tool_attempted.store(false, Ordering::SeqCst);
     dispatch::ensure_started();
     dispatch::wake();
     0
@@ -327,13 +329,14 @@ fn on_agent_settled(_event, data) {
 
 rpi_plugin_sdk::event_handler! {
 fn on_turn_end(_event, data) {
-    let _scope = runtime::enter(runtime::callback(data));
-    let output = last_text()
+    let Some(binding) = runtime::event(data) else { return 0; };
+    let _scope = runtime::enter(Some(binding));
+    let output = runtime::state().events.last_text
         .lock()
         .unwrap_or_else(|p| p.into_inner())
         .take()
         .unwrap_or_default();
-    let used_tool = TOOL_ATTEMPTED.swap(false, Ordering::SeqCst);
+    let used_tool = runtime::state().events.tool_attempted.swap(false, Ordering::SeqCst);
     account_turn_end(&output, used_tool);
     0
 }
@@ -341,7 +344,8 @@ fn on_turn_end(_event, data) {
 
 rpi_plugin_sdk::event_handler! {
 fn on_after_provider_response(event, data) {
-    let _scope = runtime::enter(runtime::callback(data));
+    let Some(binding) = runtime::event(data) else { return 0; };
+    let _scope = runtime::enter(Some(binding));
     if let Some(text) = event.data_text() {
         if let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) {
             account_response(&value);
@@ -353,27 +357,29 @@ fn on_after_provider_response(event, data) {
 
 rpi_plugin_sdk::event_handler! {
 fn on_tool_call(_event, data) {
-    let _scope = runtime::enter(runtime::callback(data));
-    TOOL_ATTEMPTED.store(true, Ordering::SeqCst);
+    let Some(binding) = runtime::event(data) else { return 0; };
+    let _scope = runtime::enter(Some(binding));
+    runtime::state().events.tool_attempted.store(true, Ordering::SeqCst);
     0
 }
 }
 
 rpi_plugin_sdk::event_handler! {
 fn on_message_end(event, data) {
-    let _scope = runtime::enter(runtime::callback(data));
+    let Some(binding) = runtime::event(data) else { return 0; };
+    let _scope = runtime::enter(Some(binding));
     let Some(raw) = event.message_text() else {
         return 0;
     };
     // The payload is the serialized `AgentMessage` (tagged by `kind`), not plain
     // text: assistant messages carry usage and the stop reason here.
     let Ok(value) = serde_json::from_str::<serde_json::Value>(&raw) else {
-        *last_text().lock().unwrap_or_else(|p| p.into_inner()) = Some(raw);
+        *runtime::state().events.last_text.lock().unwrap_or_else(|p| p.into_inner()) = Some(raw);
         return 0;
     };
     if policy::is_assistant(&value) {
         account_response(&value);
-        *last_text().lock().unwrap_or_else(|p| p.into_inner()) = Some(policy::assistant_text(&value));
+        *runtime::state().events.last_text.lock().unwrap_or_else(|p| p.into_inner()) = Some(policy::assistant_text(&value));
     }
     0
 }
@@ -381,7 +387,8 @@ fn on_message_end(event, data) {
 
 rpi_plugin_sdk::event_handler! {
 fn on_session_compact(_event, data) {
-    let _scope = runtime::enter(runtime::callback(data));
+    let Some(binding) = runtime::event(data) else { return 0; };
+    let _scope = runtime::enter(Some(binding));
     after_compaction();
     0
 }
@@ -389,7 +396,8 @@ fn on_session_compact(_event, data) {
 
 rpi_plugin_sdk::event_handler! {
 fn on_session_replaced(_event, data) {
-    let _scope = runtime::enter(runtime::callback(data));
+    let Some(binding) = runtime::event(data) else { return 0; };
+    let _scope = runtime::enter(Some(binding));
     // A queued write belongs to the branch this process no longer serves.
     state::discard_desired();
     inject::discard();
@@ -399,19 +407,23 @@ fn on_session_replaced(_event, data) {
 
 rpi_plugin_sdk::event_handler! {
 fn on_session_shutdown(_event, data) {
-    let _scope = runtime::enter(runtime::callback(data));
+    let Some(binding) = runtime::event(data) else { return 0; };
+    let _scope = runtime::enter(Some(binding));
     before_shutdown();
     0
 }
 }
 
 /// Register every handler. Returns the first non-zero host return code.
-pub fn register(api: &rpi_plugin_sdk::PluginApi) {
+pub(crate) fn register(api: &rpi_plugin_sdk::PluginApi) -> i32 {
     let Some(register_event) = api.register_event_handler else {
-        return;
+        return 1;
     };
     for (tag, handler) in registrations() {
-        let _ = register_event(tag, handler, api.user_data);
+        let rc = register_event(tag, handler, api.user_data);
+        if rc != 0 {
+            return rc;
+        }
     }
-    dispatch::ensure_started();
+    0
 }

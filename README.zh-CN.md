@@ -364,3 +364,5 @@ python3 .github/scripts/github-release.py plan --repository pi-rust/rpi-extensio
 
 `plan` 命令只打印本次选择与源提交，不会创建标签或 Release。本地预检仍可使用
 `task publish-dry-run`；`task pack` 也会在 `dist/` 下生成可直接安装的平台包。
+
+原生子 Agent 的有界观察与取消通过能力协商的 [core 服务](packages/rpi-extcore/README.md) 和 [HTTP 接口](packages/rpi-httpcore/README.md) 提供。观察记录是易失缓存，不会创建可独立续聊的子会话。

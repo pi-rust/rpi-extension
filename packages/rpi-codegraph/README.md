@@ -39,7 +39,7 @@ The plugin registers:
 ## Parameters and result boundaries
 
 Every tool accepts an optional absolute `projectPath` pointing to an accessible
-directory; omitted or blank uses the process current working directory. The
+directory. Omitted or blank uses the session workspace when available and the process working directory otherwise. The
 schema accepts extra host metadata such as `__rpi`. Optional fields remain
 optional; the plugin forwards parameters without injecting schema defaults or
 clamping numeric values. Actual resolution, normalization, caps and support

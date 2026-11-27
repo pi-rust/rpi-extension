@@ -426,6 +426,9 @@ pub fn record_until_with_level(
     params: RecordParams,
     meter: Option<LevelMeter>,
 ) -> Result<Recording, String> {
+    if stop.load(Ordering::Acquire) {
+        return Err(super::player::CANCELLED.into());
+    }
     let host = cpal::default_host();
     let (device, device_name) = select_input_device(&host)?;
 
@@ -684,29 +687,43 @@ fn load_config() -> serde_json::Value {
         .unwrap_or_else(|| serde_json::json!({}))
 }
 
+// Serialize read-modify-write across registrations in this image. Readers see
+// either whole version because the replacement is made in the same directory.
+static CONFIG_WRITE: Mutex<()> = Mutex::new(());
+
+fn write_config(path: &std::path::Path, config: &serde_json::Value) -> Result<(), String> {
+    let parent = path
+        .parent()
+        .filter(|dir| !dir.as_os_str().is_empty())
+        .unwrap_or_else(|| std::path::Path::new("."));
+    std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    let temp = tempfile::NamedTempFile::new_in(parent).map_err(|e| e.to_string())?;
+    serde_json::to_writer(temp.as_file(), config).map_err(|e| e.to_string())?;
+    temp.persist(path).map_err(|e| e.to_string())?;
+    Ok(())
+}
+
 /// Merge one key into the persisted settings.
 fn save_config(key: &str, value: &str) -> Result<std::path::PathBuf, String> {
+    let _write = CONFIG_WRITE.lock().unwrap();
     let path = config_path().ok_or("no HOME/USERPROFILE to store settings under")?;
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
-    }
     let mut config = load_config();
     config[key] = serde_json::Value::String(value.to_string());
-    std::fs::write(&path, config.to_string()).map_err(|e| e.to_string())?;
+    write_config(&path, &config)?;
     Ok(path)
 }
 
 /// Remove a persisted setting while preserving the other voice settings.
 fn clear_config(key: &str) -> Result<(), String> {
+    let _write = CONFIG_WRITE.lock().unwrap();
     let Some(path) = config_path() else {
         return Ok(());
     };
     let mut config = load_config();
-    if !config.is_object() || config.get(key).is_none() {
-        return Ok(());
+    if config.as_object_mut().unwrap().remove(key).is_some() {
+        write_config(&path, &config)?;
     }
-    config.as_object_mut().unwrap().remove(key);
-    std::fs::write(&path, config.to_string()).map_err(|e| e.to_string())
+    Ok(())
 }
 
 /// The configured input-device selector: the environment variable wins (for a

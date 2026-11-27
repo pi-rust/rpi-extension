@@ -22,15 +22,16 @@ const MAX_ENTRIES: usize = 5_000;
 /// caller wants profiles somewhere else.
 const DIRECTORY_ENV: &str = "RPI_OPTCHAT_STORE_DIR";
 
-/// The store directory for this project.
-pub fn directory() -> PathBuf {
-    if let Some(dir) = std::env::var_os(DIRECTORY_ENV).filter(|dir| !dir.is_empty()) {
-        return PathBuf::from(dir);
+/// An explicit override may be absolute or relative to the session project.
+pub fn directory(project: impl FnOnce() -> Result<PathBuf, String>) -> Result<PathBuf, String> {
+    let override_dir = std::env::var_os(DIRECTORY_ENV)
+        .filter(|dir| !dir.is_empty())
+        .map(PathBuf::from);
+    match override_dir {
+        Some(dir) if dir.is_absolute() => Ok(dir),
+        Some(dir) => Ok(project()?.join(dir)),
+        None => Ok(project()?.join(".rpi").join("optchat")),
     }
-    std::env::current_dir()
-        .unwrap_or_else(|_| PathBuf::from("."))
-        .join(".rpi")
-        .join("optchat")
 }
 
 /// A profile name safe to use as a file name: no separators, no traversal.
@@ -56,20 +57,12 @@ pub fn normalize(name: &str) -> Option<String> {
     Some(out)
 }
 
-pub fn path(profile: &str) -> Option<PathBuf> {
-    path_in(&directory(), profile)
-}
-
-fn path_in(base: &Path, profile: &str) -> Option<PathBuf> {
+pub(crate) fn path_in(base: &Path, profile: &str) -> Option<PathBuf> {
     normalize(profile).map(|name| base.join(format!("{name}.jsonl")))
 }
 
 /// Entries the profile holds, oldest first, bounded and tolerant: a malformed
 /// line is skipped rather than failing the attach.
-pub fn read(profile: &str) -> Result<Vec<Entry>, String> {
-    read_in(&directory(), profile)
-}
-
 pub(crate) fn read_in(base: &Path, profile: &str) -> Result<Vec<Entry>, String> {
     let Some(path) = path_in(base, profile) else {
         return Err(format!("`{profile}` is not a usable profile name"));
@@ -117,11 +110,7 @@ pub(crate) fn read_in(base: &Path, profile: &str) -> Result<Vec<Entry>, String> 
 
 /// Append one entry. Best effort: a memory write must never fail a turn, so the
 /// caller only logs the error.
-pub fn append(profile: &str, entry: &Entry) -> Result<(), String> {
-    append_in(&directory(), profile, entry)
-}
-
-fn append_in(base: &Path, profile: &str, entry: &Entry) -> Result<(), String> {
+pub(crate) fn append_in(base: &Path, profile: &str, entry: &Entry) -> Result<(), String> {
     let Some(path) = path_in(base, profile) else {
         return Err(format!("`{profile}` is not a usable profile name"));
     };
@@ -143,15 +132,11 @@ fn append_in(base: &Path, profile: &str, entry: &Entry) -> Result<(), String> {
     result
 }
 
-/// Append into an explicit base directory; tests only.
-#[cfg(test)]
-pub(crate) fn append_in_for_tests(base: &Path, profile: &str, entry: &Entry) -> Result<(), String> {
-    append_in(base, profile, entry)
-}
-
 /// How many entries a profile holds, for `/optchat status`.
-pub fn count(profile: &str) -> usize {
-    read(profile).map(|entries| entries.len()).unwrap_or(0)
+pub fn count_in(base: &Path, profile: &str) -> usize {
+    read_in(base, profile)
+        .map(|entries| entries.len())
+        .unwrap_or(0)
 }
 
 #[cfg(test)]
