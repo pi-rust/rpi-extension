@@ -44,7 +44,7 @@ exclude = ["tools/rpi-package-smoke", "tools/rpi-abi-test-support"]
 resolver = "2"
 
 [workspace.package]
-version = "0.1.17"
+version = "0.1.18"
 edition = "2021"
 rust-version = "1.88"
 license = "MIT"

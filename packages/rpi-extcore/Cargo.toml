@@ -1,6 +1,6 @@
 [package]
 name = "rpi-extcore"
-version = "0.2.17"
+version = "0.2.18"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
@@ -17,7 +17,7 @@ test-support = []
 [dependencies]
 serde = { workspace = true }
 serde_json.workspace = true
-rpi-mcp-core = { path = "../rpi-mcp-core", version = "0.1.1" }
+rpi-mcp-core = { path = "../rpi-mcp-core", version = "0.1.2" }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time", "process", "io-util", "net", "fs", "signal"] }
 uuid = { version = "1", features = ["v4"] }
 sha2 = "0.10"

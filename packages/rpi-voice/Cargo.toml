@@ -1,6 +1,6 @@
 [package]
 name = "rpi-voice"
-version = "0.3.17"
+version = "0.3.18"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
@@ -34,7 +34,7 @@ crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 rpi-plugin-sdk.workspace = true
-rpi-tts = { path = "../rpi-tts", version = "0.1.17" }
+rpi-tts = { path = "../rpi-tts", version = "0.1.18" }
 serde_json = { workspace = true }
 reqwest = { workspace = true, features = ["multipart"] }
 tokio = { workspace = true, features = ["rt-multi-thread", "sync", "time", "macros"] }
