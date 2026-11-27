@@ -1,4 +1,7 @@
 //! Session-state migration, compaction re-injection, and wait wake-up.
+
+#![forbid(unsafe_code)]
+
 mod support;
 
 use rpi_plugin_sdk::EventTag;

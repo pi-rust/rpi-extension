@@ -27,12 +27,9 @@ use rpi_ai::{
     event_stream::create_assistant_message_event_stream, AssistantMessageEventStream, Context,
     Model, Provider, SimpleStreamOptions, ThinkingLevel,
 };
-use rpi_plugin_sdk::{
-    callbacks::free_string, provider::ProviderContext, PluginApi, StbString, StbStringRef,
-};
+use rpi_plugin_sdk::{callbacks::free_string, provider::ProviderContext, PluginApi, StbStringRef};
 use serde_json::{json, Value};
 use std::{
-    ffi::c_void,
     future::Future,
     sync::{Arc, Mutex},
     time::Instant,
@@ -188,28 +185,23 @@ pub(crate) fn register(api: &PluginApi) -> i32 {
     )
 }
 
-/// Host action callback: `{action, providerId, input}` in, one standard envelope out.
-extern "C" fn oauth_request(
-    request: StbStringRef,
-    out: *mut StbString,
-    user_data: *mut c_void,
-) -> i32 {
-    if out.is_null() {
-        return 2;
+rpi_plugin_sdk::string_handler! {
+    /// Host action callback: `{action, providerId, input}` in, one standard envelope out.
+    fn oauth_request(request, out, user_data) {
+        if !out.is_available() {
+            return 2;
+        }
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            oauth_action(streaming::REGISTRATIONS.state(user_data)?, request)
+        }));
+        let (status, body) = match result {
+            Ok(Ok(value)) => (0, value),
+            Ok(Err(message)) => (1, error_envelope(&message)),
+            Err(_) => (1, error_envelope("Antigravity OAuth panicked")),
+        };
+        out.write(body.to_string());
+        status
     }
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        // SAFETY: the host keeps the request buffer valid until this callback returns.
-        let text = unsafe { request.as_str() }.to_owned();
-        oauth_action(streaming::REGISTRATIONS.state(user_data)?, &text)
-    }));
-    let (status, body) = match result {
-        Ok(Ok(value)) => (0, value),
-        Ok(Err(message)) => (1, error_envelope(&message)),
-        Err(_) => (1, error_envelope("Antigravity OAuth panicked")),
-    };
-    // SAFETY: `out` is the host's exclusive output slot, checked non-null above.
-    unsafe { *out = StbString::from_string(body.to_string()) };
-    status
 }
 
 fn error_envelope(message: &str) -> Value {

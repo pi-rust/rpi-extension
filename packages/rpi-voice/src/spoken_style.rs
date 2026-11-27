@@ -222,7 +222,6 @@ mod tests {
     }
 
     /// Drive the real FFI handler the way the host does.
-    #[allow(unsafe_code)]
     fn call(owner: &std::sync::Arc<crate::RuntimeContext>, event: &str) -> String {
         crate::registration::with_test_callback(owner, || {
             let event_ref = StbStringRef::from_str(event);
@@ -231,14 +230,7 @@ mod tests {
                 on_before_agent_start(event_ref, &mut out, owner.api.user_data),
                 0
             );
-            // SAFETY: the fixture takes ownership of the plugin output.
-            unsafe {
-                rpi_plugin_sdk::callbacks::OwnedString::from_raw(
-                    out,
-                    Some(rpi_plugin_sdk::callbacks::free_string),
-                )
-            }
-            .to_string_lossy()
+            rpi_plugin_sdk::stb_take!(out, Some(rpi_plugin_sdk::callbacks::free_string))
         })
     }
 

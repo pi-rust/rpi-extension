@@ -1,4 +1,4 @@
-#![deny(unsafe_code)]
+#![forbid(unsafe_code)]
 
 use rpi_plugin_sdk::handles::ToolHandles;
 use std::ffi::c_void;
@@ -398,8 +398,7 @@ fn call_codegraph(tool: &str, params: &Value, cancelled: &AtomicBool) -> Result<
 }
 
 fn execute_tool(tool: &'static str, params: StbString, free: Option<FreeStringFn>) -> StepHandle {
-    let text = params.to_string_lossy();
-    params.free_with(free);
+    let text = rpi_plugin_sdk::stb_take!(params, free);
     HANDLES.insert(Drive {
         tool,
         params: serde_json::from_str(&text).unwrap_or(Value::Null),
@@ -572,11 +571,8 @@ fn tool_specs() -> Vec<ToolSpec> {
     ]
 }
 // Each call owns its request, child process, and cancellation handle.
-#[allow(unsafe_code)] // Export the shared-session marker symbol.
-#[no_mangle]
-pub extern "C" fn rpi_plugin_shared_sessions_v1() {}
 
-rpi_plugin_sdk::export_plugin!(|api| {
+rpi_plugin_sdk::export_shared_plugin!(|api| {
     let Some(register) = api.register_tool else {
         return 1;
     };

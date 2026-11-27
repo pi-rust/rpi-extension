@@ -64,16 +64,13 @@ fn get_cli_flag(name: &str) -> Option<Value> {
 
     // The host may have produced `out` even on an error path; reclaim it via the
     // host's free so we don't leak the host allocation.
-    let result_str = if rc == 0 {
-        Some(out.to_string_lossy())
-    } else {
-        None
-    };
-    if let Some(free) = HOST_FREE_STRING.get() {
-        free(out);
+    let free = HOST_FREE_STRING.get().copied();
+    if rc != 0 {
+        rpi_plugin_sdk::stb_drop!(out, free);
+        return None;
     }
-
-    let result: Value = serde_json::from_str(&result_str?).ok()?;
+    let result_str = rpi_plugin_sdk::stb_take!(out, free);
+    let result: Value = serde_json::from_str(&result_str).ok()?;
     result.get("value").cloned()
 }
 
@@ -687,8 +684,7 @@ extern "C" fn execute_server(
     free: Option<FreeStringFn>,
 ) -> StepHandle {
     let _ = tool_call_id;
-    let text = params.to_string_lossy();
-    params.free_with(free);
+    let text = rpi_plugin_sdk::stb_take!(params, free);
     let cancelled = Arc::new(AtomicBool::new(false));
     let (tx, rx) = mpsc::channel();
     thread::spawn(move || {
@@ -718,8 +714,7 @@ extern "C" fn execute_client(
     free: Option<FreeStringFn>,
 ) -> StepHandle {
     let _ = tool_call_id;
-    let text = params.to_string_lossy();
-    params.free_with(free);
+    let text = rpi_plugin_sdk::stb_take!(params, free);
     let cancelled = Arc::new(AtomicBool::new(false));
     let cancelled_clone = Arc::clone(&cancelled);
     let (tx, rx) = mpsc::channel();
@@ -1030,10 +1025,12 @@ mod tests {
     fn registered_schemas_are_documented_and_keep_optional_fields() {
         let schemas = tool_schemas();
         for (schema, expected_name) in schemas.iter().zip(["rpc_server", "rpc_client"]) {
-            assert_eq!(schema.name.to_string_lossy(), expected_name);
-            assert!(!schema.description.to_string_lossy().trim().is_empty());
+            assert_eq!(rpi_plugin_sdk::stb_text!(schema.name), expected_name);
+            assert!(!rpi_plugin_sdk::stb_text!(schema.description)
+                .trim()
+                .is_empty());
             let parameters: Value =
-                serde_json::from_str(&schema.parameters.to_string_lossy()).unwrap();
+                serde_json::from_str(&rpi_plugin_sdk::stb_text!(schema.parameters)).unwrap();
             assert_eq!(parameters["type"], "object");
             // Do not close the object: host-injected optional __rpi must remain accepted.
             assert_ne!(parameters["additionalProperties"], false);
@@ -1062,17 +1059,17 @@ mod tests {
             }
         }
         for schema in schemas {
-            free_string(schema.name);
-            free_string(schema.description);
-            free_string(schema.parameters);
+            rpi_plugin_sdk::stb_drop!(schema.name, Some(free_string));
+            rpi_plugin_sdk::stb_drop!(schema.description, Some(free_string));
+            rpi_plugin_sdk::stb_drop!(schema.parameters, Some(free_string));
         }
     }
 
     #[test]
     fn registered_schemas_keep_defaults_and_limits() {
         let [server, client] = tool_schemas();
-        let s: Value = serde_json::from_str(&server.parameters.to_string_lossy()).unwrap();
-        let c: Value = serde_json::from_str(&client.parameters.to_string_lossy()).unwrap();
+        let s: Value = serde_json::from_str(&rpi_plugin_sdk::stb_text!(server.parameters)).unwrap();
+        let c: Value = serde_json::from_str(&rpi_plugin_sdk::stb_text!(client.parameters)).unwrap();
         let sp = &s["properties"];
         let cp = &c["properties"];
         assert_eq!(sp["bind"]["default"], "127.0.0.1");
@@ -1092,9 +1089,9 @@ mod tests {
             json!(["off", "minimal", "low", "medium", "high", "xhigh", "max"])
         );
         for schema in [server, client] {
-            free_string(schema.name);
-            free_string(schema.description);
-            free_string(schema.parameters);
+            rpi_plugin_sdk::stb_drop!(schema.name, Some(free_string));
+            rpi_plugin_sdk::stb_drop!(schema.description, Some(free_string));
+            rpi_plugin_sdk::stb_drop!(schema.parameters, Some(free_string));
         }
     }
 

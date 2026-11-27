@@ -1,5 +1,8 @@
 //! Turn accounting, token budgets, and provider-response classification through
 //! the real state machine (no live provider).
+
+#![forbid(unsafe_code)]
+
 mod support;
 
 use serde_json::json;

@@ -1,4 +1,4 @@
-#![deny(unsafe_code)]
+#![forbid(unsafe_code)]
 
 use feishu_sdk::core::{noop_logger, Config, FEISHU_BASE_URL, LARK_BASE_URL};
 use feishu_sdk::event::models::MessageEvent;
@@ -35,7 +35,7 @@ mod registration;
 mod sessions;
 mod wecom;
 
-pub use lifecycle::rpi_plugin_register;
+pub use lifecycle::{rpi_plugin_register, rpi_plugin_shared_sessions_v1};
 
 const EVENT_TYPE_MESSAGE: &str = "im.message.receive_v1";
 const MAX_MESSAGE_BYTES: usize = 1_048_576;
@@ -728,8 +728,7 @@ fn invoke_runtime_action(
         &mut output,
         runtime.user_data,
     );
-    let output_text = output.to_string_lossy();
-    (runtime.free_string)(output);
+    let output_text = rpi_plugin_sdk::stb_take!(output, Some(runtime.free_string));
     if result != 0 {
         if let Ok(value) = serde_json::from_str::<Value>(&output_text) {
             if let Some(error) = value.get("error").and_then(Value::as_str) {
@@ -2075,8 +2074,7 @@ fn cli_flag_value(context: &StartupContext, name: &str) -> Result<Value, String>
         &mut output,
         context.user_data,
     );
-    let text = output.to_string_lossy();
-    (context.free_string)(output);
+    let text = rpi_plugin_sdk::stb_take!(output, Some(context.free_string));
     if result != 0 {
         return Err(if text.is_empty() {
             format!("host rejected CLI flag lookup for {name}")
@@ -2165,8 +2163,7 @@ extern "C" fn execute<const SLOT: usize>(
     params: StbString,
     free: Option<FreeStringFn>,
 ) -> StepHandle {
-    let text = params.to_string_lossy();
-    params.free_with(free);
+    let text = rpi_plugin_sdk::stb_take!(params, free);
     HANDLES.insert(Drive {
         registration: registration::tool(SLOT),
         params: serde_json::from_str(&text).unwrap_or(Value::Null),
@@ -2222,11 +2219,6 @@ extern "C" fn destroy(handle: StepHandle) {
 }
 
 use rpi_plugin_sdk::callbacks::free_string;
-
-// Managed servers, reply progress and join handles are owned by the registration.
-#[allow(unsafe_code)] // Export the shared-session marker symbol.
-#[no_mangle]
-pub extern "C" fn rpi_plugin_shared_sessions_v1() {}
 
 fn register(api: &PluginApi, lifecycle: Option<lifecycle::Register>) -> i32 {
     // Feishu uses aws-lc-rs. Install it before either provider creates TLS clients.
@@ -2861,9 +2853,15 @@ mod tests {
     #[test]
     fn registered_tool_schema_documents_actions_and_keeps_optional_fields() {
         let registered = tool_schema();
-        assert_eq!(registered.name.to_string_lossy(), "im_message_server");
-        assert!(!registered.description.to_string_lossy().trim().is_empty());
-        let schema: Value = serde_json::from_str(&registered.parameters.to_string_lossy()).unwrap();
+        assert_eq!(
+            rpi_plugin_sdk::stb_text!(registered.name),
+            "im_message_server"
+        );
+        assert!(!rpi_plugin_sdk::stb_text!(registered.description)
+            .trim()
+            .is_empty());
+        let schema: Value =
+            serde_json::from_str(&rpi_plugin_sdk::stb_text!(registered.parameters)).unwrap();
         assert_eq!(schema["type"], "object");
         // Do not make every property required or reject host-injected __rpi.
         assert!(schema.get("required").is_none());
@@ -2904,9 +2902,9 @@ mod tests {
                 .unwrap()
                 .is_empty());
         }
-        free_string(registered.name);
-        free_string(registered.description);
-        free_string(registered.parameters);
+        rpi_plugin_sdk::stb_take!(registered.name, Some(free_string));
+        rpi_plugin_sdk::stb_take!(registered.description, Some(free_string));
+        rpi_plugin_sdk::stb_take!(registered.parameters, Some(free_string));
     }
 
     #[test]

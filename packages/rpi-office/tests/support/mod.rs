@@ -8,8 +8,8 @@
 use rpi_plugin_sdk::{
     AutocompleteProviderFn, BeforeAgentStartFn, CommandArgumentCompletionFn, CommandHandlerFn,
     EventHandlerFn, EventTag, FreeStringFn, PluginApi, PluginBeginShutdownFn,
-    PluginFinishShutdownFn, RuntimeActionId, StablePluginEvent, StableToolSchema, StbString,
-    StbStringRef, ToolCancelFn, ToolDestroyFn, ToolExecuteFn, ToolPollFn,
+    PluginFinishShutdownFn, RuntimeActionId, StablePluginEvent, StbString, StbStringRef,
+    ToolCancelFn, ToolDestroyFn, ToolExecuteFn, ToolPollFn,
 };
 use serde_json::{json, Value};
 use std::cell::Cell;
@@ -72,41 +72,32 @@ fn host<R>(f: impl FnOnce(&mut Host) -> R) -> R {
     host_for(OWNER.get(), f)
 }
 
-#[allow(unsafe_code)] // the host is the side that dereferences the schema
-extern "C" fn register_tool(
-    schema: *const StableToolSchema,
-    execute: ToolExecuteFn,
-    poll: ToolPollFn,
-    cancel: ToolCancelFn,
-    destroy: ToolDestroyFn,
-    free: FreeStringFn,
-) -> i32 {
-    // SAFETY: this test harness plays the host, so it dereferences the schema
-    // pointer the plugin just handed over. Nothing else here needs `unsafe`:
-    // the strings are copied out with the SDK's own reading macro.
-    let schema = unsafe { &*schema };
-    let name = rpi_plugin_sdk::stb_take!(schema.name, Some(free));
-    let description = rpi_plugin_sdk::stb_take!(schema.description, Some(free));
-    let parameters: Value =
-        serde_json::from_str(&rpi_plugin_sdk::stb_take!(schema.parameters, Some(free)))
-            .expect("valid tool schema");
-    host(|host| {
-        // A real host activates every registered tool by default.
-        host.active.push(name.clone());
-        host.tools.push((
-            name.clone(),
-            description,
-            parameters,
-            RegisteredTool {
-                execute,
-                poll,
-                cancel,
-                destroy,
-            },
-        ));
-    });
-    0
-}
+rpi_plugin_sdk::tool_schema_handler!(
+    register_tool,
+    |schema, execute, (poll, cancel, destroy), free| {
+        let name = rpi_plugin_sdk::stb_take!(schema.name, Some(free));
+        let description = rpi_plugin_sdk::stb_take!(schema.description, Some(free));
+        let parameters: Value =
+            serde_json::from_str(&rpi_plugin_sdk::stb_take!(schema.parameters, Some(free)))
+                .expect("valid tool schema");
+        host(|host| {
+            // A real host activates every registered tool by default.
+            host.active.push(name.clone());
+            host.tools.push((
+                name.clone(),
+                description,
+                parameters,
+                RegisteredTool {
+                    execute,
+                    poll,
+                    cancel,
+                    destroy,
+                },
+            ));
+        });
+        0
+    }
+);
 
 extern "C" fn register_event(
     tag: EventTag,

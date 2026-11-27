@@ -1,13 +1,12 @@
 //! `--webui=<UI>` selects an independent UI adapter. The host and the ACP
 //! implementation remain untouched; the local relay only carries ACP frames.
-#![deny(unsafe_code)]
+#![forbid(unsafe_code)]
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
 mod config;
 mod openwebui;
 mod server;
 
-use rpi_plugin_sdk::callbacks::OwnedString;
 use rpi_plugin_sdk::{
     EventTag, PluginApi, RuntimeActionId, StablePluginEvent, StbString, StbStringRef,
 };
@@ -38,7 +37,6 @@ struct Worker {
 struct Host(PluginApi);
 
 impl Host {
-    #[allow(unsafe_code)] // Adopt the string returned by the host ABI.
     fn action(self, id: RuntimeActionId, args: Value) -> Option<Value> {
         let mut out = StbString::empty();
         let code = (self.0.runtime_action)(
@@ -47,11 +45,11 @@ impl Host {
             &mut out,
             self.0.user_data,
         );
-        // SAFETY: the host transfers the output with its own deallocator.
-        let out = unsafe { OwnedString::from_raw(out, Some(self.0.free_string)) };
         if code == 0 {
-            serde_json::from_str(&out.to_string_lossy()).ok()
+            let body = rpi_plugin_sdk::stb_take!(out, Some(self.0.free_string));
+            serde_json::from_str(&body).ok()
         } else {
+            rpi_plugin_sdk::stb_drop!(out, Some(self.0.free_string));
             None
         }
     }
@@ -253,8 +251,4 @@ fn register(api: &PluginApi) -> i32 {
 
 // Passive registrations share the image. The active stdio owner retains its
 // own callbacks and worker until the host finishes that registration.
-#[allow(unsafe_code)] // Export the shared-session marker symbol.
-#[no_mangle]
-pub extern "C" fn rpi_plugin_shared_sessions_v1() {}
-
-rpi_plugin_sdk::export_plugin!(register);
+rpi_plugin_sdk::export_shared_plugin!(register);

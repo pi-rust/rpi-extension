@@ -1,4 +1,4 @@
-#![deny(unsafe_code)]
+#![forbid(unsafe_code)]
 
 use rpi_plugin_sdk::{EventTag, PluginApi, RuntimeActionId, StbString, StbStringRef};
 use serde_json::{json, Value};
@@ -12,6 +12,7 @@ use std::{
 
 const KEY: &str = "rpi.run-stats";
 mod lifecycle;
+pub use lifecycle::rpi_plugin_shared_sessions_v1;
 
 // The preview host passes the same opaque registration identity to commands
 // and in PluginApi. Event callbacks carry that identity explicitly.
@@ -377,7 +378,7 @@ fn component_action(runtime: &rpi_plugin_sdk::PluginApi, args: Value) -> bool {
         &mut out,
         runtime.user_data,
     );
-    (runtime.free_string)(out);
+    rpi_plugin_sdk::stb_drop!(out, Some(runtime.free_string));
     rc == 0
 }
 fn publish(runtime: &PluginApi, stats: &mut Stats) {
@@ -619,12 +620,6 @@ fn register(api: &PluginApi, cleanup: Option<lifecycle::Register>) -> i32 {
     0
 }
 
-// Matches the Host's optional shared-session ABI export. Keep the standard
-// entrypoint for hosts using the published SDK and isolated library images.
-#[allow(unsafe_code)] // Only the symbol name crosses this additional ABI boundary.
-#[no_mangle]
-pub extern "C" fn rpi_plugin_shared_sessions_v1() {}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -801,6 +796,15 @@ mod tests {
             declare: None,
             register_before_agent_start: None,
             register_oauth_provider: None,
+            register_streaming_provider: None,
+            register_tool_with_wake: None,
+            register_plugin_lifecycle: None,
+            register_tool_prompt: None,
+            register_oauth_provider_cancellable: None,
+            register_tool_result: None,
+            register_autocomplete_provider: None,
+            register_command_completions: None,
+            register_argument_suggester: None,
         }
     }
 
@@ -815,8 +819,11 @@ mod tests {
             ),
             0
         );
-        let response: Value = serde_json::from_str(&out.to_string_lossy()).unwrap();
-        rpi_plugin_sdk::callbacks::free_string(out);
+        let response: Value = serde_json::from_str(&rpi_plugin_sdk::stb_take!(
+            out,
+            Some(rpi_plugin_sdk::callbacks::free_string)
+        ))
+        .unwrap();
         assert_eq!(response["kind"], "message");
         response
     }
@@ -824,20 +831,10 @@ mod tests {
     #[test]
     fn registrations_isolate_commands_events_and_loader_cleanup() {
         use rpi_plugin_sdk::StablePluginEvent;
-        #[repr(C)]
-        struct ExtendedApi {
-            prefix: PluginApi,
-            streaming_and_wake: [usize; 2],
-            cleanup: Option<lifecycle::Register>,
-        }
         let register = |owner| {
-            let mut vtable = ExtendedApi {
-                prefix: api(owner),
-                streaming_and_wake: [0; 2],
-                cleanup: Some(register_cleanup),
-            };
-            vtable.prefix.struct_size = std::mem::size_of::<ExtendedApi>() as u32;
-            lifecycle::rpi_plugin_register(std::ptr::addr_of!(vtable).cast())
+            let mut vtable = api(owner);
+            vtable.register_plugin_lifecycle = Some(register_cleanup);
+            lifecycle::rpi_plugin_register(&vtable)
         };
         thread::scope(|scope| {
             let first = scope.spawn(|| register(1));
@@ -919,8 +916,9 @@ mod tests {
         cleanup(2);
         assert!(REGISTRATIONS.lock().unwrap().is_empty());
 
-        // Pinned SDK prefix alone, with an older host's null command owner.
-        let legacy = api(5);
+        // Simulate an older host with a shorter vtable and a null command owner.
+        let mut legacy = api(5);
+        legacy.struct_size = std::mem::offset_of!(PluginApi, register_streaming_provider) as u32;
         assert_eq!(lifecycle::rpi_plugin_register(&legacy), 0);
         run_command(0, "on");
         assert!(

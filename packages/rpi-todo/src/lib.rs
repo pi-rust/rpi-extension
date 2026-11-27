@@ -1,5 +1,4 @@
-#![deny(unsafe_code)]
-#![allow(clippy::not_unsafe_ptr_arg_deref)]
+#![forbid(unsafe_code)]
 
 mod lifecycle;
 
@@ -126,8 +125,7 @@ impl Registration {
         let input_json = args.to_string();
         let input = StbStringRef::from_str(&input_json);
         let rc = (runtime.runtime_action)(id.into(), input, &mut out, runtime.user_data);
-        let text = out.to_string_lossy();
-        (runtime.free_string)(out);
+        let text = rpi_plugin_sdk::stb_take!(out, Some(runtime.free_string));
         if rc != 0 {
             return Err(RuntimeFailure::Rejected(if text.is_empty() {
                 "runtime action failed".into()
@@ -445,8 +443,7 @@ extern "C" fn execute<const SLOT: usize>(
     params: StbString,
     free: Option<FreeStringFn>,
 ) -> StepHandle {
-    let text = params.to_string_lossy();
-    params.free_with(free);
+    let text = rpi_plugin_sdk::stb_take!(params, free);
     HANDLES.insert(Drive {
         // This tool calls the runtime synchronously in poll. The native driver
         // supplies the invocation context on that thread.
@@ -582,8 +579,9 @@ mod tests {
     fn registered_schema_has_defaults_and_conditional_requirements() {
         // Parse the same schema constructor used by register_tool, not a fixture.
         let tool = tool_schema();
-        assert_eq!(tool.name.to_string_lossy(), TOOL);
-        let schema: Value = serde_json::from_str(&tool.parameters.to_string_lossy()).unwrap();
+        assert_eq!(rpi_plugin_sdk::stb_text!(tool.name), TOOL);
+        let schema: Value =
+            serde_json::from_str(&rpi_plugin_sdk::stb_text!(tool.parameters)).unwrap();
         assert_eq!(schema["type"], "object");
         assert_eq!(schema["additionalProperties"], true);
         assert!(schema["properties"].get("__rpi").is_none());
@@ -882,7 +880,7 @@ mod tests {
         assert_eq!(result.tag, expected);
         // This is a live result from this SDK instance; the SDK macro copies
         // the tagged payload and reclaims its allocation at the ABI boundary.
-        match rpi_plugin_sdk::take_step_result!(result) {
+        match rpi_plugin_sdk::take_step!(result) {
             rpi_plugin_sdk::callbacks::Step::Done(text) => {
                 let response: Value = serde_json::from_str(&text).unwrap();
                 assert_eq!(response["content"][0]["type"], "text");
@@ -911,8 +909,8 @@ mod tests {
             legacy_command(StbStringRef::from_str(""), &mut out, std::ptr::null_mut()),
             0
         );
-        let response: Value = serde_json::from_str(&out.to_string_lossy()).unwrap();
-        free_string(out);
+        let response: Value =
+            serde_json::from_str(&rpi_plugin_sdk::stb_take!(out, Some(free_string))).unwrap();
         assert_eq!(response["kind"], "message");
         assert_eq!(response["error"].is_string(), expect_error);
         if expect_error {
@@ -953,6 +951,15 @@ mod tests {
             declare: None,
             register_before_agent_start: None,
             register_oauth_provider: None,
+            register_streaming_provider: None,
+            register_tool_with_wake: None,
+            register_plugin_lifecycle: None,
+            register_tool_prompt: None,
+            register_oauth_provider_cancellable: None,
+            register_tool_result: None,
+            register_autocomplete_provider: None,
+            register_command_completions: None,
+            register_argument_suggester: None,
         }
     }
 

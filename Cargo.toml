@@ -45,18 +45,16 @@ resolver = "2"
 [workspace.package]
 version = "0.1.17"
 edition = "2021"
-rust-version = "1.78"
+rust-version = "1.88"
 license = "MIT"
 authors = ["BigFish <bigfish1913@gmail.com>"]
 repository = "https://github.com/pi-rust/rpi-extension"
 
 [workspace.dependencies]
-# Use the published SDK so CI and cargo publish build against the same source.
-# The optional smoke tool keeps its local pi-rust dependencies.
-# Pin the SDK used by this workspace: newer 0.3.x releases make raw ABI
-# string operations unsafe and require migrating the plugin callbacks.
-# Cargo.lock alone does not constrain SDK resolution for published extensions.
-rpi-plugin-sdk = { version = "=0.3.20" }
+# Pin the companion SDK revision until these adapters reach crates.io.
+rpi-plugin-sdk = { version = "=0.30.0", git = "https://github.com/bigfish1913/pi-rust", rev = "8d3f184de93ac696ba6cbe8d0798220df69bcf9b" }
+rpi-ai = { version = "=0.30.0", git = "https://github.com/bigfish1913/pi-rust", rev = "8d3f184de93ac696ba6cbe8d0798220df69bcf9b" }
+rpi-extensions = { version = "=0.30.0", git = "https://github.com/bigfish1913/pi-rust", rev = "8d3f184de93ac696ba6cbe8d0798220df69bcf9b" }
 feishu-sdk = { version = "0.1.2", default-features = false, features = ["websocket"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -66,6 +64,9 @@ url = "2"
 wait-timeout = "0.2"
 async-trait = "0.1"
 sha2 = "0.10"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
 
 [profile.release]
 lto = "thin"

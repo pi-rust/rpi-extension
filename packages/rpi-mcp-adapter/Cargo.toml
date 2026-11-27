@@ -31,3 +31,6 @@ serde_json = { workspace = true }
 
 [dev-dependencies]
 rpi-plugin-sdk = { workspace = true, features = ["process"] }
+
+[lints]
+workspace = true

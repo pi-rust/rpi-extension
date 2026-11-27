@@ -5,7 +5,6 @@
 //! `rpi-extcore::service::Service` in its own runtime; that service does not
 //! share live sessions with the Agent session that loaded the plugin.
 use rpi_httpcore::config::{self, Launch};
-use rpi_plugin_sdk::callbacks::OwnedString;
 use rpi_plugin_sdk::{
     EventTag, PluginApi, RuntimeActionId, StablePluginEvent, StbString, StbStringRef,
 };
@@ -37,7 +36,6 @@ struct Worker {
 struct Host(PluginApi);
 
 impl Host {
-    #[allow(unsafe_code)] // Adopt the string returned by the host ABI.
     fn action(self, id: RuntimeActionId, args: Value) -> Option<Value> {
         let mut out = StbString::empty();
         let code = (self.0.runtime_action)(
@@ -46,11 +44,11 @@ impl Host {
             &mut out,
             self.0.user_data,
         );
-        // SAFETY: the host transfers the output with its own deallocator.
-        let out = unsafe { OwnedString::from_raw(out, Some(self.0.free_string)) };
         if code == 0 {
-            serde_json::from_str(&out.to_string_lossy()).ok()
+            let body = rpi_plugin_sdk::stb_take!(out, Some(self.0.free_string));
+            serde_json::from_str(&body).ok()
         } else {
+            rpi_plugin_sdk::stb_drop!(out, Some(self.0.free_string));
             None
         }
     }
@@ -355,11 +353,7 @@ fn register(api: &PluginApi) -> i32 {
 
 // Passive registrations share the image. The active stdio owner retains its
 // own callbacks and worker until the host finishes that registration.
-#[allow(unsafe_code)] // Export the shared-session marker symbol.
-#[no_mangle]
-pub extern "C" fn rpi_plugin_shared_sessions_v1() {}
-
-rpi_plugin_sdk::export_plugin!(register);
+rpi_plugin_sdk::export_shared_plugin!(register);
 
 #[cfg(test)]
 mod tests {
@@ -461,6 +455,12 @@ mod tests {
             register_streaming_provider: None,
             register_tool_with_wake: None,
             register_plugin_lifecycle: Some(fake_lifecycle),
+            register_tool_prompt: None,
+            register_oauth_provider_cancellable: None,
+            register_tool_result: None,
+            register_autocomplete_provider: None,
+            register_command_completions: None,
+            register_argument_suggester: None,
         };
 
         assert_eq!(register(&api), 0);

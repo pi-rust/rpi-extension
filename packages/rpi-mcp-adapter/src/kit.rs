@@ -70,8 +70,7 @@ pub fn execute(
     workers: &Workers,
     builder: impl FnOnce(&Value, &Control) -> Result<Value, String> + Send + 'static,
 ) -> StepHandle {
-    let text = params.to_string_lossy();
-    params.free_with(free_params);
+    let text = rpi_plugin_sdk::stb_take!(params, free_params);
     let mut set = workers.0.lock().unwrap_or_else(|p| p.into_inner());
     if set.stopping {
         return std::ptr::null_mut();
@@ -204,7 +203,7 @@ mod tests {
             let result = poll(handle, None, std::ptr::null_mut());
             if result.tag == rpi_plugin_sdk::StepResultTag::Err {
                 let rpi_plugin_sdk::callbacks::Step::Err(error) =
-                    rpi_plugin_sdk::take_step_result!(result)
+                    rpi_plugin_sdk::take_step!(result)
                 else {
                     unreachable!()
                 };

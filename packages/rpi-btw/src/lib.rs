@@ -1,5 +1,5 @@
 //! `/btw`: command-only, host-managed side questions. No plugin worker threads.
-#![deny(unsafe_code)]
+#![forbid(unsafe_code)]
 // The pinned SDK exports a safe C entrypoint around its internal raw ABI read.
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
@@ -80,8 +80,7 @@ fn raw_call(host: HostFns, args: Value, user_data: *mut c_void) -> Result<Value,
         &mut out,
         user_data,
     );
-    let text = out.to_string_lossy();
-    (host.free)(out);
+    let text = rpi_plugin_sdk::stb_take!(out, Some(host.free));
     let value: Value = serde_json::from_str(&text).map_err(|_| {
         format!(
             "Invalid SideQuestion response (status {rc}). Upgrade rpi to a host supporting /btw."
@@ -176,11 +175,8 @@ fn register(api: &PluginApi) -> i32 {
     )
 }
 // Opt in to sharing the library image across native Host registrations.
-#[allow(unsafe_code)] // The marker only exports a symbol.
-#[no_mangle]
-pub extern "C" fn rpi_plugin_shared_sessions_v1() {}
 
-rpi_plugin_sdk::export_plugin!(register);
+rpi_plugin_sdk::export_shared_plugin!(register);
 
 #[cfg(test)]
 mod tests {

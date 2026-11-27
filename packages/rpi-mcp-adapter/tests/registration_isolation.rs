@@ -7,6 +7,7 @@ use std::{
     ffi::c_void,
     mem::size_of,
     path::{Path, PathBuf},
+    rc::{Rc, Weak},
     thread,
     time::{Duration, Instant},
 };
@@ -19,16 +20,8 @@ type Lifecycle = (
     extern "C" fn(*mut c_void) -> i32,
     *mut c_void,
 );
-type RegisterLifecycle = extern "C" fn(LifecycleBegin, LifecycleFinish, *mut c_void) -> i32;
 type LifecycleBegin = extern "C" fn(*mut c_void);
 type LifecycleFinish = extern "C" fn(*mut c_void) -> i32;
-
-#[repr(C)]
-struct HostApi {
-    prefix: PluginApi,
-    streaming_and_wake_slots: [usize; 2],
-    lifecycle: Option<RegisterLifecycle>,
-}
 
 #[derive(Default)]
 struct Callbacks {
@@ -37,27 +30,20 @@ struct Callbacks {
     lifecycle: Option<Lifecycle>,
 }
 
+type Messages = RefCell<Vec<Value>>;
+
 thread_local! {
+    static MESSAGES: RefCell<BTreeMap<usize, Weak<Messages>>> = RefCell::default();
     static REGISTERING: RefCell<Callbacks> = RefCell::default();
 }
 
-extern "C" fn tool(
-    schema: *const StableToolSchema,
-    exec: ToolExecuteFn,
-    poll: ToolPollFn,
-    cancel: ToolCancelFn,
-    destroy: ToolDestroyFn,
-    free: FreeStringFn,
-) -> i32 {
-    // SAFETY: the plugin passes a live schema with three owned strings.
-    let schema = unsafe { &*schema };
-    let name = schema.name.to_string_lossy();
-    for value in [schema.name, schema.description, schema.parameters] {
-        free(value);
-    }
+rpi_plugin_sdk::tool_schema_handler!(tool, |schema, exec, (poll, cancel, destroy), free| {
+    let name = stb_take!(schema.name, Some(free));
+    stb_drop!(schema.description, Some(free));
+    stb_drop!(schema.parameters, Some(free));
     REGISTERING.with_borrow_mut(|host| host.tools.insert(name, Tool(exec, poll, cancel, destroy)));
     0
-}
+});
 
 extern "C" fn event(tag: EventTag, callback: EventHandlerFn, cookie: *mut c_void) -> i32 {
     REGISTERING.with_borrow_mut(|host| host.events.push((tag, callback, cookie)));
@@ -73,39 +59,46 @@ extern "C" fn lifecycle(
     0
 }
 
-extern "C" fn action(id: u32, args: StbStringRef, out: *mut StbString, owner: *mut c_void) -> i32 {
-    if id == 23 {
-        // SAFETY: this callback runs synchronously with a live output pointer.
-        unsafe {
-            out.write(StbString::from_string(
-                json!({"sessionId":"duplicate"}).to_string(),
-            ))
-        };
-    } else if id == RuntimeActionId::AppendEntry as u32 {
-        // SAFETY: Host keeps the boxed owner at a stable address and calls events serially.
-        let messages = unsafe { &*owner.cast::<RefCell<Vec<Value>>>() };
-        // SAFETY: the plugin lends a JSON string for this callback.
-        let Ok(message) = serde_json::from_str(unsafe { args.as_str() }) else {
-            return 1;
-        };
-        messages.borrow_mut().push(message);
-    } else {
-        return 1;
+rpi_plugin_sdk::string_handler! {
+fn action(id, args, out, owner) {
+    match RuntimeActionId::try_from(id) {
+        Ok(RuntimeActionId::GetExecutionContext) => {
+            out.write(json!({"sessionId":"duplicate"}).to_string());
+        }
+        Ok(RuntimeActionId::AppendEntry) => {
+            let Some(messages) = MESSAGES.with_borrow(|owners| {
+                owners.get(&(owner as usize)).and_then(Weak::upgrade)
+            }) else {
+                return 1;
+            };
+            let Ok(message) = serde_json::from_str(args) else {
+                return 1;
+            };
+            messages.borrow_mut().push(message);
+        }
+        _ => return 1,
     }
     0
+}
 }
 
 struct Host {
     callbacks: Callbacks,
-    messages: Box<RefCell<Vec<Value>>>,
+    messages: Rc<Messages>,
 }
 
 impl Host {
     fn new(lifecycle_tail: bool) -> Self {
-        let messages = Box::<RefCell<Vec<Value>>>::default();
-        let prefix = PluginApi {
+        let messages = Rc::<Messages>::default();
+        let owner = Rc::as_ptr(&messages);
+        MESSAGES.with_borrow_mut(|owners| owners.insert(owner as usize, Rc::downgrade(&messages)));
+        let api = PluginApi {
             abi_version: RPI_PLUGIN_ABI_VERSION_UNIFIED,
-            struct_size: size_of::<PluginApi>() as u32,
+            struct_size: if lifecycle_tail {
+                size_of::<PluginApi>() as u32
+            } else {
+                std::mem::offset_of!(PluginApi, register_streaming_provider) as u32
+            },
             free_string: callbacks::free_string,
             register_tool: Some(tool),
             register_command: None,
@@ -119,24 +112,21 @@ impl Host {
             register_resources_discover: None,
             runtime_action: action,
             dispatch_event: None,
-            user_data: std::ptr::from_ref(messages.as_ref()).cast_mut().cast(),
+            user_data: owner.cast_mut().cast(),
             declare: None,
             register_before_agent_start: None,
             register_oauth_provider: None,
+            register_streaming_provider: None,
+            register_tool_with_wake: None,
+            register_plugin_lifecycle: lifecycle_tail.then_some(lifecycle),
+            register_tool_prompt: None,
+            register_oauth_provider_cancellable: None,
+            register_tool_result: None,
+            register_autocomplete_provider: None,
+            register_command_completions: None,
+            register_argument_suggester: None,
         };
-        let rc = if lifecycle_tail {
-            let api = HostApi {
-                prefix: PluginApi {
-                    struct_size: size_of::<HostApi>() as u32,
-                    ..prefix
-                },
-                streaming_and_wake_slots: [0; 2],
-                lifecycle: Some(lifecycle),
-            };
-            rpi_plugin_register(std::ptr::from_ref(&api).cast())
-        } else {
-            rpi_plugin_register(&prefix)
-        };
+        let rc = rpi_plugin_register(&api);
         assert_eq!(rc, 0);
         let callbacks = REGISTERING.with_borrow_mut(std::mem::take);
         assert_eq!(callbacks.lifecycle.is_some(), lifecycle_tail);
@@ -201,6 +191,7 @@ impl Drop for Host {
     fn drop(&mut self) {
         self.event(EventTag::SessionShutdown);
         self.finish();
+        MESSAGES.with_borrow_mut(|owners| owners.remove(&(Rc::as_ptr(&self.messages) as usize)));
     }
 }
 
@@ -209,7 +200,7 @@ impl Step {
     fn result(&self) -> Result<Value, String> {
         let start = Instant::now();
         loop {
-            match take_step_result!((self.0 .1)(self.1, None, std::ptr::null_mut())) {
+            match take_step!((self.0 .1)(self.1, None, std::ptr::null_mut())) {
                 callbacks::Step::Done(value) => return Ok(serde_json::from_str(&value).unwrap()),
                 callbacks::Step::Err(error) => return Err(error),
                 _ => {}

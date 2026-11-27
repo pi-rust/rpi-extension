@@ -34,8 +34,8 @@ fn scripted(replies: Vec<Result<Value, ActionError>>) -> (Box<Action>, Arc<Mutex
 fn registered_schema_is_valid_json_with_only_model_fields_and_task_required() {
     // This is the builder passed to register_tool, not a duplicate schema fixture.
     let registered = delegate_schema();
-    assert_eq!(registered.name.to_string_lossy(), "delegate_task");
-    let description = registered.description.to_string_lossy();
+    assert_eq!(rpi_plugin_sdk::stb_text!(registered.name), "delegate_task");
+    let description = rpi_plugin_sdk::stb_text!(registered.description);
     for guidance in [
         "host-managed in-memory",
         "not a subagent subprocess",
@@ -48,7 +48,8 @@ fn registered_schema_is_valid_json_with_only_model_fields_and_task_required() {
             "missing guidance: {guidance}"
         );
     }
-    let parameters: Value = serde_json::from_str(&registered.parameters.to_string_lossy()).unwrap();
+    let parameters: Value =
+        serde_json::from_str(&rpi_plugin_sdk::stb_text!(registered.parameters)).unwrap();
     assert_eq!(parameters["type"], "object");
     assert_eq!(parameters["required"], json!(["task"]));
     assert_eq!(parameters["additionalProperties"], true);
@@ -79,7 +80,8 @@ fn registered_schema_is_valid_json_with_only_model_fields_and_task_required() {
 #[test]
 fn registered_schema_defaults_match_runtime_and_budgets_are_normalized_not_rejected() {
     let registered = delegate_schema();
-    let parameters: Value = serde_json::from_str(&registered.parameters.to_string_lossy()).unwrap();
+    let parameters: Value =
+        serde_json::from_str(&rpi_plugin_sdk::stb_text!(registered.parameters)).unwrap();
     let defaults = request();
     let properties = &parameters["properties"];
     assert_eq!(properties["role"]["default"], defaults.role);
@@ -148,7 +150,8 @@ fn operator_can_disable_the_turn_guard_even_for_cached_model_arguments() {
         max_turns: Some(0),
         ..Default::default()
     });
-    let parameters: Value = serde_json::from_str(&registered.parameters.to_string_lossy()).unwrap();
+    let parameters: Value =
+        serde_json::from_str(&rpi_plugin_sdk::stb_text!(registered.parameters)).unwrap();
     assert_eq!(parameters["properties"]["maxTurns"]["enum"], json!([0]));
     assert_eq!(parameters["properties"]["timeoutSeconds"]["default"], 300);
 }
@@ -167,11 +170,9 @@ fn timeout_policy_is_independent_and_overrides_cached_model_arguments() {
         let request = parse_request_with_budget_policy(&input, policy).unwrap();
         assert_eq!((request.max_turns, request.timeout_seconds), (0, 900));
     }
-    let parameters: Value = serde_json::from_str(
-        &delegate_schema_with_budget_policy(policy)
-            .parameters
-            .to_string_lossy(),
-    )
+    let parameters: Value = serde_json::from_str(&rpi_plugin_sdk::stb_text!(
+        delegate_schema_with_budget_policy(policy).parameters
+    ))
     .unwrap();
     assert_eq!(
         parameters["properties"]["timeoutSeconds"]["enum"],
@@ -555,8 +556,8 @@ thread_local! {
 }
 
 extern "C" fn collect_progress(partial: StbString, _: *mut std::ffi::c_void) {
-    let text = partial.to_string_lossy();
-    plugin_free_string(partial);
+    let text = rpi_plugin_sdk::stb_text!(partial);
+    rpi_plugin_sdk::stb_drop!(partial, Some(plugin_free_string));
     PROGRESS.with(|progress| progress.borrow_mut().push(text));
 }
 

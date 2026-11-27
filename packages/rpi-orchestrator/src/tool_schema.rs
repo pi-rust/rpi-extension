@@ -71,9 +71,9 @@ mod tests {
 
     fn registered(name: &str) -> Value {
         let schema = tool_schema(name);
-        assert_eq!(schema.name.to_string_lossy(), name);
-        assert!(!schema.description.to_string_lossy().is_empty());
-        serde_json::from_str(&schema.parameters.to_string_lossy()).unwrap()
+        assert_eq!(rpi_plugin_sdk::stb_text!(schema.name), name);
+        assert!(!rpi_plugin_sdk::stb_text!(schema.description).is_empty());
+        serde_json::from_str(&rpi_plugin_sdk::stb_text!(schema.parameters)).unwrap()
     }
 
     #[test]

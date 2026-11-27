@@ -1,4 +1,4 @@
-#![deny(unsafe_code)]
+#![forbid(unsafe_code)]
 
 use rpi_plugin_sdk::handles::ToolHandles;
 use rpi_plugin_sdk::{
@@ -372,8 +372,7 @@ extern "C" fn execute(
     params: StbString,
     free: Option<FreeStringFn>,
 ) -> StepHandle {
-    let t = params.to_string_lossy();
-    params.free_with(free);
+    let t = rpi_plugin_sdk::stb_take!(params, free);
     HANDLES.insert(Drive {
         params: serde_json::from_str(&t).unwrap_or(Value::Null),
         done: false,
@@ -481,11 +480,8 @@ fn tool_schema() -> StableToolSchema {
 }
 
 // Each call owns its query, HTTP work, and cancellation handle.
-#[allow(unsafe_code)] // Export the shared-session marker symbol.
-#[no_mangle]
-pub extern "C" fn rpi_plugin_shared_sessions_v1() {}
 
-rpi_plugin_sdk::export_plugin!(|api| {
+rpi_plugin_sdk::export_shared_plugin!(|api| {
     let Some(register) = api.register_tool else {
         return 1;
     };
@@ -528,8 +524,8 @@ mod tests {
     fn registered_schema_contract() {
         // Inspect the same builder used by register_tool, not a reconstructed schema.
         let schema = tool_schema();
-        assert_eq!(schema.name.to_string_lossy(), "websearch");
-        let description = schema.description.to_string_lossy();
+        assert_eq!(rpi_plugin_sdk::stb_text!(schema.name), "websearch");
+        let description = rpi_plugin_sdk::stb_text!(schema.description);
         for guidance in [
             "untrusted",
             "verify",
@@ -542,7 +538,8 @@ mod tests {
                 "missing guidance: {guidance}"
             );
         }
-        let params: Value = serde_json::from_str(&schema.parameters.to_string_lossy()).unwrap();
+        let params: Value =
+            serde_json::from_str(&rpi_plugin_sdk::stb_text!(schema.parameters)).unwrap();
         assert_eq!(params["type"], "object");
         assert_eq!(params["required"], json!(["query"]));
         assert_eq!(params["additionalProperties"], true); // Allows host __rpi metadata.

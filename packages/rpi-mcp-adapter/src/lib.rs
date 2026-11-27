@@ -1,4 +1,4 @@
-#![deny(unsafe_code)]
+#![forbid(unsafe_code)]
 
 use rpi_mcp_core::{config, connection, control, http, transport};
 mod jsonrpc;
@@ -150,7 +150,7 @@ macro_rules! tool_entry {
             free: Option<rpi_plugin_sdk::FreeStringFn>,
         ) -> rpi_plugin_sdk::StepHandle {
             let Some(registration) = registration::for_tool(SLOT) else {
-                params.free_with(free);
+                rpi_plugin_sdk::stb_drop!(params, free);
                 return std::ptr::null_mut();
             };
             let worker_registration = registration.clone();

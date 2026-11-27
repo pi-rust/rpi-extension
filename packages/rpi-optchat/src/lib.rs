@@ -18,9 +18,8 @@
 //! with a discarded branch, and reloads with the session. No project file, no
 //! background worker, no model call: summary lines are extractive (see
 //! `memory.rs`).
-#![deny(unsafe_code)]
+#![forbid(unsafe_code)]
 // The pinned SDK exports safe C entrypoints around its internal raw ABI reads.
-#![allow(clippy::not_unsafe_ptr_arg_deref)]
 
 mod compact;
 mod import;
@@ -121,8 +120,7 @@ fn call_action(id: u32, args: Value) -> Result<Value, String> {
         &mut output,
         runtime.user_data,
     );
-    let text = output.to_string_lossy();
-    (runtime.free_string)(output);
+    let text = rpi_plugin_sdk::stb_take!(output, Some(runtime.free_string));
     if rc != 0 {
         return Err(if text.trim().is_empty() {
             format!("runtime action {id} failed")
@@ -1034,8 +1032,7 @@ struct Drive {
 }
 
 fn submit<const SLOT: usize>(op: Op, params: StbString, free: Option<FreeStringFn>) -> StepHandle {
-    let text = params.to_string_lossy();
-    params.free_with(free);
+    let text = rpi_plugin_sdk::stb_take!(params, free);
     let Some(registration) = runtime::tool::<SLOT>() else {
         return std::ptr::null_mut();
     };
@@ -1889,8 +1886,7 @@ mod tests {
                 &mut out,
                 std::ptr::null_mut(),
             );
-            let text = out.to_string_lossy();
-            free_string(out);
+            let text = rpi_plugin_sdk::stb_take!(out, Some(free_string));
             (rc, text)
         };
         for custom_type in [
@@ -1952,8 +1948,7 @@ mod tests {
             ),
             0
         );
-        let rendered = out.to_string_lossy();
-        free_string(out);
+        let rendered = rpi_plugin_sdk::stb_take!(out, Some(free_string));
         assert_eq!(
             serde_json::from_str::<Value>(&rendered).unwrap(),
             json!({"display": false})
@@ -1963,9 +1958,9 @@ mod tests {
     #[test]
     fn tool_schemas_advertise_canonical_arguments_without_host_context() {
         let zoom = zoom_schema();
-        assert_eq!(zoom.name.to_string_lossy(), "zoom");
-        assert!(zoom.description.to_string_lossy().contains("zoom(id, n)"));
-        let params: Value = serde_json::from_str(&zoom.parameters.to_string_lossy())
+        assert_eq!(rpi_plugin_sdk::stb_text!(zoom.name), "zoom");
+        assert!(rpi_plugin_sdk::stb_text!(zoom.description).contains("zoom(id, n)"));
+        let params: Value = serde_json::from_str(&rpi_plugin_sdk::stb_text!(zoom.parameters))
             .expect("zoom parameters are JSON");
         assert_eq!(params["type"], "object");
         assert_eq!(params["additionalProperties"], Value::Bool(true));
@@ -1977,8 +1972,8 @@ mod tests {
         assert!(!params.to_string().contains("__rpi"));
 
         let search = search_schema();
-        assert_eq!(search.name.to_string_lossy(), "search");
-        let params: Value = serde_json::from_str(&search.parameters.to_string_lossy())
+        assert_eq!(rpi_plugin_sdk::stb_text!(search.name), "search");
+        let params: Value = serde_json::from_str(&rpi_plugin_sdk::stb_text!(search.parameters))
             .expect("search parameters are JSON");
         assert_eq!(params["required"], json!(["text"]));
         assert_eq!(params["properties"]["text"]["minLength"], 1);

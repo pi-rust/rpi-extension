@@ -592,7 +592,6 @@ mod tests {
         assert_eq!(mood_from_status("unrelated"), None);
     }
     #[test]
-    #[allow(unsafe_code)]
     fn mascot_commands_and_animation_stay_with_the_registration() {
         fn call(owner: &Arc<RuntimeContext>, args: &str) {
             registration::with_test_callback(owner, || {
@@ -606,8 +605,7 @@ mod tests {
                     ),
                     0
                 );
-                // SAFETY: the fixture takes ownership of the command output.
-                unsafe { rpi_plugin_sdk::callbacks::free_string(out) };
+                rpi_plugin_sdk::stb_drop!(out, Some(rpi_plugin_sdk::callbacks::free_string));
             });
         }
 

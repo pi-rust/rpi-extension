@@ -210,8 +210,7 @@ fn call_runtime(id: RuntimeActionId, args: Value) -> Result<Value, RuntimeFailur
     let input_json = args.to_string();
     let input = StbStringRef::from_str(&input_json);
     let rc = (runtime.runtime_action)(id.into(), input, &mut out, runtime.user_data);
-    let text = out.to_string_lossy();
-    (runtime.free_string)(out);
+    let text = rpi_plugin_sdk::stb_take!(out, Some(runtime.free_string));
     if rc != 0 {
         return Err(if text.is_empty() {
             "runtime action failed".into()
@@ -1211,8 +1210,7 @@ struct Drive {
 }
 
 fn take_params(params: StbString, free: Option<FreeStringFn>) -> Value {
-    let text = params.to_string_lossy();
-    params.free_with(free);
+    let text = rpi_plugin_sdk::stb_take!(params, free);
     serde_json::from_str(&text).unwrap_or(Value::Null)
 }
 
@@ -1659,6 +1657,15 @@ mod tests {
             declare: None,
             register_before_agent_start: None,
             register_oauth_provider: None,
+            register_streaming_provider: None,
+            register_tool_with_wake: None,
+            register_plugin_lifecycle: None,
+            register_tool_prompt: None,
+            register_oauth_provider_cancellable: None,
+            register_tool_result: None,
+            register_autocomplete_provider: None,
+            register_command_completions: None,
+            register_argument_suggester: None,
         });
     }
 
@@ -2405,8 +2412,8 @@ mod tests {
             std::ptr::null_mut(),
         );
         assert_eq!(rc, 0, "/jobs handler failed for {args:?}");
-        let text = output.to_string_lossy();
-        free_string(output);
+        let text = rpi_plugin_sdk::stb_text!(output);
+        rpi_plugin_sdk::stb_drop!(output, Some(free_string));
         let parsed: Value = serde_json::from_str(&text).expect("/jobs returned non-JSON");
         parsed["text"]
             .as_str()

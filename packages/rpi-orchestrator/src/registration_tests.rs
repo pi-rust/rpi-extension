@@ -1,6 +1,6 @@
 use super::*;
-use crate::lifecycle::{self, Register};
-use rpi_plugin_sdk::{callbacks::Step, PluginApi, StableToolSchema};
+use crate::lifecycle;
+use rpi_plugin_sdk::{callbacks::Step, PluginApi};
 use serde_json::json;
 use std::cell::RefCell;
 use std::sync::atomic::AtomicBool;
@@ -33,20 +33,10 @@ extern "C" fn lifecycle(
     0
 }
 
-#[allow(unsafe_code)]
-extern "C" fn register_tool(
-    schema: *const StableToolSchema,
-    _: ToolExecuteFn,
-    _: ToolPollFn,
-    _: ToolCancelFn,
-    _: ToolDestroyFn,
-    free: FreeStringFn,
-) -> i32 {
-    // SAFETY: the plugin provides a live schema and transfers its strings.
-    let schema = unsafe { &*schema };
-    free(schema.name);
-    free(schema.description);
-    free(schema.parameters);
+rpi_plugin_sdk::tool_schema_handler!(register_tool, |schema, _execute, _, free| {
+    rpi_plugin_sdk::stb_drop!(schema.name, Some(free));
+    rpi_plugin_sdk::stb_drop!(schema.description, Some(free));
+    rpi_plugin_sdk::stb_drop!(schema.parameters, Some(free));
     LOADER.with_borrow_mut(|loader| {
         loader.tool_count += 1;
         if loader.reject_tool == Some(loader.tool_count) {
@@ -55,18 +45,11 @@ extern "C" fn register_tool(
             0
         }
     })
-}
+});
 
 extern "C" fn runtime_action(_: u32, _: StbStringRef, _: *mut StbString, data: *mut c_void) -> i32 {
     INVOCATION.store(data as usize, Ordering::Release);
     1
-}
-
-#[repr(C)]
-struct HostApi {
-    prefix: PluginApi,
-    appended: [usize; 2],
-    lifecycle: Option<Register>,
 }
 
 fn load(owner: usize, reject_tool: Option<usize>) -> (i32, Hooks) {
@@ -76,32 +59,37 @@ fn load(owner: usize, reject_tool: Option<usize>) -> (i32, Hooks) {
             ..Loader::default()
         }
     });
-    let api = HostApi {
-        prefix: PluginApi {
-            abi_version: rpi_plugin_sdk::RPI_PLUGIN_ABI_VERSION_UNIFIED,
-            struct_size: std::mem::size_of::<HostApi>() as u32,
-            free_string: plugin_free_string,
-            register_tool: Some(register_tool),
-            register_command: None,
-            register_shortcut: None,
-            register_flag: None,
-            register_provider: None,
-            register_message_renderer: None,
-            register_markdown_transformer: None,
-            register_entry_renderer: None,
-            register_event_handler: None,
-            register_resources_discover: None,
-            runtime_action,
-            dispatch_event: None,
-            user_data: owner as *mut c_void,
-            declare: None,
-            register_before_agent_start: None,
-            register_oauth_provider: None,
-        },
-        appended: [0; 2],
-        lifecycle: Some(lifecycle),
+    let api = PluginApi {
+        abi_version: rpi_plugin_sdk::RPI_PLUGIN_ABI_VERSION_UNIFIED,
+        struct_size: std::mem::size_of::<PluginApi>() as u32,
+        free_string: plugin_free_string,
+        register_tool: Some(register_tool),
+        register_command: None,
+        register_shortcut: None,
+        register_flag: None,
+        register_provider: None,
+        register_message_renderer: None,
+        register_markdown_transformer: None,
+        register_entry_renderer: None,
+        register_event_handler: None,
+        register_resources_discover: None,
+        runtime_action,
+        dispatch_event: None,
+        user_data: owner as *mut c_void,
+        declare: None,
+        register_before_agent_start: None,
+        register_oauth_provider: None,
+        register_streaming_provider: None,
+        register_tool_with_wake: None,
+        register_plugin_lifecycle: Some(lifecycle),
+        register_tool_prompt: None,
+        register_oauth_provider_cancellable: None,
+        register_tool_result: None,
+        register_autocomplete_provider: None,
+        register_command_completions: None,
+        register_argument_suggester: None,
     };
-    let status = lifecycle::rpi_plugin_register(std::ptr::addr_of!(api).cast());
+    let status = lifecycle::rpi_plugin_register(&api);
     (
         status,
         LOADER.with_borrow_mut(|loader| loader.hooks.take().unwrap()),
@@ -118,8 +106,7 @@ fn run_plan(slot: usize, params: Value) -> String {
     assert!(!handle.is_null());
     let deadline = Instant::now() + Duration::from_secs(3);
     loop {
-        let step =
-            rpi_plugin_sdk::take_step_result!((callbacks.poll)(handle, None, std::ptr::null_mut()));
+        let step = rpi_plugin_sdk::take_step!((callbacks.poll)(handle, None, std::ptr::null_mut()));
         match step {
             Step::Pending(_) if Instant::now() < deadline => {
                 std::thread::sleep(Duration::from_millis(1))

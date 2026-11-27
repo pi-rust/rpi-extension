@@ -43,8 +43,7 @@ impl Registration {
             &mut out,
             self.api.user_data,
         );
-        let text = out.to_string_lossy();
-        (self.api.free_string)(out);
+        let text = rpi_plugin_sdk::stb_take!(out, Some(self.api.free_string));
         if rc != 0 {
             return Err(if text.is_empty() {
                 "runtime action failed".into()

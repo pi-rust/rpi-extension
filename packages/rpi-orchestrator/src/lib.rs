@@ -1,4 +1,4 @@
-#![deny(unsafe_code)]
+#![forbid(unsafe_code)]
 
 //! `rpi-orchestrator` — DAG subagent orchestration for the rpi Rust agent.
 //!

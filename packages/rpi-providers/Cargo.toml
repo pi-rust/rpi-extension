@@ -26,8 +26,8 @@ crate-type = ["cdylib", "rlib"]
 # Keep provider transport and lifecycle handling on the same published SDK.
 # Unrelated extensions retain their independently pinned SDK versions.
 [dependencies]
-rpi-ai = { version = "=0.8.3", features = ["providers"] }
-rpi-plugin-sdk = { version = "=0.8.3", features = ["provider"] }
+rpi-ai = { workspace = true, features = ["providers"] }
+rpi-plugin-sdk = { workspace = true, features = ["provider"] }
 async-trait.workspace = true
 serde.workspace = true
 # Ordered JSON maps: the Antigravity transcript and metadata rules depend on insertion order.
@@ -46,6 +46,9 @@ tokio-util = "0.7"
 url = "2"
 
 [dev-dependencies]
-rpi-extensions = { version = "=0.8.3" }
+rpi-extensions.workspace = true
 tokio = { workspace = true, features = ["macros", "net", "io-util"] }
 tempfile = "3"
+
+[lints]
+workspace = true

@@ -11,7 +11,7 @@
 //! user runs `/office connect` (or passes `--office-bridge-autostart`), so
 //! several sessions can coexist without silently fighting over 38617.
 //!
-//! Requires `rpi-plugin-sdk` 0.26 (ABI 4). The host may expose a shorter vtable
+//! Uses the workspace SDK (ABI 4). The host may expose a shorter vtable
 //! (for example `rpi 0.24.0`'s 192-byte layout); the SDK zero-fills appended
 //! slots, so the plugin degrades instead of failing: no `client-abort`, no
 //! prompt snippets, no reload-safe join, and no editor/command completions.
@@ -19,10 +19,10 @@
 // Every ABI shape this extension touches goes through an SDK macro
 // (`event_handler!`, `string_handler!`, `execute_handler!`, `call_action!`,
 // `stb_text!`), which keeps the raw-pointer contract inside the SDK. The
-// entrypoint emitted by `export_plugin!` takes a raw
+// entrypoint emitted by `export_shared_plugin!` takes a raw
 // `*const PluginApi` by ABI definition, which is why the pointer-deref lint is
 // allowed here; the dereference itself happens inside the SDK's macro.
-#![deny(unsafe_code)]
+#![forbid(unsafe_code)]
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
 pub mod active_tools;
@@ -1291,11 +1291,7 @@ fn register_callbacks(registration: &Registration) -> i32 {
 }
 
 // The loader probes this fixed ABI symbol on this specific library image.
-#[allow(unsafe_code)]
-#[no_mangle]
-pub extern "C" fn rpi_plugin_shared_sessions_v1() {}
-
-rpi_plugin_sdk::export_plugin!(register);
+rpi_plugin_sdk::export_shared_plugin!(register);
 
 #[cfg(test)]
 mod tests {

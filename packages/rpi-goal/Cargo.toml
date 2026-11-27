@@ -28,3 +28,6 @@ crate-type = ["cdylib", "rlib"]
 rpi-plugin-sdk = { workspace = true }
 serde = { version = "1", features = ["derive"] }
 serde_json = { workspace = true }
+
+[lints]
+workspace = true

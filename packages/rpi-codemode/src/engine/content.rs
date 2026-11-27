@@ -74,7 +74,7 @@ pub(super) fn blocks(mut value: Value) -> Result<Vec<Value>, String> {
 }
 
 fn base64(data: &[u8]) -> bool {
-    if data.is_empty() || data.len() % 4 != 0 {
+    if data.is_empty() || !data.len().is_multiple_of(4) {
         return false;
     }
     let padding = data.iter().rev().take_while(|&&b| b == b'=').count();

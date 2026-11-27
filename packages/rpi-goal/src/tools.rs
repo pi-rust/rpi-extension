@@ -204,8 +204,7 @@ macro_rules! drive {
             params: StbString,
             free: Option<FreeStringFn>,
         ) -> StepHandle {
-            let text = params.to_string_lossy();
-            params.free_with(free);
+            let text = rpi_plugin_sdk::stb_take!(params, free);
             let params = serde_json::from_str(&text).unwrap_or(Value::Null);
             $handles.insert(Drive {
                 binding: runtime::tool::<SLOT>(&params),
@@ -463,13 +462,13 @@ mod tests {
     use super::*;
 
     fn parameters(schema: StableToolSchema) -> Value {
-        serde_json::from_str(&schema.parameters.to_string_lossy()).unwrap()
+        serde_json::from_str(&rpi_plugin_sdk::stb_text!(schema.parameters)).unwrap()
     }
 
     #[test]
     fn every_tool_schema_is_valid_and_conditional() {
         let goal = goal_schema();
-        assert_eq!(goal.name.to_string_lossy(), "goal");
+        assert_eq!(rpi_plugin_sdk::stb_text!(goal.name), "goal");
         let params = parameters(goal);
         assert_eq!(params["properties"]["action"]["default"], "show");
         assert_eq!(params["additionalProperties"], true);
@@ -477,13 +476,13 @@ mod tests {
         assert_eq!(params["properties"]["title"]["pattern"], "\\S");
 
         let complete = complete_schema();
-        assert_eq!(complete.name.to_string_lossy(), "goal_complete");
+        assert_eq!(rpi_plugin_sdk::stb_text!(complete.name), "goal_complete");
         let params = parameters(complete);
         assert_eq!(params["required"], json!(["goal_id", "summary"]));
         assert_eq!(params["properties"]["summary"]["maxLength"], 4000);
 
         let blocked = blocked_schema();
-        assert_eq!(blocked.name.to_string_lossy(), "goal_blocked");
+        assert_eq!(rpi_plugin_sdk::stb_text!(blocked.name), "goal_blocked");
         let params = parameters(blocked);
         assert_eq!(
             params["required"],
@@ -492,7 +491,7 @@ mod tests {
         assert_eq!(params["properties"]["repeated_turns"]["minimum"], 3);
 
         let wait = wait_schema();
-        assert_eq!(wait.name.to_string_lossy(), "goal_wait");
+        assert_eq!(rpi_plugin_sdk::stb_text!(wait.name), "goal_wait");
         let params = parameters(wait);
         assert_eq!(params["required"], json!(["goal_id", "reason"]));
         assert_eq!(

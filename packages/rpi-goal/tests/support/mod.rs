@@ -7,9 +7,8 @@
 #![allow(dead_code)]
 
 use rpi_plugin_sdk::{
-    CommandHandlerFn, EventHandlerFn, EventTag, FreeStringFn, PluginApi, StablePluginEvent,
-    StableToolSchema, StbString, StbStringRef, ToolCancelFn, ToolDestroyFn, ToolExecuteFn,
-    ToolPollFn,
+    CommandHandlerFn, EventHandlerFn, EventTag, PluginApi, StablePluginEvent, StbString,
+    StbStringRef, ToolCancelFn, ToolDestroyFn, ToolExecuteFn, ToolPollFn,
 };
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
@@ -235,30 +234,24 @@ extern "C" fn register_event(tag: EventTag, handler: EventHandlerFn, _: *mut c_v
     0
 }
 
-extern "C" fn register_tool(
-    schema: *const StableToolSchema,
-    execute: ToolExecuteFn,
-    poll: ToolPollFn,
-    cancel: ToolCancelFn,
-    destroy: ToolDestroyFn,
-    _: FreeStringFn,
-) -> i32 {
-    // SAFETY: the host owns the schema for the duration of this call and the
-    // plugin keeps the name alive in its own registration; copying the name here
-    // is an ordinary read.
-    let schema = unsafe { &*schema };
-    let name = schema.name.to_string_lossy();
-    TOOLS.lock().unwrap_or_else(|p| p.into_inner()).insert(
-        name,
-        ToolFns {
-            execute,
-            poll,
-            cancel,
-            destroy,
-        },
-    );
-    0
-}
+rpi_plugin_sdk::tool_schema_handler!(
+    register_tool,
+    |schema, execute, (poll, cancel, destroy), free| {
+        let name = rpi_plugin_sdk::stb_take!(schema.name, Some(free));
+        rpi_plugin_sdk::stb_drop!(schema.description, Some(free));
+        rpi_plugin_sdk::stb_drop!(schema.parameters, Some(free));
+        TOOLS.lock().unwrap_or_else(|p| p.into_inner()).insert(
+            name,
+            ToolFns {
+                execute,
+                poll,
+                cancel,
+                destroy,
+            },
+        );
+        0
+    }
+);
 
 rpi_plugin_sdk::string_handler! {
 fn runtime_action(action, args, out, _user_data) {
@@ -382,6 +375,15 @@ pub fn api() -> PluginApi {
         declare: None,
         register_before_agent_start: None,
         register_oauth_provider: None,
+        register_streaming_provider: None,
+        register_tool_with_wake: None,
+        register_plugin_lifecycle: None,
+        register_tool_prompt: None,
+        register_oauth_provider_cancellable: None,
+        register_tool_result: None,
+        register_autocomplete_provider: None,
+        register_command_completions: None,
+        register_argument_suggester: None,
     }
 }
 
@@ -425,7 +427,7 @@ pub fn fire_message(tag: EventTag, payload: &str) {
         handler(event, std::ptr::null_mut());
     }
     // The host frees one payload allocation after the fan-out.
-    owned.free_with(Some(rpi_plugin_sdk::callbacks::free_string));
+    rpi_plugin_sdk::stb_drop!(owned, Some(rpi_plugin_sdk::callbacks::free_string));
 }
 
 pub fn fire_settled() {
@@ -449,8 +451,7 @@ pub fn command(args: &str) -> Value {
         &mut output,
         std::ptr::null_mut(),
     );
-    let text = output.to_string_lossy();
-    rpi_plugin_sdk::callbacks::free_string(output);
+    let text = rpi_plugin_sdk::stb_take!(output, Some(rpi_plugin_sdk::callbacks::free_string));
     assert_eq!(rc, 0, "/goal handler failed");
     serde_json::from_str(&text).unwrap_or(Value::Null)
 }
@@ -469,21 +470,15 @@ pub fn tool(name: &str, params: Value) -> Result<Value, String> {
         Some(rpi_plugin_sdk::callbacks::free_string),
     );
     let result = (fns.poll)(handle, None, std::ptr::null_mut());
-    // SAFETY: the union arm is selected by the tag the plugin set, and the plugin
-    // allocated exactly one string there. Reading it once and freeing it mirrors
-    // what the host does.
-    let (is_error, owned) = match result.tag {
-        rpi_plugin_sdk::StepResultTag::Done => (false, unsafe { result.payload.done.result }),
-        rpi_plugin_sdk::StepResultTag::Err => (true, unsafe { result.payload.err.message }),
-        rpi_plugin_sdk::StepResultTag::Pending => (false, StbString::empty()),
-    };
-    let text = owned.to_string_lossy();
-    owned.free_with(Some(rpi_plugin_sdk::callbacks::free_string));
+    let step = rpi_plugin_sdk::take_step!(result);
     (fns.destroy)(handle);
-    if is_error {
-        return Err(text);
+    match step {
+        rpi_plugin_sdk::callbacks::Step::Done(text) => {
+            Ok(serde_json::from_str(&text).unwrap_or(Value::Null))
+        }
+        rpi_plugin_sdk::callbacks::Step::Err(text) => Err(text),
+        rpi_plugin_sdk::callbacks::Step::Pending(_) => Ok(Value::Null),
     }
-    Ok(serde_json::from_str(&text).unwrap_or(Value::Null))
 }
 
 pub fn tool_names() -> Vec<String> {
