@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.18](https://github.com/pi-rust/rpi-extension/compare/rpi-extcore-v0.2.17...rpi-extcore-v0.2.18) - 2026-11-27
+
+### Added
+
+- *(web)* share a native Host across Web sessions ([#105](https://github.com/pi-rust/rpi-extension/pull/105))
+
+### Fixed
+
+- *(web)* open local Host sessions in the native default execution mode ([#123](https://github.com/pi-rust/rpi-extension/pull/123))
+
+### Other
+
+- *(release)* prepare workspace-wide SDK 0.31.0 release ([#124](https://github.com/pi-rust/rpi-extension/pull/124))
+
 ## [0.2.17](https://github.com/pi-rust/rpi-extension/compare/rpi-extcore-v0.2.16...rpi-extcore-v0.2.17) - 2026-11-25
 
 ### Added

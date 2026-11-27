@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.7](https://github.com/pi-rust/rpi-extension/compare/rpi-http-v0.2.6...rpi-http-v0.2.7) - 2026-11-27
+
+### Other
+
+- *(release)* prepare workspace-wide SDK 0.31.0 release ([#124](https://github.com/pi-rust/rpi-extension/pull/124))
+
 ## [0.2.5](https://github.com/pi-rust/rpi-extension/compare/rpi-http-v0.2.4...rpi-http-v0.2.5) - 2026-11-23
 
 ### Other

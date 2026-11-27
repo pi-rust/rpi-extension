@@ -2,6 +2,12 @@
 
 ## [Unreleased]
 
+## [0.1.12](https://github.com/pi-rust/rpi-extension/compare/rpi-providers-v0.1.11...rpi-providers-v0.1.12) - 2026-11-27
+
+### Other
+
+- *(release)* prepare workspace-wide SDK 0.31.0 release ([#124](https://github.com/pi-rust/rpi-extension/pull/124))
+
 ## [0.1.10](https://github.com/pi-rust/rpi-package/compare/rpi-providers-v0.1.9...rpi-providers-v0.1.10) - 2026-11-13
 
 ### Fixed

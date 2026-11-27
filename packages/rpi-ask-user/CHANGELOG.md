@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.12](https://github.com/pi-rust/rpi-extension/compare/rpi-ask-user-v0.1.11...rpi-ask-user-v0.1.12) - 2026-11-27
+
+### Other
+
+- *(release)* prepare workspace-wide SDK 0.31.0 release ([#124](https://github.com/pi-rust/rpi-extension/pull/124))
+
 ### Changed
 
 - *(tools)* steer callers away from `timeout` on open-ended `ask_user` input questions: the model-facing description, schema and README now recommend omitting the deadline (or allowing at least 300 seconds for short choices), so a question that needs a human to look something up is no longer closed by a too-short timeout.
