@@ -153,12 +153,9 @@ valid host-injected capabilities and matching session/project context.
 
 The extension builds the delegation prompt and sends it as input to
 `RuntimeActionId::IndependentRun` (33). It also selects the active tool subset,
-excluding `delegate_task`. Both the new action and the compatibility action
-require the per-call `__rpi.runtimeHandle` and `runtimeKey` capabilities.
-
-When the host explicitly rejects action 33 as unknown, the extension uses the
-existing `ChildAgent` action (24). Other start errors are returned to the caller.
-Both paths run in memory with the host's active execution bindings.
+excluding `delegate_task`. The action requires the per-call
+`__rpi.runtimeHandle` and `runtimeKey` capabilities. It runs in memory with the
+host's active execution bindings. Use a host supporting `IndependentRun`.
 `RPI_SUBAGENT_CHILD=1` still suppresses registration for external legacy launches.
 
 The package retains the workspace's published SDK pin. Its runtime action IDs are declared locally until the SDK publishes the enum variant. Host-side SDK validation remains authoritative; the vtable is unchanged.
