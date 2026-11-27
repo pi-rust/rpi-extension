@@ -58,8 +58,8 @@ execution errors are tool errors, not message results.
   `autoReply`. Its fixed startup wait is 10s: Feishu reports local SDK readiness,
   while WeCom waits for the authentication acknowledgement. A startup timeout
   requests shutdown but is not proof that all background work has stopped.
-- `list` returns an unordered array of statuses, possibly empty; `status`
-  returns one. Status includes `queueLength`, `maxQueueSize`, `dropped`,
+- `list` returns the calling registration’s servers in an unordered array,
+  which may be empty. `status` looks up one server in that registration. Status includes `queueLength`, `maxQueueSize`, `dropped`,
   `lastError`, auto-reply settings and capabilities. This is local state, not
   proof of remote connectivity, permissions or delivery.
 - `receive` destructively pops **one** oldest queued message. Multiple callers
@@ -120,8 +120,8 @@ are not returned by `receive`; they may send replies and persist session
 selection in `.rpi/im-sessions.json`. Consuming a queued message does not cancel
 or suppress auto-reply work. See the session behavior below.
 
-Configuration is loaded from `RPI_IM_CONFIG`, project `.rpi/im.json`, or the
-global `~/.rpi/agent/im.json` (in that order). Each profile may provide either
+Configuration is loaded from an absolute `RPI_IM_CONFIG` path, the calling
+session’s workspace `.rpi/im.json`, or `~/.rpi/agent/im.json`, in that order. Each profile may provide either
 `appSecret` directly or `appSecretEnv` with the name of an environment variable;
 configure only one of them. Environment variables are recommended for shared
 machines and source-controlled configuration.
@@ -334,8 +334,8 @@ mention):
 | `/session <ID>` | Switch to a full ID from `/sessions`, including the original session. |
 
 Commands are handled locally without calling the model. Selection is scoped
-to the IM profile and chat and saved in `<working-directory>/.rpi/im-sessions.json`.
-Keep the service's working directory the same when restarting to restore it.
+to the IM profile and chat and saved in `.rpi/im-sessions.json` in the workspace
+that started the server. Starting from the same workspace restores the selection.
 New session files are created by rpi on their first normal message. Switching
 affects subsequent messages; already scheduled replies retain their original
 session. Explicitly selected sessions always use the JSONL child-process path

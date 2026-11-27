@@ -1,6 +1,6 @@
 [package]
 name = "rpi-goal"
-version = "0.2.5"
+version = "0.2.7"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
@@ -28,3 +28,9 @@ crate-type = ["cdylib", "rlib"]
 rpi-plugin-sdk = { workspace = true }
 serde = { version = "1", features = ["derive"] }
 serde_json = { workspace = true }
+
+[dev-dependencies]
+rpi-abi-test-support = { path = "../../tools/rpi-abi-test-support" }
+
+[lints]
+workspace = true

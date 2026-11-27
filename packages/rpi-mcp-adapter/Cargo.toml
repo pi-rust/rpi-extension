@@ -1,6 +1,6 @@
 [package]
 name = "rpi-mcp-adapter"
-version = "0.2.11"
+version = "0.2.13"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
@@ -25,9 +25,13 @@ supported-targets = [
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-rpi-plugin-sdk = { version = "0.3.16" }
-rpi-mcp-core = { version = "0.1.1", path = "../rpi-mcp-core" }
+rpi-plugin-sdk = { workspace = true }
+rpi-mcp-core = { version = "0.1.2", path = "../rpi-mcp-core" }
 serde_json = { workspace = true }
 
 [dev-dependencies]
-rpi-plugin-sdk = { version = "0.3.16", features = ["process"] }
+rpi-abi-test-support = { path = "../../tools/rpi-abi-test-support" }
+rpi-plugin-sdk = { workspace = true, features = ["process"] }
+
+[lints]
+workspace = true

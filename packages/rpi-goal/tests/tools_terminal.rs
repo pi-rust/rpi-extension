@@ -1,4 +1,7 @@
 //! Explicit stopping reasons: `goal_complete`, `goal_blocked`, `goal_wait`.
+
+#![forbid(unsafe_code)]
+
 mod support;
 
 use rpi_plugin_sdk::EventTag;
@@ -26,6 +29,21 @@ fn all_four_tools_are_registered() {
             "missing {expected}: {names:?}"
         );
     }
+}
+
+#[test]
+fn independent_tool_invocation_cannot_complete_the_parent_goal() {
+    let _guard = support::serial();
+    let id = start_goal("Keep the parent goal active");
+
+    let error = support::tool(
+        "goal_complete",
+        json!({"goal_id": id, "summary": "done", "__rpi":{"independentRun":true}}),
+    )
+    .expect_err("an independent run cannot complete its parent's goal");
+    assert!(error.contains("Subagents cannot manage the parent goal"));
+    assert_eq!(support::active_goal().unwrap()["id"], id);
+    assert_eq!(support::status(), "active");
 }
 
 #[test]

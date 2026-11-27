@@ -1,25 +1,117 @@
 #![forbid(unsafe_code)]
 
-use rpi_plugin_sdk::{EventTag, PluginApi, RuntimeActionId, StbString, StbStringRef};
+use rpi_plugin_sdk::{EventTag, PluginApi, RuntimeActionId, StbStringRef};
 use serde_json::{json, Value};
 use std::{
-    collections::VecDeque,
-    sync::{Mutex, OnceLock},
-    time::Instant,
+    collections::{HashMap, VecDeque},
+    ffi::c_void,
+    sync::{mpsc, Arc, LazyLock, Mutex},
+    thread::{self, JoinHandle},
+    time::{Duration, Instant},
 };
 
 const KEY: &str = "rpi.run-stats";
-// Reuse the SDK's host-context lifetime and thread-safety contract.
-type Runtime = PluginApi;
-static RUNTIME: OnceLock<Runtime> = OnceLock::new();
-static STATE: OnceLock<Mutex<Stats>> = OnceLock::new();
-static TIMER: Mutex<Option<(std::sync::mpsc::Sender<()>, std::thread::JoinHandle<()>)>> =
-    Mutex::new(None);
-fn state() -> &'static Mutex<Stats> {
-    STATE.get_or_init(|| Mutex::new(Stats::default()))
+mod lifecycle;
+pub use lifecycle::rpi_plugin_shared_sessions_v1;
+
+// The preview host passes the same opaque registration identity to commands
+// and in PluginApi. Event callbacks carry that identity explicitly.
+static REGISTRATIONS: LazyLock<Mutex<HashMap<usize, Arc<Registration>>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+struct Registration {
+    runtime: PluginApi,
+    stats: Mutex<Stats>,
+    timer: Mutex<Option<Timer>>,
+    loader_cleanup: bool,
+}
+
+struct Timer {
+    stop: mpsc::Sender<()>,
+    thread: JoinHandle<()>,
+}
+
+impl Registration {
+    fn lookup(owner: *mut c_void) -> Option<Arc<Self>> {
+        let registrations = REGISTRATIONS.lock().unwrap_or_else(|p| p.into_inner());
+        registrations.get(&(owner as usize)).cloned()
+    }
+
+    fn for_command(owner: *mut c_void) -> Option<Arc<Self>> {
+        if !owner.is_null() {
+            return Self::lookup(owner);
+        }
+        // Older isolated hosts can supply null to commands. The shared-image
+        // host always binds commands when the registration has an action bridge.
+        let registrations = REGISTRATIONS.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(registration) = registrations.get(&0) {
+            return Some(registration.clone());
+        }
+        (registrations.len() == 1).then(|| registrations.values().next().unwrap().clone())
+    }
+
+    fn remove(owner: *mut c_void) -> Option<Arc<Self>> {
+        REGISTRATIONS
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(&(owner as usize))
+    }
+
+    fn start_timer(self: &Arc<Self>) -> std::io::Result<()> {
+        let mut timer = self.timer.lock().unwrap_or_else(|p| p.into_inner());
+        let (stop, receiver) = mpsc::channel();
+        let owner = self.clone();
+        let thread = thread::Builder::new()
+            .name("rpi-run-stats-refresh".into())
+            .spawn(move || {
+                while let Err(mpsc::RecvTimeoutError::Timeout) =
+                    receiver.recv_timeout(Duration::from_secs(1))
+                {
+                    let mut stats = owner.stats.lock().unwrap_or_else(|p| p.into_inner());
+                    if stats.publish_attempted {
+                        publish(&owner.runtime, &mut stats);
+                    }
+                }
+            })?;
+        *timer = Some(Timer { stop, thread });
+        Ok(())
+    }
+
+    fn signal_stop(&self) {
+        if let Some(timer) = self
+            .timer
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .as_ref()
+        {
+            let _ = timer.stop.send(());
+        }
+    }
+
+    fn stop_and_join(&self) {
+        let timer = self.timer.lock().unwrap_or_else(|p| p.into_inner()).take();
+        if let Some(Timer { stop, thread }) = timer {
+            let _ = stop.send(());
+            let _ = thread.join();
+        }
+    }
+}
+
+extern "C" fn begin_shutdown(owner: *mut c_void) {
+    if let Some(registration) = Registration::lookup(owner) {
+        registration.signal_stop();
+    }
+}
+
+extern "C" fn finish_shutdown(owner: *mut c_void) -> i32 {
+    if let Some(registration) = Registration::remove(owner) {
+        registration.stop_and_join();
+    }
+    0
 }
 
 struct Stats {
+    publish_attempted: bool,
     last_publication: Option<String>,
     last_visibility: Option<bool>,
     supports_highlights: Option<bool>,
@@ -46,6 +138,7 @@ struct Stats {
 impl Default for Stats {
     fn default() -> Self {
         Self {
+            publish_attempted: false,
             last_publication: None,
             last_visibility: None,
             supports_highlights: None,
@@ -277,21 +370,12 @@ fn compact(n: u64) -> String {
     }
 }
 fn component_action(runtime: &rpi_plugin_sdk::PluginApi, args: Value) -> bool {
-    let args = args.to_string();
-    let mut out = StbString::empty();
-    let rc = (runtime.runtime_action)(
-        RuntimeActionId::UiComponent as u32,
-        StbStringRef::from_str(&args),
-        &mut out,
-        runtime.user_data,
-    );
-    (runtime.free_string)(out);
+    let (rc, _) =
+        rpi_plugin_sdk::call_action!(runtime, RuntimeActionId::UiComponent, &args.to_string());
     rc == 0
 }
-fn publish(stats: &mut Stats) {
-    let Some(runtime) = RUNTIME.get() else {
-        return;
-    };
+fn publish(runtime: &PluginApi, stats: &mut Stats) {
+    stats.publish_attempted = true;
     if stats.last_publication.is_none() {
         if !component_action(
             runtime,
@@ -330,20 +414,20 @@ fn publish(stats: &mut Stats) {
     }
 }
 rpi_plugin_sdk::event_handler! {
-fn event(event, _user_data) {
-    if event.tag() == EventTag::SessionShutdown {
-        if let Some((stop, thread)) = TIMER.lock().unwrap_or_else(|p| p.into_inner()).take() {
-            let _ = stop.send(());
-            let _ = thread.join();
-        }
-        let mut stats = state().lock().unwrap_or_else(|p| p.into_inner());
-        stats.enabled = false;
-        publish(&mut stats);
-        return 0;
-    }
-    let Some(_runtime) = RUNTIME.get() else {
+fn event(event, owner) {
+    let Some(registration) = Registration::lookup(owner) else {
         return 0;
     };
+    if event.tag() == EventTag::SessionShutdown {
+        registration.stop_and_join();
+        let mut stats = registration.stats.lock().unwrap_or_else(|p| p.into_inner());
+        stats.enabled = false;
+        publish(&registration.runtime, &mut stats);
+        if !registration.loader_cleanup {
+            Registration::remove(owner);
+        }
+        return 0;
+    }
     // Events are borrowed during host fan-out; the host frees their payloads
     // once all subscribers have returned (dispatch_to_handlers contract).
     let payload = match event.tag() {
@@ -359,12 +443,12 @@ fn event(event, _user_data) {
             parsed
         })
         .unwrap_or(Value::Null);
-    let mut stats = state().lock().unwrap_or_else(|p| p.into_inner());
+    let mut stats = registration.stats.lock().unwrap_or_else(|p| p.into_inner());
     stats.update(event.tag(), &value, Instant::now());
     // Stream deltas only latch TTFT. The one-second timer publishes ongoing
     // timing; request/lifecycle boundaries still publish immediately.
     if event.tag() != EventTag::MessageUpdate {
-        publish(&mut stats);
+        publish(&registration.runtime, &mut stats);
     }
     0
 }
@@ -389,24 +473,30 @@ fn shortcut(stats: &mut Stats, value: &Value) -> i32 {
     }
 }
 rpi_plugin_sdk::event_handler! {
-fn input(event, _user_data) {
+fn input(event, owner) {
+    let Some(registration) = Registration::lookup(owner) else {
+        return 0;
+    };
     let raw = event.data_text().unwrap_or_default();
     let value = serde_json::from_str(&raw).unwrap_or(Value::Null);
-    let mut stats = state().lock().unwrap_or_else(|p| p.into_inner());
+    let mut stats = registration.stats.lock().unwrap_or_else(|p| p.into_inner());
     let enabled = stats.enabled;
     let result = shortcut(&mut stats, &value);
     if stats.enabled != enabled {
-        publish(&mut stats);
+        publish(&registration.runtime, &mut stats);
     }
     result
 }
 }
 rpi_plugin_sdk::string_handler! {
-fn command(args, out, _user_data) {
+fn command(args, out, owner) {
     if !out.is_available() {
         return 1;
     }
-    let mut stats = state().lock().unwrap_or_else(|p| p.into_inner());
+    let Some(registration) = Registration::for_command(owner) else {
+        return 1;
+    };
+    let mut stats = registration.stats.lock().unwrap_or_else(|p| p.into_inner());
     let envelope: Value = serde_json::from_str(args).unwrap_or(Value::Null);
     let text = match envelope
         .get("args")
@@ -435,13 +525,12 @@ fn command(args, out, _user_data) {
         }
         _ => "用法：/stats [on|off|toggle]，也可使用 F8 切换",
     };
-    publish(&mut stats);
+    publish(&registration.runtime, &mut stats);
     out.write(json!({"kind":"message","text":text}).to_string());
     0
 }
 }
-rpi_plugin_sdk::export_plugin!(|api| {
-    let _ = RUNTIME.set(*api);
+fn register(api: &PluginApi, cleanup: Option<lifecycle::Register>) -> i32 {
     let Some(register) = api.register_event_handler else {
         return 1;
     };
@@ -455,11 +544,11 @@ rpi_plugin_sdk::export_plugin!(|api| {
         EventTag::MessageUpdate,
         EventTag::MessageEnd,
     ] {
-        if register(tag, event, std::ptr::null_mut()) != 0 {
+        if register(tag, event, api.user_data) != 0 {
             return 1;
         }
     }
-    if register(EventTag::Input, input, std::ptr::null_mut()) != 0 {
+    if register(EventTag::Input, input, api.user_data) != 0 {
         return 1;
     }
     let Some(register_shortcut) = api.register_shortcut else {
@@ -483,27 +572,51 @@ rpi_plugin_sdk::export_plugin!(|api| {
     {
         return 1;
     }
-    publish(&mut state().lock().unwrap_or_else(|p| p.into_inner()));
-    // Keep waiting time and the rolling TPM window fresh even without streaming events.
-    let mut timer = TIMER.lock().unwrap_or_else(|p| p.into_inner());
-    if timer.is_none() {
-        let (stop, receiver) = std::sync::mpsc::channel();
-        let thread = std::thread::spawn(move || {
-            while matches!(
-                receiver.recv_timeout(std::time::Duration::from_secs(1)),
-                Err(std::sync::mpsc::RecvTimeoutError::Timeout)
-            ) {
-                publish(&mut state().lock().unwrap_or_else(|p| p.into_inner()));
-            }
-        });
-        *timer = Some((stop, thread));
+    let registration = Arc::new(Registration {
+        runtime: *api,
+        stats: Mutex::new(Stats::default()),
+        timer: Mutex::new(None),
+        loader_cleanup: cleanup.is_some(),
+    });
+    {
+        let mut registrations = REGISTRATIONS.lock().unwrap_or_else(|p| p.into_inner());
+        let std::collections::hash_map::Entry::Vacant(entry) =
+            registrations.entry(api.user_data as usize)
+        else {
+            return 1;
+        };
+        entry.insert(registration.clone());
+    }
+    // A registered finish hook runs even for an unpublished or failed load.
+    // Install it before starting the refresh thread or publishing the UI.
+    if let Some(cleanup) = cleanup {
+        let rc = cleanup(begin_shutdown, finish_shutdown, api.user_data);
+        if rc != 0 {
+            Registration::remove(api.user_data);
+            return rc;
+        }
+    }
+    if registration.start_timer().is_err() {
+        if cleanup.is_none() {
+            Registration::remove(api.user_data);
+        }
+        return 1;
+    }
+    // Managed reload candidates may never become live. Wait for their first
+    // event or command before publishing to the session's UI mailbox.
+    if cleanup.is_none() {
+        publish(
+            api,
+            &mut registration.stats.lock().unwrap_or_else(|p| p.into_inner()),
+        );
     }
     0
-});
+}
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rpi_plugin_sdk::StbString;
     #[test]
     fn f8_toggles_once_and_modified_or_unrelated_keys_are_not_claimed() {
         use rpi_plugin_sdk::{EVENT_HANDLER_CLAIMED, EVENT_HANDLER_CONTINUE};
@@ -610,8 +723,137 @@ mod tests {
         assert_eq!(compact(999_950), "1.0M");
         assert_eq!(compact(u64::MAX), "18E");
     }
+    static UI: Mutex<Vec<(usize, Value)>> = Mutex::new(Vec::new());
+    static HOOKS: Mutex<
+        Vec<(
+            usize,
+            extern "C" fn(*mut c_void),
+            extern "C" fn(*mut c_void) -> i32,
+        )>,
+    > = Mutex::new(Vec::new());
+
+    rpi_plugin_sdk::string_handler! {
+    fn runtime(action, args, _out, owner) {
+        assert_eq!(action, RuntimeActionId::UiComponent as u32);
+        UI.lock().unwrap().push((owner as usize, serde_json::from_str(args).unwrap()));
+        0
+    }
+    }
+
+    extern "C" fn register_event(
+        _: EventTag,
+        _: rpi_plugin_sdk::EventHandlerFn,
+        _: *mut c_void,
+    ) -> i32 {
+        0
+    }
+    extern "C" fn register_command(
+        _: StbStringRef,
+        _: StbStringRef,
+        _: rpi_plugin_sdk::CommandHandlerFn,
+    ) -> i32 {
+        0
+    }
+    extern "C" fn register_shortcut(_: StbStringRef, _: StbStringRef) -> i32 {
+        0
+    }
+    extern "C" fn register_cleanup(
+        begin: extern "C" fn(*mut c_void),
+        finish: extern "C" fn(*mut c_void) -> i32,
+        owner: *mut c_void,
+    ) -> i32 {
+        if owner as usize == 4 {
+            return 5;
+        }
+        HOOKS.lock().unwrap().push((owner as usize, begin, finish));
+        0
+    }
+
+    fn api(owner: usize) -> PluginApi {
+        PluginApi {
+            abi_version: rpi_plugin_sdk::RPI_PLUGIN_ABI_VERSION_UNIFIED,
+            struct_size: std::mem::size_of::<PluginApi>() as u32,
+            free_string: rpi_plugin_sdk::callbacks::free_string,
+            runtime_action: runtime,
+            user_data: owner as *mut c_void,
+            register_tool: None,
+            register_command: Some(register_command),
+            register_shortcut: Some(register_shortcut),
+            register_flag: None,
+            register_provider: None,
+            register_message_renderer: None,
+            register_markdown_transformer: None,
+            register_entry_renderer: None,
+            register_event_handler: Some(register_event),
+            register_resources_discover: None,
+            dispatch_event: None,
+            declare: None,
+            register_before_agent_start: None,
+            register_oauth_provider: None,
+            register_streaming_provider: None,
+            register_tool_with_wake: None,
+            register_plugin_lifecycle: None,
+            register_tool_prompt: None,
+            register_oauth_provider_cancellable: None,
+            register_tool_result: None,
+            register_autocomplete_provider: None,
+            register_command_completions: None,
+            register_argument_suggester: None,
+        }
+    }
+
+    fn run_command(owner: usize, args: &str) -> Value {
+        let input = json!({"args":args,"command":"stats"}).to_string();
+        let mut out = StbString::empty();
+        assert_eq!(
+            command(
+                StbStringRef::from_str(&input),
+                &mut out,
+                owner as *mut c_void
+            ),
+            0
+        );
+        let response: Value = serde_json::from_str(&rpi_plugin_sdk::stb_take!(
+            out,
+            Some(rpi_plugin_sdk::callbacks::free_string)
+        ))
+        .unwrap();
+        assert_eq!(response["kind"], "message");
+        response
+    }
+
     #[test]
-    fn command_accepts_host_envelope_and_rejects_unknown_arguments() {
+    fn registrations_isolate_commands_events_and_loader_cleanup() {
+        use rpi_plugin_sdk::StablePluginEvent;
+        let register = |owner| {
+            let mut vtable = api(owner);
+            vtable.register_plugin_lifecycle = Some(register_cleanup);
+            lifecycle::rpi_plugin_register(&vtable)
+        };
+        thread::scope(|scope| {
+            let first = scope.spawn(|| register(1));
+            assert_eq!(register(2), 0);
+            assert_eq!(first.join().unwrap(), 0);
+        });
+        assert_eq!(register(3), 0); // Unpublished candidate.
+        assert_eq!(register(4), 5); // Lifecycle registration refused.
+        assert!(Registration::lookup(4_usize as *mut c_void).is_none());
+        assert!(UI.lock().unwrap().is_empty());
+        let first = Registration::lookup(1_usize as *mut c_void).unwrap();
+        let second = Registration::lookup(2_usize as *mut c_void).unwrap();
+        let candidate = Registration::lookup(3_usize as *mut c_void).unwrap();
+        let cleanup = |owner| {
+            let (_, begin, finish) = HOOKS
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|hook| hook.0 == owner)
+                .copied()
+                .unwrap();
+            begin(owner as *mut c_void);
+            assert_eq!(finish(owner as *mut c_void), 0);
+        };
+
         for (args, enabled) in [
             ("off", false),
             ("on", true),
@@ -621,28 +863,74 @@ mod tests {
             ("position bottom-left", true),
             ("position invalid", true),
         ] {
-            let input = json!({"args":args,"command":"stats"}).to_string();
-            let mut out = StbString::empty();
-            assert_eq!(
-                command(
-                    StbStringRef::from_str(&input),
-                    &mut out,
-                    std::ptr::null_mut()
-                ),
-                0
-            );
-            assert_eq!(state().lock().unwrap().enabled, enabled);
-            if args.starts_with("position ") {
-                assert_eq!(state().lock().unwrap().anchor, "top-right");
-            }
-            let response: Value = serde_json::from_str(&out.to_string_lossy()).unwrap();
-            assert_eq!(response["kind"], "message");
+            let response = run_command(1, args);
+            let stats = first.stats.lock().unwrap();
+            assert_eq!(stats.enabled, enabled);
+            assert_eq!(stats.anchor, "top-right");
+            assert!(!second.stats.lock().unwrap().enabled);
             if args == "unknown" {
                 assert!(response["text"].as_str().unwrap().contains("用法"));
             }
-            // The command output uses the SDK boxed-slice allocation contract.
-            rpi_plugin_sdk::callbacks::free_string(out);
         }
+        assert_eq!(
+            event(
+                StablePluginEvent::empty(EventTag::AgentStart),
+                2_usize as *mut c_void
+            ),
+            0
+        );
+        assert_eq!(first.stats.lock().unwrap().rounds, 0);
+        assert_eq!(second.stats.lock().unwrap().rounds, 1);
+        let ui = UI.lock().unwrap();
+        assert!(ui
+            .iter()
+            .any(|(owner, args)| *owner == 1 && args["op"] == "show"));
+        assert!(ui
+            .iter()
+            .any(|(owner, args)| *owner == 2 && args["op"] == "register"));
+        assert!(!ui
+            .iter()
+            .any(|(owner, args)| *owner == 2 && args["op"] == "show"));
+        drop(ui);
+
+        cleanup(3);
+        assert!(candidate.timer.lock().unwrap().is_none());
+        assert!(Registration::lookup(3_usize as *mut c_void).is_none());
+        cleanup(1);
+        assert!(first.timer.lock().unwrap().is_none());
+        assert!(second.timer.lock().unwrap().is_some());
+        assert_eq!(
+            event(
+                StablePluginEvent::empty(EventTag::SessionShutdown),
+                2_usize as *mut c_void
+            ),
+            0
+        );
+        assert!(second.timer.lock().unwrap().is_none());
+        cleanup(2);
+        assert!(REGISTRATIONS.lock().unwrap().is_empty());
+
+        // Simulate an older host with a shorter vtable and a null command owner.
+        let mut legacy = api(5);
+        legacy.struct_size = std::mem::offset_of!(PluginApi, register_streaming_provider) as u32;
+        assert_eq!(lifecycle::rpi_plugin_register(&legacy), 0);
+        run_command(0, "on");
+        assert!(
+            Registration::lookup(legacy.user_data)
+                .unwrap()
+                .stats
+                .lock()
+                .unwrap()
+                .enabled
+        );
+        assert_eq!(
+            event(
+                StablePluginEvent::empty(EventTag::SessionShutdown),
+                legacy.user_data
+            ),
+            0
+        );
+        assert!(REGISTRATIONS.lock().unwrap().is_empty());
     }
     #[test]
     fn counts_requests_and_real_usage_without_counting_tool_messages_or_duplicate_ends() {

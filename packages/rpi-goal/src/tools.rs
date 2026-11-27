@@ -199,16 +199,16 @@ macro_rules! drive {
     ($handles:ident, $execute:ident, $poll:ident, $cancel:ident, $destroy:ident, $run:path) => {
         static $handles: ToolHandles<Drive> = ToolHandles::new();
 
-        extern "C" fn $execute(
+        extern "C" fn $execute<const SLOT: usize>(
             _: StbStringRef,
             params: StbString,
             free: Option<FreeStringFn>,
         ) -> StepHandle {
-            let text = params.to_string_lossy();
-            params.free_with(free);
+            let text = rpi_plugin_sdk::stb_take!(params, free);
+            let params = serde_json::from_str(&text).unwrap_or(Value::Null);
             $handles.insert(Drive {
-                runtime: runtime::snapshot(),
-                params: serde_json::from_str(&text).unwrap_or(Value::Null),
+                binding: runtime::tool::<SLOT>(&params),
+                params,
                 done: false,
             })
         }
@@ -227,7 +227,6 @@ macro_rules! drive {
                 ));
             };
             let mut drive = entry.lock();
-            let _scope = runtime::enter(drive.runtime);
             if entry.cancelled.load(std::sync::atomic::Ordering::SeqCst) {
                 drive.done = true;
                 return StepResult::err(StbString::from_string("goal tool cancelled".into()));
@@ -238,7 +237,13 @@ macro_rules! drive {
                 ));
             }
             drive.done = true;
-            match $run(&drive.params) {
+            let result = (|| {
+                let binding = drive.binding.as_ref().map_err(Clone::clone)?;
+                let _scope = runtime::enter(Some(binding.clone()));
+                runtime::authorize_tool(binding, &drive.params)?;
+                $run(&drive.params)
+            })();
+            match result {
                 Ok(value) => StepResult::done(StbString::from_string(value)),
                 Err(error) => StepResult::err(StbString::from_string(error)),
             }
@@ -255,7 +260,7 @@ macro_rules! drive {
 }
 
 struct Drive {
-    runtime: Option<PluginApi>,
+    binding: Result<runtime::Binding, String>,
     params: Value,
     done: bool,
 }
@@ -383,10 +388,20 @@ pub fn wait_schema() -> StableToolSchema {
 }
 
 /// Register all four tools. Returns the host return code of the last call.
-pub fn register(api: &PluginApi) -> i32 {
+pub(crate) fn register(api: &PluginApi, slot: usize) -> i32 {
     let Some(register) = api.register_tool else {
         return 1;
     };
+    macro_rules! execute_for {
+        ($execute:ident) => {{
+            let table: [rpi_plugin_sdk::ToolExecuteFn; runtime::SLOTS] =
+                crate::lifecycle::execute_table!($execute);
+            table
+                .get(slot)
+                .copied()
+                .unwrap_or($execute::<{ runtime::SLOTS }>)
+        }};
+    }
     let plan: [(
         StableToolSchema,
         rpi_plugin_sdk::ToolExecuteFn,
@@ -396,28 +411,28 @@ pub fn register(api: &PluginApi) -> i32 {
     ); 4] = [
         (
             goal_schema(),
-            goal_execute,
+            execute_for!(goal_execute),
             goal_poll,
             goal_cancel,
             goal_destroy,
         ),
         (
             complete_schema(),
-            complete_execute,
+            execute_for!(complete_execute),
             complete_poll,
             complete_cancel,
             complete_destroy,
         ),
         (
             blocked_schema(),
-            blocked_execute,
+            execute_for!(blocked_execute),
             blocked_poll,
             blocked_cancel,
             blocked_destroy,
         ),
         (
             wait_schema(),
-            wait_execute,
+            execute_for!(wait_execute),
             wait_poll,
             wait_cancel,
             wait_destroy,
@@ -447,13 +462,13 @@ mod tests {
     use super::*;
 
     fn parameters(schema: StableToolSchema) -> Value {
-        serde_json::from_str(&schema.parameters.to_string_lossy()).unwrap()
+        serde_json::from_str(&rpi_plugin_sdk::stb_text!(schema.parameters)).unwrap()
     }
 
     #[test]
     fn every_tool_schema_is_valid_and_conditional() {
         let goal = goal_schema();
-        assert_eq!(goal.name.to_string_lossy(), "goal");
+        assert_eq!(rpi_plugin_sdk::stb_text!(goal.name), "goal");
         let params = parameters(goal);
         assert_eq!(params["properties"]["action"]["default"], "show");
         assert_eq!(params["additionalProperties"], true);
@@ -461,13 +476,13 @@ mod tests {
         assert_eq!(params["properties"]["title"]["pattern"], "\\S");
 
         let complete = complete_schema();
-        assert_eq!(complete.name.to_string_lossy(), "goal_complete");
+        assert_eq!(rpi_plugin_sdk::stb_text!(complete.name), "goal_complete");
         let params = parameters(complete);
         assert_eq!(params["required"], json!(["goal_id", "summary"]));
         assert_eq!(params["properties"]["summary"]["maxLength"], 4000);
 
         let blocked = blocked_schema();
-        assert_eq!(blocked.name.to_string_lossy(), "goal_blocked");
+        assert_eq!(rpi_plugin_sdk::stb_text!(blocked.name), "goal_blocked");
         let params = parameters(blocked);
         assert_eq!(
             params["required"],
@@ -476,7 +491,7 @@ mod tests {
         assert_eq!(params["properties"]["repeated_turns"]["minimum"], 3);
 
         let wait = wait_schema();
-        assert_eq!(wait.name.to_string_lossy(), "goal_wait");
+        assert_eq!(rpi_plugin_sdk::stb_text!(wait.name), "goal_wait");
         let params = parameters(wait);
         assert_eq!(params["required"], json!(["goal_id", "reason"]));
         assert_eq!(

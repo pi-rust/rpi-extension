@@ -23,7 +23,7 @@ Policy changes require explicit user authorization.
 | `rule` | Required for `grant`/`revoke` unless `capability` is supplied. Trimmed, 1–200 **UTF-8 bytes**. `Tool(pattern)` matches that tool; a bare pattern matches any tool. Only `*` is a wildcard. |
 | `capability` | Legacy fallback for `value` on check or `rule` on mutation. A present primary field takes precedence (even if invalid). |
 | `effect` | `allow` (default) or `deny`. `grant` adds the rule to that list after removing the same exact text from both lists. `grant` with `effect=deny` **adds a deny rule**, not a revocation. `revoke` deletes the exact rule from **both** lists regardless of effect; supplied effect must still be valid. Ignored by check/list. |
-| `cwd` | Project directory; omitted/empty uses process working directory. A relative `cwd` is resolved relative to the process working directory; check's `value` is matched literally, not path-resolved. |
+| `cwd` | Project directory. Omitted, empty, and relative values use the host session working directory when supplied, with the process directory as fallback. The `check` action matches `value` literally. |
 
 Reads use `<cwd>/.pi/permissions.json` when present, otherwise
 `$RPI_AGENT_DIR/permissions.json` when set, otherwise

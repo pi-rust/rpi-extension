@@ -14,79 +14,135 @@
 //! binding, the extractive line already in the view stays. The log is the source
 //! of truth; a compressed line is a cache that can always be rebuilt or dropped.
 
-use serde_json::json;
-use std::io::Write;
-use std::path::PathBuf;
+use serde_json::Value;
+use std::collections::HashSet;
+use std::io::{Read, Seek, Write};
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::mpsc::{sync_channel, Receiver, SyncSender};
-use std::sync::{Mutex, OnceLock};
-use std::time::Duration;
-use wait_timeout::ChildExt;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::mpsc::{channel, sync_channel, Receiver, Sender, SyncSender};
+use std::sync::Arc;
+use std::thread::{self, JoinHandle};
+use std::time::{Duration, Instant};
 
 /// Session custom-entry type holding one model-written line.
 pub(crate) const NODE_TYPE: &str = "optchat-node";
 /// Session custom-entry type holding plugin settings.
 pub(crate) const CONFIG_TYPE: &str = "optchat-config";
-/// `GetExecutionContext`: the host reports the session's model binding. The
-/// published SDK predates the variant, so the id is a documented number (see
-/// `HOST-REQUIREMENTS.md`) rather than an enum arm.
-const GET_EXECUTION_CONTEXT: u32 = 23;
 /// Bytes one line may occupy; a longer reply is cut, never refused.
 const LINE: usize = super::memory::NODE;
 /// Jobs waiting at once. A full queue drops new work instead of delaying a turn.
 const DEPTH: usize = 8;
 
-pub(crate) struct Job {
-    pub l: u32,
-    pub i: u64,
-    pub source: String,
+struct Job {
+    generation: u64,
+    l: u32,
+    i: u64,
+    source: String,
+    binding: Binding,
 }
 
 pub(crate) struct Done {
+    pub generation: u64,
     pub l: u32,
     pub i: u64,
     pub text: String,
 }
 
-struct Engine {
+#[derive(Clone, Default)]
+pub(crate) struct Binding {
+    provider: Option<String>,
+    model: Option<String>,
+    cwd: Option<PathBuf>,
+}
+
+impl Binding {
+    pub(crate) fn from_context(context: &Value) -> Option<Self> {
+        let string = |value: &Value| {
+            value
+                .as_str()
+                .filter(|s| !s.trim().is_empty())
+                .map(str::to_owned)
+        };
+        let provider = string(&context["model"]["provider"]);
+        let model = string(&context["model"]["id"]);
+        let cwd = string(&context["cwd"])
+            .map(PathBuf::from)
+            .filter(|path| path.is_absolute());
+        (provider.is_some() && model.is_some()).then_some(Self {
+            provider,
+            model,
+            cwd,
+        })
+    }
+}
+
+pub(crate) struct Engine {
     queue: SyncSender<Job>,
-    done: Mutex<Receiver<Done>>,
+    done: Receiver<Done>,
+    // Includes finished jobs until they are drained, so the completion queue
+    // is bounded by the same admission budget as the work queue.
+    in_flight: HashSet<(u64, u32, u64)>,
+    worker: JoinHandle<()>,
 }
 
-/// Provider/model the child should run on, resolved once per session. Kept
-/// outside `Engine`: the worker reads it while `Engine` is still initializing,
-/// and reaching back into the `OnceLock` from inside its initializer deadlocks.
-type Binding = Option<(Option<String>, Option<String>)>;
-static BINDING: OnceLock<Mutex<Binding>> = OnceLock::new();
-
-fn binding() -> &'static Mutex<Binding> {
-    BINDING.get_or_init(|| Mutex::new(None))
-}
-
-/// Merges already queued, so a candidate is not asked for twice while the
-/// answer is in flight.
-static IN_FLIGHT: OnceLock<Mutex<std::collections::HashSet<(u32, u64)>>> = OnceLock::new();
-
-fn in_flight() -> &'static Mutex<std::collections::HashSet<(u32, u64)>> {
-    IN_FLIGHT.get_or_init(|| Mutex::new(std::collections::HashSet::new()))
-}
-
-static ENGINE: OnceLock<Engine> = OnceLock::new();
-
-fn engine() -> &'static Engine {
-    ENGINE.get_or_init(|| {
-        let (queue, jobs) = sync_channel::<Job>(DEPTH);
-        let (sender, done) = sync_channel::<Done>(DEPTH);
-        std::thread::Builder::new()
+impl Engine {
+    pub(crate) fn new(
+        stopping: Arc<AtomicBool>,
+        generation: Arc<AtomicU64>,
+    ) -> std::io::Result<Self> {
+        let (queue, jobs) = sync_channel(DEPTH);
+        let (sender, done) = channel();
+        let worker = thread::Builder::new()
             .name("rpi-optchat-compactor".into())
-            // A compressor that panics must not take the plugin down.
-            .spawn(move || worker(jobs, sender))
-            .ok();
-        Engine {
+            .spawn(move || worker(jobs, sender, stopping, generation))?;
+        Ok(Self {
             queue,
-            done: Mutex::new(done),
+            done,
+            in_flight: HashSet::new(),
+            worker,
+        })
+    }
+
+    pub(crate) fn enqueue(
+        &mut self,
+        generation: u64,
+        l: u32,
+        i: u64,
+        source: String,
+        binding: Binding,
+    ) {
+        let key = (generation, l, i);
+        if self.in_flight.len() <= DEPTH
+            && !self.in_flight.contains(&key)
+            && self
+                .queue
+                .try_send(Job {
+                    generation,
+                    l,
+                    i,
+                    source,
+                    binding,
+                })
+                .is_ok()
+        {
+            self.in_flight.insert(key);
         }
-    })
+    }
+
+    pub(crate) fn drain(&mut self) -> Vec<Done> {
+        let done: Vec<_> = self.done.try_iter().collect();
+        for result in &done {
+            self.in_flight
+                .remove(&(result.generation, result.l, result.i));
+        }
+        done
+    }
+
+    pub(crate) fn finish(self) {
+        drop(self.queue);
+        let _ = self.worker.join();
+    }
 }
 
 /// Whether the user enables model compaction. `RPI_OPTCHAT_COMPACT` is the launch
@@ -187,172 +243,124 @@ fn parse_reply(stdout: &str) -> Option<String> {
     Some(super::memory::clip(&super::memory::flat(&text), LINE))
 }
 
-fn command(exe: &PathBuf) -> Command {
+fn command(exe: &Path, binding: &Binding) -> Command {
     let mut command = Command::new(exe);
-    command
-        .arg("-p")
-        // Ephemeral: a compaction is not a conversation worth resuming, and
-        // writing a session file per merge would fill the project directory.
-        .arg("--no-session")
-        // Recursion guard: the child must not load this plugin, or ask for its
-        // own memory tools, and must not spend a turn calling anything.
-        .arg("--no-extensions")
-        .arg("--no-tools")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    if let Ok(binding) = binding().lock() {
-        if let Some((provider, model)) = binding.as_ref() {
-            if let Some(provider) = provider {
-                command.arg("--provider").arg(provider);
-            }
-            if Some(model.as_ref()).flatten().is_some() {
-                if let Some(model) = model {
-                    command.arg("--model").arg(model);
-                }
-            }
-        }
+    command.args(["-p", "--no-session", "--no-extensions", "--no-tools"]);
+    if let Some(cwd) = &binding.cwd {
+        command.current_dir(cwd);
+    }
+    if let Some(provider) = &binding.provider {
+        command.arg("--provider").arg(provider);
+    }
+    if let Some(model) = &binding.model {
+        command.arg("--model").arg(model);
     }
     command
 }
 
-/// Run one call: prompt on stdin, answer on stdout, killed at the deadline.
-fn run(exe: &PathBuf, job: &Job) -> Result<String, String> {
-    let mut child = command(exe)
+/// Anonymous files keep child I/O from blocking shutdown, including when a
+/// descendant keeps a standard stream open. Poll the child directly so the
+/// library never installs a process-wide signal handler.
+fn run(exe: &Path, job: &Job, cancelled: impl Fn() -> bool) -> Result<String, String> {
+    let mut input = tempfile::tempfile().map_err(|error| error.to_string())?;
+    input
+        .write_all(prompt(job).as_bytes())
+        .map_err(|error| error.to_string())?;
+    input.rewind().map_err(|error| error.to_string())?;
+    let mut output = tempfile::tempfile().map_err(|error| error.to_string())?;
+    let mut errors = tempfile::tempfile().map_err(|error| error.to_string())?;
+    let mut child = command(exe, &job.binding)
+        .stdin(Stdio::from(input))
+        .stdout(Stdio::from(
+            output.try_clone().map_err(|error| error.to_string())?,
+        ))
+        .stderr(Stdio::from(
+            errors.try_clone().map_err(|error| error.to_string())?,
+        ))
         .spawn()
         .map_err(|error| format!("cannot start the compactor: {error}"))?;
-    if let Some(mut stdin) = child.stdin.take() {
-        let _ = stdin.write_all(prompt(job).as_bytes());
-    }
-    let deadline = timeout();
-    match child
-        .wait_timeout(deadline)
-        .map_err(|error| format!("cannot wait for the compactor: {error}"))?
-    {
-        Some(_) => {}
-        None => {
-            let _ = child.kill();
-            let _ = child.wait();
-            return Err(format!(
-                "compaction took longer than {}s",
-                deadline.as_secs()
-            ));
+    let limit = timeout();
+    let deadline = Instant::now() + limit;
+    let status = loop {
+        let failure = match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Err(error) => format!("cannot wait for the compactor: {error}"),
+            Ok(None) if cancelled() => "compaction cancelled".to_string(),
+            Ok(None) if Instant::now() >= deadline => {
+                format!("compaction took longer than {}s", limit.as_secs())
+            }
+            Ok(None) => {
+                thread::sleep(Duration::from_millis(20));
+                continue;
+            }
+        };
+        if let Err(error) = child.kill() {
+            if !matches!(child.try_wait(), Ok(Some(_))) {
+                return Err(format!("{failure}; could not kill compactor: {error}"));
+            }
+        } else {
+            let reap_deadline = Instant::now() + Duration::from_secs(2);
+            while matches!(child.try_wait(), Ok(None)) && Instant::now() < reap_deadline {
+                thread::sleep(Duration::from_millis(20));
+            }
         }
-    }
-    let output = child
-        .wait_with_output()
-        .map_err(|error| format!("cannot read the compactor output: {error}"))?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(failure);
+    };
+    let read = |file: &mut std::fs::File| -> Result<String, String> {
+        let mut bytes = Vec::new();
+        file.rewind()
+            .and_then(|_| file.take(64 * 1024).read_to_end(&mut bytes))
+            .map_err(|error| format!("cannot read the compactor output: {error}"))?;
+        Ok(String::from_utf8_lossy(&bytes).into_owned())
+    };
+    if !status.success() {
+        let stderr = read(&mut errors)?;
         return Err(format!(
-            "compactor exited with {}: {}",
-            output.status,
+            "compactor exited with {status}: {}",
             stderr.trim().lines().next().unwrap_or("")
         ));
     }
-    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-    parse_reply(&stdout).ok_or_else(|| "compactor returned no usable line".to_string())
+    parse_reply(&read(&mut output)?).ok_or_else(|| "compactor returned no usable line".to_string())
 }
 
-fn worker(jobs: Receiver<Job>, done: SyncSender<Done>) {
-    let Some(exe) = executable() else {
-        // No host binary: leave every line extractive.
-        for _ in jobs {}
-        return;
-    };
+fn worker(
+    jobs: Receiver<Job>,
+    done: Sender<Done>,
+    stopping: Arc<AtomicBool>,
+    generation: Arc<AtomicU64>,
+) {
+    let exe = executable().and_then(|path| path.canonicalize().ok());
     while let Ok(job) = jobs.recv() {
-        match run(&exe, &job) {
-            Ok(text) => {
-                let _ = done.try_send(Done {
-                    l: job.l,
-                    i: job.i,
-                    text,
-                });
-            }
-            Err(error) => {
-                let _ = done.try_send(Done {
-                    l: job.l,
-                    i: job.i,
-                    text: String::new(),
-                });
-                if std::env::var_os("RPI_OPTCHAT_DEBUG").is_some() {
-                    eprintln!(
-                        "[optchat] compaction {}+{}: {error}",
+        if stopping.load(Ordering::Acquire) {
+            break;
+        }
+        let cancelled = || {
+            stopping.load(Ordering::Acquire) || generation.load(Ordering::Acquire) != job.generation
+        };
+        let text = match exe.as_ref().filter(|_| !cancelled()) {
+            Some(exe) => run(exe, &job, cancelled).unwrap_or_else(|error| {
+                if !cancelled() {
+                    super::debug(&format!(
+                        "compaction {}+{}: {error}",
                         job.i << job.l,
                         1 << job.l
-                    );
+                    ));
                 }
-            }
+                String::new()
+            }),
+            None => String::new(),
+        };
+        if done
+            .send(Done {
+                generation: job.generation,
+                l: job.l,
+                i: job.i,
+                text,
+            })
+            .is_err()
+        {
+            break;
         }
-    }
-}
-
-/// Queue one merge for compression. A merge already queued is skipped, and a
-/// full queue drops the job: an idle engine catches up later.
-pub(crate) fn enqueue(l: u32, i: u64, source: String) {
-    if !in_flight()
-        .lock()
-        .unwrap_or_else(|error| error.into_inner())
-        .insert((l, i))
-    {
-        return;
-    }
-    if engine().queue.try_send(Job { l, i, source }).is_err() {
-        in_flight()
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .remove(&(l, i));
-    }
-}
-
-/// Completed lines, ready to install. Never blocks a turn. A `Done` with an
-/// empty text reports a failed call: the extractive line stays and the merge may
-/// be asked for again.
-pub(crate) fn drain() -> Vec<Done> {
-    let mut out = Vec::new();
-    {
-        let receiver = engine()
-            .done
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
-        while let Ok(done) = receiver.try_recv() {
-            out.push(done);
-        }
-    }
-    let mut queued = in_flight()
-        .lock()
-        .unwrap_or_else(|error| error.into_inner());
-    for done in &out {
-        queued.remove(&(done.l, done.i));
-    }
-    out
-}
-
-/// Provider/model of this session, so the child runs on the same model instead
-/// of the default one (which may be another provider or unauthenticated).
-pub(crate) fn bind_session(
-    call: &impl Fn(u32, serde_json::Value) -> Result<serde_json::Value, String>,
-) {
-    let Ok(value) = call(GET_EXECUTION_CONTEXT, json!({})) else {
-        return;
-    };
-    let provider = value
-        .get("model")
-        .and_then(|model| model.get("provider"))
-        .and_then(|value| value.as_str())
-        .filter(|value| !value.trim().is_empty())
-        .map(str::to_string);
-    let model = value
-        .get("model")
-        .and_then(|model| model.get("id"))
-        .and_then(|value| value.as_str())
-        .filter(|value| !value.trim().is_empty())
-        .map(str::to_string);
-    if provider.is_none() && model.is_none() {
-        return;
-    }
-    if let Ok(mut slot) = binding().lock() {
-        *slot = Some((provider, model));
     }
 }
 
@@ -362,6 +370,8 @@ mod tests {
 
     fn job(source: &str) -> Job {
         Job {
+            generation: 0,
+            binding: Binding::default(),
             l: 1,
             i: 0,
             source: source.to_string(),
@@ -394,7 +404,7 @@ mod tests {
 
     #[test]
     fn command_is_ephemeral_and_tool_free() {
-        let command = command(&PathBuf::from("/usr/bin/rpi"));
+        let command = command(Path::new("/usr/bin/rpi"), &Binding::default());
         let args: Vec<String> = command
             .get_args()
             .map(|arg| arg.to_string_lossy().into_owned())
@@ -439,7 +449,7 @@ mod tests {
     fn run_script(path: &PathBuf, job: &Job) -> Result<String, String> {
         let mut delay = std::time::Duration::from_millis(10);
         for _ in 0..40 {
-            match run(path, job) {
+            match run(path, job, || false) {
                 Err(error) if error.contains("Text file busy") => {
                     std::thread::sleep(delay);
                     delay = (delay * 2).min(std::time::Duration::from_millis(200));
@@ -447,7 +457,7 @@ mod tests {
                 result => return result,
             }
         }
-        run(path, job)
+        run(path, job, || false)
     }
 
     #[cfg(unix)]

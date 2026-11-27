@@ -88,7 +88,9 @@ export function staleSessionIds(
       )
         return false;
       if (
-        ["running", "starting", "awaiting_input"].includes(session.status ?? "")
+        ["running", "compacting", "starting", "awaiting_input"].includes(
+          session.status ?? "",
+        )
       )
         return false;
       const ended = session.lastTurnEndedAt;

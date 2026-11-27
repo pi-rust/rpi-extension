@@ -6793,6 +6793,88 @@ test("snapshot overlap neither duplicates committed messages nor downgrades comp
   await expect(page.locator(".transcript-note")).toHaveText(["Completed once"]);
 });
 
+test("snapshot and live events share committed assistant message IDs", async ({
+  page,
+}) => {
+  await mockHost(page);
+  const thinking = { type: "thinking", thinking: "**Checking staging**" };
+  const assistant = {
+    role: "assistant",
+    timestamp: 42,
+    content: [thinking, { type: "text", text: "Saved assistant response" }],
+  };
+  const committedEvent = {
+    messageId: "saved-assistant",
+    message: assistant,
+  };
+  await page.route(`**/api/v1/sessions/${sessionId}/open`, (route) =>
+    route.fulfill({ json: { ...session, status: "running" } }),
+  );
+  await page.route(snapshotRoute, (route) =>
+    route.fulfill({
+      json: {
+        sessionId,
+        status: "running",
+        messages: [{ ...assistant, entryId: committedEvent.messageId }],
+        events: [{ seq: 5, event: { type: "message_update", ...committedEvent } }],
+        lastSeq: 5,
+      },
+    }),
+  );
+
+  let release!: () => void;
+  const live = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  await page.route(`**/api/v1/sessions/${sessionId}/events?*`, async (route) => {
+    await live;
+    const events = [
+      { type: "message_end", ...committedEvent },
+      {
+        type: "message_start",
+        messageId: "new-assistant",
+        message: { role: "assistant", content: [] },
+      },
+      {
+        type: "message_end",
+        messageId: "new-assistant",
+        message: {
+          role: "assistant",
+          timestamp: 43,
+          content: [thinking, { type: "text", text: "New assistant response" }],
+        },
+      },
+    ];
+    return route.fulfill({
+      contentType: "text/event-stream",
+      body:
+        "retry: 60000\n" +
+        events
+          .map(
+            (event, index) =>
+              `id: ${6 + index}\nevent: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`,
+          )
+          .join(""),
+    });
+  });
+
+  try {
+    await page.goto(`/?session=${sessionId}`);
+    const thoughts = page.locator(".thinking-row");
+    const saved = page.getByText("Saved assistant response", { exact: true });
+    await expect(saved).toHaveCount(1);
+    await expect(thoughts).toHaveCount(1);
+    release();
+    await expect(
+      page.getByText("New assistant response", { exact: true }),
+    ).toBeVisible();
+    await expect(saved).toHaveCount(1);
+    await expect(thoughts).toHaveCount(2);
+  } finally {
+    release();
+  }
+});
+
 test("read images show outside tool details on live completion and reload", async ({
   page,
 }) => {
@@ -7646,6 +7728,72 @@ for (const source of ["snapshot", "live"]) {
     expect([...answered]).toEqual(["first", "second"]);
   });
 }
+
+test("compact commands show a compacting label while other runs keep processing", async ({
+  page,
+}) => {
+  await page.addInitScript(
+    (value) => localStorage.setItem("rpi-web-language", value),
+    "en",
+  );
+  const seed = {
+    role: "user",
+    entryId: "compact-status-seed",
+    content: "before compact",
+  };
+  await mockHost(page, { snapshotMessages: [seed] });
+  // The host answers `get_state` with whatever operation is live. A reload must
+  // rebuild the label from this snapshot, not from replayed SSE frames.
+  let activeOperation: Record<string, unknown> | null = {
+    runId: "run-compact",
+    kind: "compact",
+  };
+  await page.route(
+    `**/api/v1/sessions/${sessionId}/commands`,
+    async (route) => {
+      if (route.request().postDataJSON().type !== "get_state")
+        return route.fallback();
+      return route.fulfill({
+        json: response(
+          {
+            sessionId,
+            leafId: "leaf-1",
+            activeOperation,
+            queue: { steeringCount: 0, followUpCount: 0 },
+            stats: {
+              messageCount: 0,
+              cachedTokens: 0,
+              uncachedTokens: 0,
+              totalTokens: 0,
+              costTotal: 0,
+            },
+          },
+          "get_state",
+        ),
+      });
+    },
+  );
+  // A real host only replays frames past the snapshot cursor, so the compact
+  // acceptance belongs to the first stream only: replaying it after the switch
+  // would claim a compaction that the live session no longer runs.
+  let replayCompact = true;
+  await page.route(`**/api/v1/sessions/${sessionId}/events?*`, (route) =>
+    route.fulfill({
+      contentType: "text/event-stream",
+      body: replayCompact
+        ? 'id: 7\nevent: operation_accepted\ndata: {"type":"operation_accepted","command":"compact"}\n\n'
+        : "retry: 60000\n",
+    }),
+  );
+  await page.goto("/");
+  await expect(page.locator(".working-indicator")).toContainText("Compacting…");
+
+  // The compaction settled and an ordinary run started.
+  replayCompact = false;
+  activeOperation = { runId: "run-prompt", kind: "run" };
+  await page.reload();
+  await expect(page.locator(".working-indicator")).toContainText("Processing…");
+});
 
 test("a rejected compact command releases the composer and restores its draft", async ({
   page,
@@ -10672,6 +10820,118 @@ test.describe("run timing regressions", () => {
     await expect(
       metrics.getByLabel("会话工作时长: 3m 20s", { exact: true }),
     ).toBeVisible();
+  });
+
+  test("composer footer ticks during an active run and settles to recorded time", async ({
+    page,
+  }) => {
+    await mockHost(page);
+    const messages = [finalMessage()];
+    const liveRun = "current-run";
+    const now = new Date("2026-11-27T12:00:00Z");
+    const historyData = {
+      records: [],
+      hasMore: false,
+      openOperations: [
+        {
+          id: liveRun,
+          lane: "main",
+          intent: { kind: "run" },
+          timestamp: now.getTime() - 20_000,
+        },
+      ],
+    };
+    const nativeStart = gate();
+    const refresh = gate();
+    const completion = gate();
+    let refreshed = false;
+    let settled = false;
+    await page.clock.install({ time: now });
+    await page.route(snapshotRoute, (route) =>
+      route.fulfill({
+        json: {
+          sessionId,
+          messages: refreshed
+            ? [...messages, finalMessage("refreshed", "Refreshed transcript")]
+            : messages,
+          events: [],
+          lastSeq: settled ? 6 : refreshed ? 5 : 4,
+          status: settled ? "ready" : "running",
+        },
+      }),
+    );
+    await page.route(`**/api/v1/sessions/${sessionId}/open`, (route) =>
+      route.fulfill({ json: session }),
+    );
+    await page.route(`**/api/v1/sessions/${sessionId}/commands`, async (route) => {
+      if (route.request().postDataJSON().type !== "get_history")
+        return route.fallback();
+      await nativeStart.promise;
+      return route.fulfill({ json: response(historyData) });
+    });
+    await page.route(timingRoute, (route) =>
+      route.fulfill({
+        json: timingPage([
+          nativeTiming(undefined, "previous-run", "completed", 2_000),
+          ...(settled ? [nativeTiming(undefined, liveRun, "completed", 36_000)] : []),
+        ]),
+      }),
+    );
+    await page.route(`**/api/v1/sessions/${sessionId}/events?*`, async (route) => {
+      if (!refreshed) {
+        await refresh.promise;
+        refreshed = true;
+        return route.fulfill({
+          contentType: "text/event-stream",
+          body: 'retry: 100\nid: 5\nevent: agent_start\ndata: {"type":"agent_start"}\n\n',
+        });
+      }
+      await completion.promise;
+      const event = { type: "agent_settled", runId: liveRun, outcome: "completed" };
+      return route.fulfill({
+        contentType: "text/event-stream",
+        body: `retry: 60000\nid: 6\nevent: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`,
+      });
+    });
+
+    try {
+      await page.goto(`/?session=${sessionId}`);
+      const metric = page.getByLabel(/^Session work:/);
+      await expect(metric).toHaveAttribute(
+        "title",
+        "Recorded work time plus time since this page detected the current run",
+      );
+      nativeStart.release();
+      await expect(metric).toHaveAttribute(
+        "title",
+        "Recorded work time plus the current run",
+      );
+      refresh.release();
+      await expect(page.getByText("Refreshed transcript")).toBeVisible();
+      await expect(metric).toHaveAttribute(
+        "title",
+        "Recorded work time plus the current run",
+      );
+      const elapsedSeconds = async () => {
+        const text = await metric.innerText();
+        const part = (unit: string) =>
+          Number(text.match(new RegExp(`(\\d+)${unit}`))?.[1] ?? 0);
+        return part("h") * 3600 + part("m") * 60 + part("s");
+      };
+      await expect.poll(elapsedSeconds).toBeGreaterThanOrEqual(22);
+      const before = await elapsedSeconds();
+      await page.clock.runFor(2500);
+      await expect.poll(elapsedSeconds).toBeGreaterThanOrEqual(before + 2);
+      settled = true;
+      completion.release();
+      await expect(metric).toHaveText("38s");
+      await page.clock.runFor(3000);
+      await expect(metric).toHaveText("38s");
+    } finally {
+      nativeStart.release();
+      refresh.release();
+      completion.release();
+    }
   });
 
   test("composer footer shows unknown work when native timings are unavailable", async ({

@@ -267,7 +267,7 @@ impl HostSession {
             match tokio::time::timeout(Duration::from_secs(10), task).await {
                 Err(_) => {
                     return Err(ResourceError::unavailable(
-                        "native child exit not established; configuration remains blocked",
+                        "native session retirement not established; configuration remains blocked",
                     ))
                 }
                 Ok(_) => {
@@ -275,8 +275,17 @@ impl HostSession {
                 }
             }
         }
-        // Independent OS-reap evidence is mandatory, including after ordinary
-        // shutdown aborted the RPC reader and removed its JoinHandle.
+        // Socket EOF follows native writer retirement. An aborted reader
+        // does not establish that the native session closed.
+        if let Some(eof) = &self.socket_eof {
+            if eof.load(Ordering::Acquire) {
+                return Ok(());
+            }
+            return Err(ResourceError::unavailable(
+                "local Host session close not confirmed",
+            ));
+        }
+        // An owned process needs independent OS-reap evidence.
         if let Some(child) = &self.child_owner {
             child
                 .stop_checked()

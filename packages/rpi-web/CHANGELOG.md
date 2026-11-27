@@ -2,6 +2,33 @@
 
 ## [Unreleased]
 
+## [0.1.95](https://github.com/pi-rust/rpi-extension/compare/rpi-web-v0.1.86...rpi-web-v0.1.95) - 2026-11-27
+
+First stable Web release after the 0.1.87–0.1.95 preview series, built from `main`
+(production frontend without the preview badge).
+
+### Added
+
+- *(web)* add a progress ring to the composer action button (#102)
+
+### Changed
+
+- *(web)* remove the redundant Fork session action (#87)
+- *(web)* revert the saved default model and thinking UI (#86)
+
+### Fixed
+
+- *(web)* deduplicate committed assistant messages across snapshot replay and the live SSE stream (#117)
+- *(web)* show saved session history while native opens (#106)
+- *(web)* align read thumbnails with tool labels (#104)
+- *(web)* archive multi-selected sessions in one batch request and stay on the project view after archiving (#97)
+- *(web)* show read images outside tool details (#100)
+- *(web)* suppress completion notifications for skipped runs (#92)
+- *(web)* keep mobile composer opaque over empty-state copy (#91)
+- *(web)* keep queued messages visible when stopping a run (#84)
+- *(web)* total every native run in the session work metric (#85)
+- *(web)* improve installed workspace icons (#83)
+
 ## [0.1.94-preview](https://github.com/pi-rust/rpi-extension/compare/rpi-web-v0.1.93-preview...rpi-web-v0.1.94-preview) - 2026-11-26
 
 ### Fixed

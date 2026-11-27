@@ -1,3 +1,36 @@
+export interface UpdateEntry {
+  name: string;
+  current: string;
+  latest?: string | null;
+  updatable: boolean;
+  reason?: string | null;
+}
+
+export interface UpdateInfo {
+  currentVersion?: string;
+  lastCheckedAt?: number;
+  checkedAt?: number;
+  /**
+   * Present only when the backend answered with a full inventory. The
+   * `unavailable_response` fallback drops `host`, and an older CLI that does
+   * not implement `rpi updates` answers with the model's prose, so neither
+   * field may be treated as always present.
+   */
+  host?: UpdateEntry;
+  extensions?: UpdateEntry[];
+  proxy?: string | null;
+  proxyConfigured?: boolean;
+  error?: string;
+}
+
+export interface UpdateTaskStatus {
+  state: "running" | "succeeded" | "failed";
+  target: string;
+  message: string;
+  log: string;
+  restartRequired: boolean;
+}
+
 export interface Capabilities {
   /** Installed build reported by the host; absent on older services. */
   version?: string;
@@ -1318,6 +1351,25 @@ export const api = {
       signal,
     ),
   tools: (id: string) => commandData<ToolCatalog>(id, "get_available_tools"),
+  updatesCheck: (force = false) =>
+    request<UpdateInfo>(`/updates/check${force ? "?force=1" : ""}`),
+  saveUpdatesProxy: (proxy: string) =>
+    request<{ proxy: string | null; proxyConfigured: boolean }>(
+      "/updates/proxy",
+      {
+        method: "POST",
+        body: JSON.stringify({ proxy }),
+      },
+    ),
+  installUpdate: (target: "host" | "extension") =>
+    request<{ taskId: string }>("/updates/install", {
+      method: "POST",
+      body: JSON.stringify({ target }),
+    }),
+  updateTaskStatus: (taskId: string) =>
+    request<UpdateTaskStatus>(
+      `/updates/status?${new URLSearchParams({ taskId })}`,
+    ),
 };
 
 export function extractText(value: unknown): string {

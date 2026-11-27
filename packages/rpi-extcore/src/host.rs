@@ -1,6 +1,8 @@
 use serde_json::{json, Value};
 mod admission;
 mod child;
+#[cfg(unix)]
+pub(crate) mod local_socket;
 mod resources;
 mod startup;
 use admission::{ExecutionAdmission, ExecutionProjection, ExecutionTicket};
@@ -9,7 +11,7 @@ use std::{
     collections::{HashMap, VecDeque},
     path::PathBuf,
     sync::{
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         Arc, Mutex as StdMutex, OnceLock,
     },
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -23,23 +25,35 @@ use tokio::{
 /// transcript without asking the native host for history.
 const HISTORY_LIMIT: usize = 512;
 
-async fn read_ready(
+async fn read_startup_frame(
     reader: &mut (impl AsyncBufRead + Unpin),
-    timeout: Duration,
+    deadline: tokio::time::Instant,
+    timeout_error: &str,
 ) -> Result<Value, String> {
-    let mut first_line = String::new();
-    let count = tokio::time::timeout(timeout, reader.take(1024 * 1024).read_line(&mut first_line))
+    let mut line = String::new();
+    let count = tokio::time::timeout_at(deadline, reader.take(1024 * 1024).read_line(&mut line))
         .await
-        .map_err(|_| "native rpi host startup timed out".to_string())?
+        .map_err(|_| timeout_error.to_string())?
         .map_err(|error| format!("failed to read rpi ready frame: {error}"))?;
     if count == 0 {
         return Err("native rpi host closed stdout before ready (EOF)".into());
     }
-    if count == 1024 * 1024 && !first_line.ends_with('\n') {
+    if count == 1024 * 1024 && !line.ends_with('\n') {
         return Err("rpi ready frame exceeds startup frame limit".into());
     }
-    let ready: Value = serde_json::from_str(first_line.trim())
-        .map_err(|error| format!("invalid rpi ready frame: {error}"))?;
+    serde_json::from_str(line.trim()).map_err(|error| format!("invalid rpi ready frame: {error}"))
+}
+
+async fn read_ready(
+    reader: &mut (impl AsyncBufRead + Unpin),
+    timeout: Duration,
+) -> Result<Value, String> {
+    let ready = read_startup_frame(
+        reader,
+        tokio::time::Instant::now() + timeout,
+        "native rpi host startup timed out",
+    )
+    .await?;
     if ready["type"] != "ready" || ready["protocol"] != "rpi" {
         return Err("native child did not advertise protocol rpi".into());
     }
@@ -334,6 +348,7 @@ impl std::error::Error for IdleCloseError {}
 
 pub struct HostSession {
     child_owner: Option<child::NativeChild>,
+    socket_eof: Option<Arc<AtomicBool>>,
     worker: Worker,
     shutdown_gate: Mutex<()>,
     ready: Value,
@@ -780,6 +795,19 @@ impl HostSession {
         Self::spawn_transport(options, None, None, true).await
     }
 
+    #[cfg(unix)]
+    pub(crate) async fn connect_local_socket(
+        options: SessionOptions,
+        fork_cut: Option<&str>,
+        path: &std::path::Path,
+    ) -> Result<Arc<Self>, String> {
+        let guard = startup::LaunchGuard::acquire(&options)?;
+        let resource_file = resources::StartupFile::prepare(&options).await?;
+        let (reader, writer, ready) =
+            local_socket::open(path, &options, fork_cut, resource_file.as_ref()).await?;
+        Self::start_rpc(options, ready, reader, writer, None, Some(guard)).await
+    }
+
     pub(crate) async fn attach_area(
         executable: PathBuf,
         project: PathBuf,
@@ -995,7 +1023,17 @@ impl HostSession {
                     .await);
             }
         }
-        let launch_options = options;
+        Self::start_rpc(options, ready, reader, stdin, Some(child_owner), None).await
+    }
+
+    async fn start_rpc(
+        launch_options: SessionOptions,
+        ready: Value,
+        reader: impl AsyncBufRead + Unpin + Send + 'static,
+        stdin: impl AsyncWrite + Unpin + Send + 'static,
+        child_owner: Option<child::NativeChild>,
+        socket_guard: Option<startup::LaunchGuard>,
+    ) -> Result<Arc<Self>, String> {
         let session_id = &launch_options.session_id;
         let mut timings =
             crate::timing::ToolTimings::load(launch_options.timings_dir.join(format!(
@@ -1038,10 +1076,15 @@ impl HostSession {
             external_bridge: StdMutex::new(std::sync::Weak::new()),
             file_io_bridge: StdMutex::new(std::sync::Weak::new()),
         });
-        let child_stop = child_owner.stop_signal();
-        let child_exit = child_owner.exit_signal();
+        let child_signals = child_owner
+            .as_ref()
+            .map(|child| (child.stop_signal(), child.exit_signal()));
+        let socket_eof = socket_guard
+            .as_ref()
+            .map(|_| Arc::new(AtomicBool::new(false)));
         let session = Arc::new(Self {
-            child_owner: Some(child_owner),
+            child_owner,
+            socket_eof: socket_eof.clone(),
             worker: Arc::new(Mutex::new(None)),
             shutdown_gate: Mutex::new(()),
             ready: ready.clone(),
@@ -1076,23 +1119,47 @@ impl HostSession {
         let history_reader = history.clone();
         let seq_reader = seq.clone();
         let worker = tokio::spawn(async move {
+            let _socket_guard = socket_guard;
             let mut closed = runtime.closed_signal.subscribe();
             let mut lines = reader.lines();
+            let mut writer_done = false;
             loop {
                 let line = tokio::select! {
-                    _ = async { let _ = closed.wait_for(|v| *v).await; } => break,
-                    failure = &mut writer_failure => {
+                    _ = async { let _ = closed.wait_for(|v| *v).await; }, if !writer_done => {
+                        if socket_eof.is_none() {
+                            break;
+                        }
+                        writer.abort();
+                        writer_done = true;
+                        continue;
+                    }
+                    failure = &mut writer_failure, if !writer_done => {
                         if let Ok(error) = failure {
                             publish(&events_reader, &history_reader, &state_reader, &seq_reader,
                                 json!({"type":"host_error","error":error})).await;
                         }
-                        break;
+                        if socket_eof.is_none() {
+                            break;
+                        }
+                        // Closing the write half requests native retirement. Read
+                        // through EOF to observe completion before reopening.
+                        writer_done = true;
+                        continue;
                     }
                     line = lines.next_line() => match line {
                         Ok(Some(line)) => line,
-                        _ => break,
+                        Ok(None) => {
+                            if let Some(eof) = &socket_eof {
+                                eof.store(true, Ordering::Release);
+                            }
+                            break;
+                        }
+                        Err(_) => break,
                     }
                 };
+                if writer_done || *closed.borrow() {
+                    continue;
+                }
                 let Ok(mut value) = serde_json::from_str::<Value>(&line) else {
                     publish(
                         &events_reader,
@@ -1106,7 +1173,11 @@ impl HostSession {
                 };
                 if runtime.route_external(&value).is_err() || runtime.route_file_io(&value).is_err()
                 {
-                    break;
+                    if socket_eof.is_none() {
+                        break;
+                    }
+                    runtime.fail_closed();
+                    continue;
                 }
                 let execution_projection = runtime
                     .execution
@@ -1170,8 +1241,10 @@ impl HostSession {
             let _ = finish.await;
             writer.abort();
             let _ = writer.await;
-            child_stop.send_replace(true);
-            let _ = child::NativeChild::wait_checked(child_exit).await;
+            if let Some((stop, exit)) = child_signals {
+                stop.send_replace(true);
+                let _ = child::NativeChild::wait_checked(exit).await;
+            }
         });
 
         *session.worker.lock().await = Some(worker);
@@ -1336,6 +1409,10 @@ impl HostSession {
     }
 
     pub async fn terminate(&self) {
+        if self.socket_eof.is_some() {
+            let _ = self.await_resource_exit().await;
+            return;
+        }
         let _guard = self.shutdown_gate.lock().await;
         self.terminate_worker().await;
         if let Some(child) = &self.child_owner {
@@ -1388,6 +1465,7 @@ impl HostSession {
         let execution = ExecutionAdmission::from_ready(&ready);
         let session = Arc::new(Self {
             child_owner: None,
+            socket_eof: None,
             worker: Arc::new(Mutex::new(None)),
             shutdown_gate: Mutex::new(()),
             ready,
@@ -1587,7 +1665,7 @@ impl HostSession {
 
     /// Best-effort `stop` before the registry drops this session.
     pub async fn stop(&self) {
-        if self.is_shared_area() {
+        if self.is_shared_area() || self.socket_eof.is_some() {
             self.runtime.closed_signal.send_replace(true);
             return;
         }
@@ -1608,6 +1686,10 @@ impl HostSession {
     }
 
     pub async fn shutdown(&self) {
+        if self.socket_eof.is_some() {
+            let _ = self.await_resource_exit().await;
+            return;
+        }
         let _guard = self.shutdown_gate.lock().await;
         let _ = tokio::time::timeout(Duration::from_secs(1), self.stop()).await;
         let mut worker = self.worker.lock().await;
@@ -1770,6 +1852,12 @@ impl HostSession {
     }
 
     async fn shutdown_idle_child(&self) -> Result<(), IdleCloseError> {
+        if self.socket_eof.is_some() {
+            return self
+                .await_resource_exit()
+                .await
+                .map_err(|error| IdleCloseError::Unavailable(error.to_string()));
+        }
         self.shutdown().await;
         // shutdown's legacy best-effort contract is unchanged. This stricter
         // API may only report success once the independent reaper confirms exit.
@@ -1958,6 +2046,10 @@ impl Drop for HostSession {
         }
         if let Some(bridge) = self.external_owner.lock().expect("external owner").take() {
             bridge.close();
+        }
+        if self.socket_eof.is_some() {
+            // The detached reader owns the launch guard until native EOF.
+            return;
         }
         if let Ok(worker) = self.worker.try_lock() {
             if let Some(task) = worker.as_ref() {

@@ -126,6 +126,10 @@ LANGFUSE_BASE_URL=https://langfuse.laofu.online LANGFUSE_PUBLIC_KEY=pk-lf-... LA
 #   live_plugin_event_flow   —— 驱动真实事件处理器跑完整一轮（root + generation）再读回
 ```
 
+## Unix 本地 Host
+
+此扩展继续使用独立插件映像。插件的追踪状态和宿主回调目前由映像持有，父 trace 还通过进程级 `LANGFUSE_PI_PARENT_*` 环境变量传递。要启用共享映像，宿主需要在创建子代理时按父会话和当前 turn 传递 trace 上下文，插件也需要把追踪和导出状态绑定到单次注册。
+
 ## 配置
 
 支持两种配置方式，环境变量优先级高于配置文件。

@@ -8,8 +8,7 @@
 
 use cpal::traits::{DeviceTrait, HostTrait};
 use rodio::buffer::SamplesBuffer;
-use rodio::{OutputStream, OutputStreamHandle, Sink};
-use std::cell::RefCell;
+use rodio::{OutputStream, Sink};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::mpsc::{Receiver, Sender};
 use std::sync::Arc;
@@ -216,15 +215,17 @@ struct ChunkSource {
     current: Vec<u8>,
     pos: usize,
     finished: bool,
+    stop: Arc<AtomicBool>,
 }
 
 impl ChunkSource {
-    fn new(rx: Receiver<Vec<u8>>) -> Self {
+    fn new(rx: Receiver<Vec<u8>>, stop: Arc<AtomicBool>) -> Self {
         Self {
             rx: Arc::new(std::sync::Mutex::new(rx)),
             current: Vec::new(),
             pos: 0,
             finished: false,
+            stop,
         }
     }
 }
@@ -232,6 +233,9 @@ impl ChunkSource {
 impl std::io::Read for ChunkSource {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
         loop {
+            if self.stop.load(Ordering::Relaxed) {
+                return Ok(0);
+            }
             if self.pos < self.current.len() {
                 let n = (self.current.len() - self.pos).min(buf.len());
                 buf[..n].copy_from_slice(&self.current[self.pos..self.pos + n]);
@@ -245,7 +249,7 @@ impl std::io::Read for ChunkSource {
                 .rx
                 .lock()
                 .map_err(|_| std::io::Error::other("chunk channel poisoned"))?
-                .recv();
+                .recv_timeout(Duration::from_millis(20));
             match next {
                 Ok(chunk) => {
                     self.current = chunk;
@@ -254,7 +258,8 @@ impl std::io::Read for ChunkSource {
                 // Producer hung up: a normal end-of-stream as far as the decoder
                 // is concerned (symphonia tolerates a stream that stops at a
                 // packet boundary, which MP3's framing guarantees).
-                Err(_) => {
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
                     self.finished = true;
                     return Ok(0);
                 }
@@ -318,52 +323,6 @@ impl MediaSource for ChunkSource {
 /// noise — it removes the step discontinuity where the device starts delivering
 /// a non-zero waveform, which is what an abrupt start sounds like.
 const FADE_FRAMES: usize = 240;
-
-/// The audio device, opened once per process and kept alive.
-///
-/// Reopening the output stream for every spoken sentence is what made each
-/// chunk begin with a click: the device is started from a stopped state while
-/// the first samples are already non-silent. Keeping one stream open and only
-/// creating a fresh [`Sink`] per utterance keeps the device running, so the
-/// transition into speech is continuous.
-struct PlaybackSession {
-    /// Held only to keep the device open; dropping it ends playback.
-    _stream: OutputStream,
-    handle: OutputStreamHandle,
-    /// Device name the stream was opened on, so a changed
-    /// `RPI_VOICE_OUTPUT_DEVICE` re-opens rather than silently keeping the old one.
-    device: String,
-}
-
-thread_local! {
-    /// One session per thread. The TTS worker owns playback, so this is the
-    /// device for the whole process without needing `OutputStream: Send`.
-    static SESSION: RefCell<Option<PlaybackSession>> = const { RefCell::new(None) };
-}
-
-/// Run `f` with the process's persistent output stream, opening it on first use
-/// (or re-opening it when the configured device changed).
-fn with_session<T>(
-    device: &cpal::Device,
-    f: impl FnOnce(&OutputStreamHandle) -> T,
-) -> Result<T, String> {
-    let name = device.name().unwrap_or_default();
-    SESSION.with(|slot| {
-        let mut slot = slot.borrow_mut();
-        let stale = slot.as_ref().is_some_and(|s| s.device != name);
-        if slot.is_none() || stale {
-            let (stream, handle) = OutputStream::try_from_device(device)
-                .map_err(|e| format!("Audio output error on `{name}`: {e}"))?;
-            *slot = Some(PlaybackSession {
-                _stream: stream,
-                handle,
-                device: name,
-            });
-        }
-        let session = slot.as_ref().expect("session just created");
-        Ok(f(&session.handle))
-    })
-}
 
 /// Apply a linear fade to one interleaved buffer in place.
 ///
@@ -484,35 +443,43 @@ pub fn play_mp3_stream(
     let (tx, rx): (Sender<Vec<u8>>, Receiver<Vec<u8>>) = std::sync::mpsc::channel();
     let producer_stop = stop.clone();
 
-    // The producer pulls MP3 bytes (from the network) into the channel; the
-    // decoder on this thread consumes them as they land. Dropping `tx` when the
-    // closure returns is what signals end-of-stream — for completion and for
-    // cancellation alike.
-    let produced = std::thread::spawn(move || -> Result<(), String> {
-        let result = on_chunk(&mut |chunk: &[u8]| {
-            if producer_stop.load(Ordering::Relaxed) {
-                // A cancelled utterance is not an error: report it as a clean
-                // early stop so the caller can distinguish it from a failure.
-                return Err(CANCELLED.to_string());
+    std::thread::scope(|scope| {
+        let producer = std::thread::Builder::new()
+            .name("rpi-voice-tts-feed".into())
+            .spawn_scoped(scope, move || {
+                on_chunk(&mut |chunk: &[u8]| {
+                    if producer_stop.load(Ordering::Relaxed) {
+                        return Err(CANCELLED.to_string());
+                    }
+                    tx.send(chunk.to_vec())
+                        .map_err(|_| "playback consumer went away".into())
+                })
+            })
+            .map_err(|e| e.to_string())?;
+        // Drop the output stream on this thread before the device lease can
+        // pass to another session. Signal the producer on errors and unwind.
+        struct CancelFeed<'a>(&'a AtomicBool);
+        impl Drop for CancelFeed<'_> {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::Release);
             }
-            tx.send(chunk.to_vec())
-                .map_err(|_| "playback consumer went away".to_string())
-        });
-        drop(tx);
-        result
-    });
-
-    let outcome = decode_and_play(rx, &stop, level);
-
-    let produce_result = produced
-        .join()
-        .map_err(|_| "TTS producer thread panicked".to_string())?;
-    // A stop requested mid-synthesis surfaces as CANCELLED; that is expected.
-    match produce_result {
-        Err(e) if e == CANCELLED => {}
-        other => other?,
-    }
-    outcome
+        }
+        let cancel_feed = CancelFeed(&stop);
+        let outcome = decode_and_play(rx, stop.clone(), level);
+        let cancelled = stop.load(Ordering::Acquire);
+        drop(cancel_feed);
+        let produced = producer
+            .join()
+            .map_err(|_| "TTS producer thread panicked".to_string())?;
+        if cancelled {
+            return Ok(false);
+        }
+        let played = outcome?;
+        match produced {
+            Err(e) if e == CANCELLED => Ok(false),
+            result => result.map(|_| played),
+        }
+    })
 }
 
 /// Sentinel for "the caller asked us to stop", so a cancelled stream is not
@@ -522,23 +489,25 @@ pub(crate) const CANCELLED: &str = "__rpi_voice_cancelled";
 /// Decode the chunk stream with symphonia and play it through the default device.
 fn decode_and_play(
     rx: Receiver<Vec<u8>>,
-    stop: &AtomicBool,
+    stop: Arc<AtomicBool>,
     level: &AtomicU32,
 ) -> Result<bool, String> {
-    std::thread::scope(|scope| decode_and_play_scoped(rx, stop, level, scope))
+    std::thread::scope(|scope| decode_and_play_scoped(rx, &stop, level, scope))
 }
 
 fn decode_and_play_scoped<'scope, 'env>(
     rx: Receiver<Vec<u8>>,
-    stop: &'scope AtomicBool,
+    stop: &'scope Arc<AtomicBool>,
     level: &'scope AtomicU32,
     scope: &'scope std::thread::Scope<'scope, 'env>,
 ) -> Result<bool, String> {
+    if stop.load(Ordering::Acquire) {
+        return Ok(false);
+    }
     let device = output_device().map_err(|e| format!("Audio output error: {e}"))?;
-    // The stream is opened once and kept for the process; only the queue is
-    // per-utterance. See [`PlaybackSession`] for why reopening it per sentence
-    // produced an audible click at the start of every chunk.
-    let sink = with_session(&device, Sink::try_new)?.map_err(|e| format!("Sink error: {e}"))?;
+    let (_stream, handle) =
+        OutputStream::try_from_device(&device).map_err(|e| format!("Audio output error: {e}"))?;
+    let sink = Sink::try_new(&handle).map_err(|e| format!("Sink error: {e}"))?;
 
     // The meter runs on its own thread: decoding queues levels, and the meter
     // releases each one only once its audio has had time to play. Decoupling
@@ -547,7 +516,7 @@ fn decode_and_play_scoped<'scope, 'env>(
     let (level_tx, level_rx) = std::sync::mpsc::channel::<(u32, u64)>();
     let meter = spawn_level_meter(scope, level_rx, level, stop);
 
-    let source = ChunkSource::new(rx);
+    let source = ChunkSource::new(rx, stop.clone());
     let mss = MediaSourceStream::new(Box::new(source), Default::default());
     let probed = symphonia::default::get_probe()
         .format(

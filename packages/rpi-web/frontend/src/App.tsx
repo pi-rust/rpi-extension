@@ -47,12 +47,15 @@ import {
   Sparkles,
   SquarePen,
   Sun,
-  Timer,
   Volume2,
   VolumeX,
   X,
 } from "lucide-react";
 import { useInstallApp } from "./installApp";
+import {
+  readAutoUpdatePreference,
+  writeAutoUpdatePreference,
+} from "./autoUpdate";
 import { FilePreview } from "./FilePreview";
 import { readPreviewLink } from "./previewLink";
 import type { ProjectFileLink } from "./messageLinks";
@@ -93,6 +96,8 @@ import { delegationInfo, isDelegationTool } from "./delegation";
 import { queueDeliverAs } from "./queueKind";
 import {
   api,
+  type UpdateInfo,
+  type UpdateTaskStatus,
   ApiError,
   commandData,
   hostIsRetired,
@@ -135,6 +140,7 @@ import {
 } from "./useRunTimings";
 import { groupTodoUpdates, isTodoTool } from "./todoGroups";
 import { RunElapsed } from "./RunElapsed";
+import { SessionWork } from "./SessionWork";
 import { ExecutionTrace } from "./ExecutionTracePanel";
 import {
   ToolProgramChildren,
@@ -358,6 +364,8 @@ const LOCAL_SLASH_COMMANDS = new Set(["/help", "/tools"]);
  * reports the session as unavailable. A healthy stream refills the budget.
  */
 const MAX_REARMS = 3;
+/** One install poll per second, bounded so a lost status cannot spin forever. */
+const UPDATE_POLL_BUDGET = 900;
 
 const FAST_SNAPSHOT_OPTIONS = {
   limit: 40,
@@ -499,18 +507,6 @@ function formatTokens(value: number) {
   if (value >= 1_000)
     return `${(value / 1_000).toFixed(value >= 10_000 ? 0 : 1)}k`;
   return String(Math.round(value));
-}
-
-/** Compact tabular duration for the footer, e.g. 2m 18s or 1h 01m. */
-function formatRunDuration(value: number) {
-  if (!Number.isFinite(value) || value <= 0) return "0s";
-  const seconds = Math.floor(value / 1000);
-  const hours = Math.floor(seconds / 3600);
-  const minutes = Math.floor(seconds / 60) % 60;
-  if (hours > 0) return `${hours}h ${String(minutes).padStart(2, "0")}m`;
-  if (minutes > 0)
-    return `${minutes}m ${String(seconds % 60).padStart(2, "0")}s`;
-  return `${seconds}s`;
 }
 
 function statNumber(
@@ -852,6 +848,123 @@ export default function App() {
   const [autoArchive, setAutoArchive] = useState<SessionAutoArchivePreference>(
     readSessionAutoArchivePreference,
   );
+  const [autoUpdate, setAutoUpdate] = useState(readAutoUpdatePreference);
+  const [updateInfo, setUpdateInfo] = useState<UpdateInfo | null>(null);
+  const [updateBusy, setUpdateBusy] = useState(false);
+  const [updateError, setUpdateError] = useState("");
+  const [proxyDraft, setProxyDraft] = useState("");
+  const [proxyBusy, setProxyBusy] = useState(false);
+  const [updateTaskId, setUpdateTaskId] = useState<string | null>(null);
+  /** The status poll hit its budget while the task still reported running. */
+  const [updateTimeout, setUpdateTimeout] = useState(false);
+  const [updateTask, setUpdateTask] = useState<UpdateTaskStatus | null>(null);
+
+  const checkUpdates = useCallback(async (force = false) => {
+    setUpdateBusy(true);
+    setUpdateError("");
+    try {
+      const info = await api.updatesCheck(force);
+      setUpdateInfo(info);
+      setProxyDraft(info.proxy ?? "");
+    } catch (cause) {
+      setUpdateError(cause instanceof Error ? cause.message : String(cause));
+    } finally {
+      setUpdateBusy(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    if (!authChecked || (authRequired && !authenticated)) return;
+    if (!readAutoUpdatePreference().enabled) return;
+    void checkUpdates();
+  }, [authChecked, authRequired, authenticated, checkUpdates]);
+
+  useEffect(() => {
+    if (!updateTaskId) return;
+    let active = true;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    // Bound the poll: an install task is dropped by the backend after a few
+    // minutes, and a lost terminal state must not leave an endless timer.
+    let polls = 0;
+    const poll = async () => {
+      try {
+        const result = await api.updateTaskStatus(updateTaskId);
+        if (!active) return;
+        setUpdateTask(result);
+        if (result.state === "running" && ++polls < UPDATE_POLL_BUDGET) {
+          timer = setTimeout(() => void poll(), 1000);
+        } else if (result.state === "running") {
+          setUpdateTimeout(true);
+        }
+      } catch (cause) {
+        if (!active) return;
+        setUpdateError(cause instanceof Error ? cause.message : String(cause));
+      }
+    };
+    void poll();
+    return () => {
+      active = false;
+      if (timer) clearTimeout(timer);
+    };
+  }, [updateTaskId]);
+
+  const saveProxy = useCallback(async () => {
+    setProxyBusy(true);
+    setUpdateError("");
+    try {
+      const result = await api.saveUpdatesProxy(proxyDraft);
+      setUpdateInfo((previous) =>
+        previous
+          ? {
+              ...previous,
+              proxy: result.proxy,
+              proxyConfigured: result.proxyConfigured,
+            }
+          : previous,
+      );
+      void checkUpdates(true);
+    } catch (cause) {
+      setUpdateError(cause instanceof Error ? cause.message : String(cause));
+    } finally {
+      setProxyBusy(false);
+    }
+  }, [proxyDraft, checkUpdates]);
+
+  const startUpdate = useCallback(async (target: "host" | "extension") => {
+    setUpdateError("");
+    setUpdateTimeout(false);
+    try {
+      const result = await api.installUpdate(target);
+      setUpdateTaskId(result.taskId);
+      setUpdateTask({
+        state: "running",
+        target,
+        message: "Update is running…",
+        log: "",
+        restartRequired: false,
+      });
+    } catch (cause) {
+      setUpdateError(cause instanceof Error ? cause.message : String(cause));
+    }
+  }, []);
+
+  const webExtensionUpdate = useMemo(() => {
+    // A partial answer (an older backend, or the local fallback that drops the
+    // inventory when `rpi updates` is unavailable) must degrade to "unknown",
+    // not throw: an exception here unmounts the whole workspace.
+    const extensions = updateInfo?.extensions;
+    if (!Array.isArray(extensions)) return null;
+    return (
+      extensions.find((entry) => entry?.name === "rpi-web") ??
+      extensions[0] ??
+      null
+    );
+  }, [updateInfo]);
+  const updateAvailable = Boolean(
+    updateInfo?.host?.updatable || webExtensionUpdate?.updatable,
+  );
+  const updateRunning = updateTask?.state === "running";
+
   // The startup sweep reads the preference once, through a ref: a settings
   // change must not re-run session bootstrap or move the restored chat.
   const autoArchiveRef = useRef(autoArchive);
@@ -1177,6 +1290,12 @@ export default function App() {
   const attachmentPreviews = useRef(new Set<string>());
   const fileInputRef = useRef<HTMLInputElement>(null);
   const [status, setStatus] = useState("connecting");
+  const compactingRef = useRef(false);
+  const [compacting, setCompacting] = useState(false);
+  const patchCompacting = useCallback((next: boolean) => {
+    compactingRef.current = next;
+    setCompacting(next);
+  }, []);
   /** Set when the native host reports `host_closed`; cleared on session switch. */
   const hostClosedRef = useRef(false);
   const [loadingSession, setLoadingSession] = useState(false);
@@ -1339,6 +1458,13 @@ export default function App() {
         : null,
     [sessionTimings],
   );
+  // Fast transcript refreshes omit native history. Keep the start tied to the
+  // selected session and run boundary independently of the diagnostics page.
+  const runClockBinding = `${traceBinding}:${settleTick}`;
+  const [nativeRunStart, setNativeRunStart] = useState<{
+    binding: string;
+    timestamp: number;
+  }>();
   const runFooters = useMemo(
     () => timingByRow(displayedRows, displayedTimings),
     [displayedRows, displayedTimings],
@@ -2002,6 +2128,7 @@ export default function App() {
 
   const lastSeq = useRef(0);
   const noteSeq = useRef(0);
+  const snapshotMessageIds = useRef(new Set<string>());
   const currentAssistant = useRef<string | null>(null);
   const currentUser = useRef<string | null>(null);
   const credentialRevision = useRef(0);
@@ -2035,8 +2162,15 @@ export default function App() {
   const busy =
     runActive ||
     status === "running" ||
+    status === "compacting" ||
     status === "starting" ||
     status === "awaiting_input";
+  // The indicator names the operation kind, not the transport state: a Web
+  // session that is compacting keeps that label while its SSE reconnects,
+  // otherwise a dropped stream relabels an in-flight compaction as an ordinary
+  // run. `compacting` is cleared on settlement, close, rejection and session
+  // switch, so it stays authoritative for the current operation.
+  const activeCompacting = compacting && busy;
   // Agents create linked worktrees while a run is in progress and then report
   // the files they wrote there. Refresh the roots once the run settles so those
   // paths become previewable without a page reload; a failed refresh keeps the
@@ -2125,7 +2259,11 @@ export default function App() {
     [],
   );
   const connectionLabel = t(
-    (status === "awaiting_input" ? "waitingForAnswer" : status) as MessageKey,
+    (status === "awaiting_input"
+      ? "waitingForAnswer"
+      : status === "compacting"
+        ? "compacting"
+        : status) as MessageKey,
   );
   const current = sessions.find((session) => session.sessionId === sessionId);
   const hostVersion = capabilities?.hostVersion?.trim() ?? "";
@@ -2156,6 +2294,7 @@ export default function App() {
   );
   const activeSessionRunning = [
     "running",
+    "compacting",
     "starting",
     "awaiting_input",
   ].includes(activeSession?.status ?? "");
@@ -2241,6 +2380,14 @@ export default function App() {
 
   const applyEvent = useCallback(
     (event: SeqEvent, seq: number) => {
+      if (
+        typeof event.messageId === "string" &&
+        snapshotMessageIds.current.has(event.messageId) &&
+        (event.type === "message_start" ||
+          event.type === "message_update" ||
+          event.type === "message_end")
+      )
+        return;
       // Presentation only: observe the same deduplicated data, never the protocol cursor.
       traceEvent(event, seq);
       // Dialog controls may already have been shown while transcript I/O was
@@ -2259,19 +2406,24 @@ export default function App() {
         dialogEventSeq.current = seq;
       switch (event.type) {
         case "agent_start":
-        case "operation_accepted":
+        case "operation_accepted": {
+          const isCompacting =
+            event.type === "operation_accepted" && event.command === "compact";
+          patchCompacting(isCompacting);
           setRows((previous) =>
             previous.filter((row) => row.id !== "retry-note"),
           );
           setRunActive(true);
-          setStatus("running");
+          setStatus(isCompacting ? "compacting" : "running");
           setInterrupted(false);
           setFailedRun(false);
           setError("");
           break;
+        }
         case "agent_settled": {
           setRows(stopToolTimers);
           setRunActive(false);
+          patchCompacting(false);
           if (freshDialogEvent) {
             dialogRequests.current.clear();
             activeDialogId.current = "";
@@ -2363,12 +2515,16 @@ export default function App() {
           );
           break;
         case "host_error":
+          // A host error ends the operation it was running: keeping the
+          // compaction label would name a run that no longer exists.
+          patchCompacting(false);
           setStatus("error");
           setError(String(event.error ?? "Native host error"));
           break;
         case "host_closed":
           setRows(stopToolTimers);
           setRunActive(false);
+          patchCompacting(false);
           dialogRequests.current.clear();
           activeDialogId.current = "";
           hostClosedRef.current = true;
@@ -2563,7 +2719,7 @@ export default function App() {
           break;
       }
     },
-    [notifySessionCompletion, showNextDialog, traceEvent],
+    [notifySessionCompletion, patchCompacting, showNextDialog, traceEvent],
   );
 
   const handleEvent = useCallback(
@@ -2616,6 +2772,7 @@ export default function App() {
     setDialog(null);
     resolveTextRequest(null);
     setRuntime(null);
+    patchCompacting(false);
     setModels([]);
     setAuthProviders([]);
     setAuthProvider("");
@@ -2630,7 +2787,7 @@ export default function App() {
     clearDrafts();
     // Signing out drops every other composer field; the ring must not survive.
     setComposerActionPending(null);
-  }, [clearDrafts, clearTrace]);
+  }, [clearDrafts, clearTrace, patchCompacting]);
 
   const refreshSessions = useCallback(
     (force = true) => {
@@ -3138,6 +3295,7 @@ export default function App() {
     setError(initialSelectionError.current);
     initialSelectionError.current = "";
     setConnectionFailed(false);
+    patchCompacting(false);
     hostClosedRef.current = false;
     setStatus("connecting");
     setRunActive(false);
@@ -3156,6 +3314,7 @@ export default function App() {
     setFirstId("");
     setHasMore(false);
     lastSeq.current = 0;
+    snapshotMessageIds.current.clear();
     currentAssistant.current = null;
     currentUser.current = null;
     streamingAssistant.current = null;
@@ -3214,8 +3373,13 @@ export default function App() {
         stats: latestMessageStats(snapshot.messages),
       });
       if (snapshot.status && !preserveDialogs) {
-        setStatus(snapshot.status);
-        setRunActive(["running", "awaiting_input"].includes(snapshot.status));
+        const restoringCompacting =
+          compactingRef.current && snapshot.status !== "ready";
+        setStatus(restoringCompacting ? "compacting" : snapshot.status);
+        setRunActive(
+          ["running", "awaiting_input"].includes(snapshot.status) ||
+            restoringCompacting,
+        );
       }
       if (
         !preserveDialogs &&
@@ -3232,6 +3396,20 @@ export default function App() {
       if (dialogRequests.current.size) {
         setStatus("awaiting_input");
       }
+    };
+
+    const replaySnapshot = (snapshot: Awaited<ReturnType<typeof snapshotOf>>) => {
+      // History can see a committed entry before its final event reaches SSE.
+      // Use native entry IDs across replay and the subsequent live stream.
+      const committed = new Set<string>();
+      for (const message of snapshot.messages) {
+        const entryId = (message as { entryId?: unknown } | null)?.entryId;
+        if (typeof entryId === "string" && entryId) committed.add(entryId);
+      }
+      snapshotMessageIds.current = committed;
+      for (const entry of eventsAfterSnapshot(snapshot.messages, snapshot.events))
+        applyEvent(entry.event, entry.seq);
+      lastSeq.current = snapshot.lastSeq;
     };
 
     // Direct prompts are persisted by the native harness without user message
@@ -3273,12 +3451,7 @@ export default function App() {
         setRecoveryNoticeDismissed(false);
         setFirstId(earlierPage.current?.firstId ?? snapshot.firstId ?? "");
         setHasMore(earlierPage.current?.hasMore ?? Boolean(snapshot.hasMore));
-        for (const entry of eventsAfterSnapshot(
-          snapshot.messages,
-          snapshot.events,
-        ))
-          applyEvent(entry.event, entry.seq);
-        lastSeq.current = snapshot.lastSeq;
+        replaySnapshot(snapshot);
       } catch (cause) {
         if (!isCurrent()) return;
         if (cause instanceof ApiError && cause.status === 401) {
@@ -3438,6 +3611,10 @@ export default function App() {
           setRuntime((previous) =>
             previous ? { ...state, ...previous } : state,
           );
+          const activeCompacting = state.activeOperation?.kind === "compact";
+          if (activeCompacting || !state.activeOperation) {
+            patchCompacting(activeCompacting);
+          }
         }
         return state;
       };
@@ -3480,18 +3657,19 @@ export default function App() {
           const state = await readRuntime();
           if (!isCurrent()) return;
           stateLoaded = true;
+          const activeCompacting = state.activeOperation?.kind === "compact";
           setRunActive(Boolean(state.activeOperation));
-          setStatus(state.activeOperation ? "running" : "ready");
+          setStatus(
+            activeCompacting
+              ? "compacting"
+              : state.activeOperation
+                ? "running"
+                : "ready",
+          );
         }
         if (snapshot) {
           restoreSnapshotStatus(snapshot);
-          for (const entry of eventsAfterSnapshot(
-            snapshot.messages,
-            snapshot.events,
-          )) {
-            applyEvent(entry.event, entry.seq);
-          }
-          lastSeq.current = snapshot.lastSeq;
+          replaySnapshot(snapshot);
           after = snapshot.lastSeq;
           setSeen(snapshot.events.length);
         }
@@ -3577,6 +3755,7 @@ export default function App() {
     capabilities,
     clearAccess,
     handleEvent,
+    patchCompacting,
     sessionId,
     connectionRevision,
     showNextDialog,
@@ -3682,6 +3861,21 @@ export default function App() {
         jobs.push(async () => {
           const value = await api.history(id, {}, controller.signal);
           if (!current()) return;
+          if (runActive) {
+            const timestamp = value.openOperations?.find((record) => {
+              const intent = record.intent as
+                | { kind?: unknown }
+                | null
+                | undefined;
+              return record.lane === "main" && intent?.kind === "run";
+            })?.timestamp;
+            if (
+              typeof timestamp === "number" &&
+              Number.isSafeInteger(timestamp) &&
+              timestamp > 0
+            )
+              setNativeRunStart({ binding: runClockBinding, timestamp });
+          }
           setHistory(value);
           setHistoryHasMore(value.hasMore);
         });
@@ -3725,6 +3919,7 @@ export default function App() {
       showQueueHistory,
       clearAccess,
       runActive,
+      runClockBinding,
       refreshQueue,
     ],
   );
@@ -3951,7 +4146,8 @@ export default function App() {
           note("compact is not advertised by this host.");
           return;
         }
-        setStatus("running");
+        patchCompacting(true);
+        setStatus("compacting");
         setRunActive(true);
         await commandData(
           sessionId,
@@ -4056,6 +4252,7 @@ export default function App() {
         updateDraft(raw, targetSession);
       if (navigation !== navigationRevision.current) return;
       if (name === "/compact" && cursor === lastSeq.current) {
+        patchCompacting(false);
         setStatus((current) =>
           current === "reconnecting" ? current : priorStatus,
         );
@@ -5106,7 +5303,9 @@ export default function App() {
   function retirementBusy(session: SessionSummary) {
     const state =
       session.sessionId === activeSessionRef.current ? status : session.status;
-    if (!["running", "starting", "awaiting_input"].includes(state))
+    if (
+      !["running", "compacting", "starting", "awaiting_input"].includes(state)
+    )
       return false;
     setError(errorText(new ApiError("", 409, "session_busy")));
     if (window.innerWidth < 768) setSidebar(false);
@@ -6151,6 +6350,193 @@ export default function App() {
                 {t("mappedToolNames")}
               </button>
             </div>
+            <div className="auto-update-settings">
+              <label htmlFor="settings-auto-update-enabled">
+                {language === "zh" ? "自动更新" : "Automatic updates"}
+              </label>
+              <label
+                className="settings-toggle"
+                htmlFor="settings-auto-update-enabled"
+              >
+                <input
+                  id="settings-auto-update-enabled"
+                  type="checkbox"
+                  checked={autoUpdate.enabled}
+                  onChange={(event) => {
+                    const next = { enabled: event.target.checked };
+                    setAutoUpdate(next);
+                    writeAutoUpdatePreference(next);
+                    if (next.enabled) void checkUpdates();
+                  }}
+                />
+                {language === "zh"
+                  ? "打开网页时检查新版本"
+                  : "Check for new versions on open"}
+              </label>
+              <p className="form-hint">
+                {language === "zh"
+                  ? "仅检查并提示，不会自动安装；安装后需重启 rpi 宿主生效。开启后每次打开页面会调用一次原生 rpi 检查更新。"
+                  : "Checks and notifies only; updates are installed manually and require restarting the rpi host. When enabled, each page open runs one native rpi check."}
+              </p>
+              <div className="update-targets">
+                <div className="update-target">
+                  <strong>{language === "zh" ? "宿主 rpi" : "rpi host"}</strong>
+                  <span>
+                    {language === "zh" ? "当前" : "Current"}: v
+                    {updateInfo?.host?.current ?? "—"}
+                    {updateInfo?.host?.latest
+                      ? ` · ${language === "zh" ? "最新" : "latest"}: v${updateInfo.host.latest}`
+                      : ""}
+                  </span>
+                  <button
+                    type="button"
+                    className="settings-refresh"
+                    disabled={!updateInfo?.host?.updatable || updateRunning}
+                    onClick={() => void startUpdate("host")}
+                  >
+                    {language === "zh" ? "更新宿主" : "Update host"}
+                  </button>
+                </div>
+                <div className="update-target">
+                  <strong>rpi-web</strong>
+                  <span>
+                    {language === "zh" ? "当前" : "Current"}: v
+                    {webExtensionUpdate?.current ?? "—"}
+                    {webExtensionUpdate?.latest
+                      ? ` · ${language === "zh" ? "最新" : "latest"}: v${webExtensionUpdate.latest}`
+                      : ""}
+                    {webExtensionUpdate?.reason === "local-install"
+                      ? ` · ${language === "zh" ? "本地安装，不适用" : "local install"}`
+                      : ""}
+                  </span>
+                  <button
+                    type="button"
+                    className="settings-refresh"
+                    disabled={!webExtensionUpdate?.updatable || updateRunning}
+                    onClick={() => void startUpdate("extension")}
+                  >
+                    {language === "zh" ? "更新扩展" : "Update extension"}
+                  </button>
+                </div>
+              </div>
+              <div className="update-proxy">
+                <label htmlFor="settings-update-proxy">
+                  {language === "zh"
+                    ? "代理地址（可选）"
+                    : "Proxy URL (optional)"}
+                </label>
+                <input
+                  id="settings-update-proxy"
+                  className="settings-text"
+                  type="url"
+                  placeholder="http://127.0.0.1:7890"
+                  value={proxyDraft}
+                  onChange={(event) => setProxyDraft(event.target.value)}
+                />
+                <p className="form-hint">
+                  {language === "zh"
+                    ? "填写本地代理监听地址，不是订阅链接。仅支持 http:// 或 https://。"
+                    : "Enter a local proxy listener URL, not a subscription link. Only http:// and https:// are supported."}
+                </p>
+                <div className="update-proxy-actions">
+                  <button
+                    type="button"
+                    className="settings-refresh"
+                    disabled={proxyBusy}
+                    onClick={() => void saveProxy()}
+                  >
+                    {language === "zh" ? "保存代理" : "Save proxy"}
+                  </button>
+                  <button
+                    type="button"
+                    className="settings-refresh"
+                    disabled={proxyBusy}
+                    onClick={() => {
+                      // A rejected clear must report, and the draft only
+                      // changes once the server accepted it.
+                      setUpdateError("");
+                      void api
+                        .saveUpdatesProxy("")
+                        .then((result) => {
+                          setProxyDraft("");
+                          setUpdateInfo((previous) =>
+                            previous
+                              ? {
+                                  ...previous,
+                                  proxy: result.proxy,
+                                  proxyConfigured: result.proxyConfigured,
+                                }
+                              : previous,
+                          );
+                        })
+                        .catch((cause: unknown) =>
+                          setUpdateError(
+                            cause instanceof Error
+                              ? cause.message
+                              : String(cause),
+                          ),
+                        );
+                    }}
+                  >
+                    {language === "zh" ? "清除" : "Clear"}
+                  </button>
+                  <button
+                    type="button"
+                    className="settings-refresh"
+                    disabled={updateBusy}
+                    onClick={() => void checkUpdates(true)}
+                  >
+                    <RefreshCw
+                      size={14}
+                      className={updateBusy ? "spin" : undefined}
+                    />
+                    {language === "zh" ? "立即检查" : "Check now"}
+                  </button>
+                </div>
+              </div>
+              {updateTask && (
+                <div className="update-task" role="status">
+                  <strong>
+                    {updateTask.state === "running"
+                      ? language === "zh"
+                        ? "更新进行中"
+                        : "Update running"
+                      : updateTask.state === "succeeded"
+                        ? language === "zh"
+                          ? "更新成功"
+                          : "Update succeeded"
+                        : language === "zh"
+                          ? "更新失败"
+                          : "Update failed"}
+                  </strong>
+                  <span>{updateTask.message}</span>
+                  {updateTask.log && (
+                    <pre className="update-log">{updateTask.log}</pre>
+                  )}
+                </div>
+              )}
+              {updateInfo?.error && (
+                <p className="form-hint update-error">{updateInfo.error}</p>
+              )}
+              {updateError && (
+                <p className="form-hint update-error">{updateError}</p>
+              )}
+              {updateTimeout && (
+                <p className="form-hint update-error">
+                  {language === "zh"
+                    ? "更新仍在运行，请稍后重新打开设置查看结果。"
+                    : "The update is still running. Reopen Settings later to check the result."}
+                </p>
+              )}
+              {updateInfo?.checkedAt && (
+                <p className="form-hint">
+                  {language === "zh" ? "上次检查" : "Last checked"}:{" "}
+                  {new Date(updateInfo.checkedAt).toLocaleString(
+                    language === "zh" ? "zh-CN" : "en-US",
+                  )}
+                </p>
+              )}
+            </div>
             <div className="auto-archive-settings">
               <label htmlFor="settings-auto-archive-days">
                 {language === "zh" ? "自动会话归档" : "Auto-archive sessions"}
@@ -6338,6 +6724,16 @@ export default function App() {
               >
                 <Settings2 size={14} />
                 <span>{language === "zh" ? "设置" : "Settings"}</span>
+                {updateAvailable && (
+                  <span
+                    className="update-badge"
+                    title={
+                      language === "zh" ? "有新版本可更新" : "Update available"
+                    }
+                  >
+                    !
+                  </span>
+                )}
                 <kbd>Ctrl ,</kbd>
               </button>
             </div>
@@ -6411,7 +6807,9 @@ export default function App() {
                     {t(
                       activeSession?.status === "awaiting_input"
                         ? "sessionAwaitingAnswer"
-                        : "running",
+                        : activeSession?.status === "compacting"
+                          ? "compacting"
+                          : "running",
                     )}
                   </small>
                 )}
@@ -6570,9 +6968,11 @@ export default function App() {
                     const selected = entry.sessionId === sessionId;
                     const entryAwaitingAnswer =
                       entry.status === "awaiting_input";
-                    const entryRunning = ["running", "starting"].includes(
-                      entry.status ?? "",
-                    );
+                    const entryRunning = [
+                      "running",
+                      "compacting",
+                      "starting",
+                    ].includes(entry.status ?? "");
                     return (
                       <button
                         type="button"
@@ -6590,7 +6990,8 @@ export default function App() {
                           <strong>{entry.title || t("newSession")}</strong>
                           <small>
                             {entryProject?.name ?? "rpi"}
-                            {entryRunning && ` · ${t("running")}`}
+                            {entryRunning &&
+                              ` · ${t(entry.status === "compacting" ? "compacting" : "running")}`}
                           </small>
                         </span>
                         <SessionAnswerBadge
@@ -7024,7 +7425,9 @@ export default function App() {
                   {!historical.active && busy && rows.length > 0 && (
                     <div className="working-indicator">
                       <Loader2 size={14} className="spin" />{" "}
-                      {dialog ? t("waitingForAnswer") : t("waiting")}
+                      {dialog
+                        ? t("waitingForAnswer")
+                        : t(activeCompacting ? "compacting" : "waiting")}
                     </div>
                   )}
                 </div>
@@ -7489,18 +7892,17 @@ export default function App() {
                         : "—"}
                     </strong>
                   </span>
-                  <span
-                    className="composer-metric"
-                    title={t("sessionWorkTotal")}
-                    aria-label={`${t("sessionWork")}: ${sessionWorkMs == null ? "—" : formatRunDuration(sessionWorkMs)}`}
-                  >
-                    <Timer size={12} aria-hidden="true" />
-                    <strong>
-                      {sessionWorkMs == null
-                        ? "—"
-                        : formatRunDuration(sessionWorkMs)}
-                    </strong>
-                  </span>
+                  <SessionWork
+                    key={runClockBinding}
+                    completedMs={sessionWorkMs}
+                    running={runActive && !loadingSession && !connectionFailed}
+                    startedAt={
+                      nativeRunStart?.binding === runClockBinding
+                        ? nativeRunStart.timestamp
+                        : undefined
+                    }
+                    language={language}
+                  />
                   <button
                     type="button"
                     className="slim-metrics-more"

@@ -46,6 +46,42 @@ In `web.json`, set `"hostArea": true` for the native default, `"hostArea": "work
 
 Open the shared Session from the session list to see saved messages, send text prompts, follow live responses, and cancel runs. The native Host owns its Agent and tools. Web shuts down its connection when it exits. Other Web sessions continue to use the ordinary RPC backend.
 
+### Use one local Host for all Web sessions
+
+On Unix, configure `localHostSocket` in `web.json` to connect directly to an
+already-running rpi local Host v1 daemon. The socket must be owned by the Web
+service user and live in a private directory. Keep `sessionDir` and `registry`
+pointing to the existing Web history and registry when switching deployments.
+For example, a local daemon started with `rpi __rpi_local_host web` listens at
+`$RPI_CODING_AGENT_DIR/local-host-v1/area-web/rpc.sock` (the agent directory
+defaults to `~/.rpi/agent`). Both processes should run as the same user.
+
+```json
+{
+  "localHostSocket": "~/.rpi/agent/local-host-v1/area-web/rpc.sock",
+  "sessionDir": "./sessions",
+  "registry": "./registry.json"
+}
+```
+
+This mode uses the local Host for new, reopened, and forked Web sessions. Each
+live Web session has its own socket connection to the same daemon. An
+unavailable daemon surfaces an error, with no fallback to a per-session process.
+`localHostSocket` and `hostArea` are mutually exclusive. A session attached
+through `hostArea` lives in the managed area's storage and needs a separate
+migration if you want to move it into Web's session directory. Use a native
+build that supports local Host RPC and releases the session writer before
+closing its socket. The daemon supplies the agent environment and provider
+credentials for socket-backed sessions.
+
+The ordinary Web backend spawns each child with
+`RPI_RPC_EXECUTION_LIFECYCLE=correlated-v1`. A socket request cannot carry
+process environment, so a socket-backed session only advertises correlated
+execution settlement when the daemon itself runs with that variable. Without
+it the session keeps the legacy admission path, where `agent_settled` is the
+only settlement signal. Set it in the daemon's service environment if you rely
+on correlated per-execution settlement.
+
 ### New-session model preference
 
 A successful **explicit** model choice in the composer, Runtime settings,

@@ -671,7 +671,8 @@ impl Service {
                 bypass: settings.bypass,
                 resources: Some(ResourceStartup::Transition(transition.clone())),
             };
-            let candidate = HostSession::spawn_options(options)
+            let candidate = self
+                .start_native_session(options, None, false)
                 .await
                 .map_err(ResourceError::unavailable)?;
             let verified = async {

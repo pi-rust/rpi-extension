@@ -22,6 +22,8 @@ pub struct AppConfig {
     pub allowed_hosts: Option<Vec<String>>,
     /// Optional `--session-dir` forwarded to the native host.
     pub session_dir: Option<PathBuf>,
+    /// A local Host v1 Unix socket for all Web sessions.
+    pub local_host_socket: Option<PathBuf>,
     /// Where the bridge remembers session ids across restarts.
     pub registry: PathBuf,
     /// Idle timeout for live native hosts, in seconds. Zero/None disables it.
@@ -40,6 +42,7 @@ impl Default for AppConfig {
             port: 3030,
             allowed_hosts: None,
             session_dir: None,
+            local_host_socket: None,
             registry: rpi_extcore::registry::default_path(),
             session_timeout_seconds: Some(30 * 60),
         }
@@ -70,6 +73,10 @@ pub(crate) async fn run_until(
     host_area: Option<String>,
     stop: impl std::future::Future<Output = ()> + Send + 'static,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    if config.local_host_socket.is_some() && host_area.is_some() {
+        return Err("localHostSocket and hostArea cannot be enabled together".into());
+    }
+    let socket = config.local_host_socket.clone();
     let asset_root = asset_root(&config);
     let files = ServeDir::new(asset_root.join("assets"));
     let files = if config.assets.is_none() {
@@ -77,6 +84,7 @@ pub(crate) async fn run_until(
     } else {
         files.fallback(get(|| async { StatusCode::NOT_FOUND }))
     };
+    let update_routes = crate::updates::routes(Arc::new(config.clone()));
     let frontend = Router::new()
         .route("/", get(index))
         .nest_service("/assets", files)
@@ -90,7 +98,8 @@ pub(crate) async fn run_until(
         .route("/manifest-icon-maskable.png", get(manifest_icon_maskable))
         .with_state(FrontendState {
             config: Arc::new(config.clone()),
-        });
+        })
+        .merge(update_routes);
     let http = rpi_httpcore::AppConfig {
         service_name: "rpi-web",
         service_version: Some(env!("CARGO_PKG_VERSION")),
@@ -106,19 +115,30 @@ pub(crate) async fn run_until(
         session_timeout_seconds: config.session_timeout_seconds,
         admission_limit: 64,
     };
-    rpi_httpcore::serve_until_with_host_area(
-        http,
-        frontend,
-        move |info| {
-            println!(
-                "{}",
-                crate::startup::page(info.address, &config, &info.hosts, info.password_enabled)
+    let on_listen = move |info: rpi_httpcore::Listening| {
+        println!(
+            "{}",
+            crate::startup::page(info.address, &config, &info.hosts, info.password_enabled)
+        )
+    };
+    match socket {
+        Some(socket) => {
+            rpi_httpcore::serve_until_with_local_host_socket(
+                http, frontend, on_listen, stop, socket,
             )
-        },
-        stop,
-        host_area.as_deref(),
-    )
-    .await
+            .await
+        }
+        None => {
+            rpi_httpcore::serve_until_with_host_area(
+                http,
+                frontend,
+                on_listen,
+                stop,
+                host_area.as_deref(),
+            )
+            .await
+        }
+    }
     .map_err(|error| error as Box<dyn std::error::Error>)
 }
 fn asset_root(config: &AppConfig) -> PathBuf {

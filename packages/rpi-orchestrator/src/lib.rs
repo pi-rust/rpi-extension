@@ -1,9 +1,4 @@
 #![forbid(unsafe_code)]
-// The `export_plugin!` expansion exposes the raw-pointer ABI entrypoints the host
-// calls. Every other plugin crate in this workspace carries the same allow (see
-// rpi-acp, rpi-btw, rpi-subagents, rpi-ui-adapter); without it
-// `cargo clippy -p rpi-orchestrator` fails on the macro expansion alone.
-#![allow(clippy::not_unsafe_ptr_arg_deref)]
 
 //! `rpi-orchestrator` — DAG subagent orchestration for the rpi Rust agent.
 //!
@@ -25,33 +20,29 @@ mod dispatch;
 mod graph;
 mod host;
 mod kit;
+mod lifecycle;
 mod plan;
+mod runtime;
 mod spawn;
 mod subagent;
 mod tool_schema;
 
+use runtime::Registration;
 use serde_json::Value;
-use std::sync::{Mutex, MutexGuard, OnceLock};
+use std::sync::MutexGuard;
 
-/// The orchestration graph, scoped to the session the host says it is serving.
+/// The orchestration graph owned by one registration.
 ///
 /// The plan is session state: switching sessions must not let session B see or
 /// dispatch session A's plan. The host injects `__rpi.sessionId` into every
 /// plugin tool call ([`rpi_plugin_sdk::HOST_CONTEXT_KEY`]), so the current
-/// session is known without the model supplying it. A host that predates that
-/// field — or an ephemeral session with no id — shares a single fallback graph
-/// rather than refusing to work.
+/// session is known without the model supplying it. Sessionless tool calls
+/// still use the graph of their registration.
 #[derive(Default)]
 pub(crate) struct GraphState {
     session: Option<String>,
     graph: graph::Graph,
     generation: u64,
-}
-
-static GRAPH: OnceLock<Mutex<GraphState>> = OnceLock::new();
-
-fn graph_state() -> &'static Mutex<GraphState> {
-    GRAPH.get_or_init(|| Mutex::new(GraphState::default()))
 }
 
 /// The session id the host attached to this tool call, if any.
@@ -71,9 +62,12 @@ pub(crate) fn session_of(params: &Value) -> Option<String> {
 /// over is a human decision, not something the extension should silently replay.
 /// A poisoned lock is recovered rather than panicking, mirroring the SDK's
 /// tool-handle convention.
-pub(crate) fn lock_graph(params: &Value) -> MutexGuard<'static, GraphState> {
+pub(crate) fn lock_graph<'a>(
+    registration: &'a Registration,
+    params: &Value,
+) -> MutexGuard<'a, GraphState> {
     let session = session_of(params);
-    let mut guard = graph_state().lock().unwrap_or_else(|p| p.into_inner());
+    let mut guard = registration.graph.lock().unwrap_or_else(|p| p.into_inner());
     if guard.session != session {
         guard.session = session;
         guard.graph = graph::Graph::default();
@@ -84,11 +78,12 @@ pub(crate) fn lock_graph(params: &Value) -> MutexGuard<'static, GraphState> {
 
 /// Rejoin a wave without changing the active session or touching a newer plan.
 /// The generation also detects A -> B -> A switches with reused node ids.
-pub(crate) fn lock_graph_for_wave(
+pub(crate) fn lock_graph_for_wave<'a>(
+    registration: &'a Registration,
     params: &Value,
     generation: u64,
-) -> Result<MutexGuard<'static, GraphState>, String> {
-    let guard = graph_state().lock().unwrap_or_else(|p| p.into_inner());
+) -> Result<MutexGuard<'a, GraphState>, String> {
+    let guard = registration.graph.lock().unwrap_or_else(|p| p.into_inner());
     if guard.session != session_of(params) || guard.generation != generation {
         return Err(
             "plan or session changed while dispatch was running; stale results discarded".into(),
@@ -125,10 +120,6 @@ impl GraphState {
         &mut self.graph
     }
 }
-
-crate::tool_entry!(subagent_tool, crate::subagent::subagent);
-crate::tool_entry!(plan_tool, crate::plan::plan);
-crate::tool_entry!(dispatch_tool, crate::dispatch::dispatch);
 
 /// Optional override for the orchestration guidance injected into the system
 /// prompt. Guidance is **on by default whenever a goal is active** — `/goal`
@@ -181,17 +172,14 @@ fn active_goal_from(text: &str) -> bool {
     !active.is_null() && active.get("status").and_then(Value::as_str) == Some("active")
 }
 
-fn active_goal_in_project() -> bool {
-    let Ok(cwd) = std::env::current_dir() else {
-        return false;
-    };
+fn active_goal_in_project(cwd: &std::path::Path) -> bool {
     match std::fs::read_to_string(cwd.join(GOALS_FILE)) {
         Ok(text) => active_goal_from(&text),
         Err(_) => false,
     }
 }
 
-fn guide_enabled() -> bool {
+fn guide_enabled(registration: &Registration) -> bool {
     // Never inject into a subagent: it has no `plan`/`dispatch`, and telling it to
     // use them would just waste a turn.
     if std::env::var(crate::spawn::SUBAGENT_ENV).is_ok() {
@@ -199,7 +187,15 @@ fn guide_enabled() -> bool {
     }
     // `/goal` implies orchestration: an active goal turns the guidance on unless
     // the variable explicitly overrides the decision.
-    guide_override(std::env::var(GUIDE_ENV).ok().as_deref()).unwrap_or_else(active_goal_in_project)
+    guide_override(std::env::var(GUIDE_ENV).ok().as_deref()).unwrap_or_else(|| {
+        let cwd = registration
+            .host
+            .as_ref()
+            .and_then(host::Runtime::event_context)
+            .and_then(|ctx| ctx["cwd"].as_str().map(std::path::PathBuf::from))
+            .or_else(|| std::env::current_dir().ok());
+        cwd.as_deref().is_some_and(active_goal_in_project)
+    })
 }
 
 fn write_out(out: &mut rpi_plugin_sdk::callbacks::Output<'_>, value: Value) {
@@ -215,8 +211,8 @@ rpi_plugin_sdk::string_handler! {
 /// `systemPrompt` and writes `{"systemPrompt": "..."}` when it changed it, or
 /// `{}` (no change) otherwise. A malformed envelope declines rather than
 /// replacing the host's prompt with our section alone.
-fn on_before_agent_start(event_json, out, _user_data) {
-    if !guide_enabled() {
+fn on_before_agent_start(event_json, out, owner) {
+    if !runtime::callback(owner).as_deref().is_some_and(guide_enabled) {
         write_out(out, serde_json::json!({}));
         return 0;
     }
@@ -241,76 +237,60 @@ fn on_before_agent_start(event_json, out, _user_data) {
 }
 }
 
-rpi_plugin_sdk::export_plugin!(|api| {
-    // Capture the host action bridge first: `subagent`/`dispatch` read this
-    // session's provider/model through it so a child inherits the parent binding
-    // instead of quietly resolving the default provider.
-    crate::host::install(api);
-    if let Some(register_prompt) = api.register_before_agent_start {
-        let _ = register_prompt(
-            on_before_agent_start,
-            rpi_plugin_sdk::callbacks::free_string,
-            api.user_data,
-        );
-    }
-
-    let Some(register) = api.register_tool else {
+fn register(api: &rpi_plugin_sdk::PluginApi, cleanup: Option<lifecycle::Register>) -> i32 {
+    let Some(register_tool) = api.register_tool else {
         return 1;
     };
-
-    {
-        let schema = Box::new(crate::tool_schema::tool_schema("subagent"));
-        let rc = register(
-            &*schema,
-            subagent_tool::execute,
-            subagent_tool::poll,
-            subagent_tool::cancel,
-            subagent_tool::destroy,
-            crate::kit::plugin_free_string,
+    let slot = match cleanup {
+        Some(cleanup) => match runtime::install(api, cleanup) {
+            Ok(slot) => slot,
+            Err(rc) => return rc,
+        },
+        None => runtime::LEGACY_SLOT,
+    };
+    if let Some(register_prompt) = api.register_before_agent_start {
+        let rc = register_prompt(
+            on_before_agent_start,
+            rpi_plugin_sdk::callbacks::free_string,
+            runtime::callback_data(slot),
         );
-        drop(schema);
         if rc != 0 {
-            return 1;
+            return rc;
         }
     }
-
+    let callbacks = kit::callbacks_for(slot);
+    for (name, execute) in ["subagent", "plan", "dispatch"]
+        .into_iter()
+        .zip(callbacks.executes)
     {
-        let schema = Box::new(crate::tool_schema::tool_schema("plan"));
-        let rc = register(
-            &*schema,
-            plan_tool::execute,
-            plan_tool::poll,
-            plan_tool::cancel,
-            plan_tool::destroy,
+        let schema = crate::tool_schema::tool_schema(name);
+        let rc = register_tool(
+            &schema,
+            execute,
+            callbacks.poll,
+            callbacks.cancel,
+            callbacks.destroy,
             crate::kit::plugin_free_string,
         );
-        drop(schema);
         if rc != 0 {
-            return 1;
+            return rc;
         }
     }
-
-    {
-        let schema = Box::new(crate::tool_schema::tool_schema("dispatch"));
-        let rc = register(
-            &*schema,
-            dispatch_tool::execute,
-            dispatch_tool::poll,
-            dispatch_tool::cancel,
-            dispatch_tool::destroy,
-            crate::kit::plugin_free_string,
-        );
-        drop(schema);
-        if rc != 0 {
-            return 1;
-        }
+    if cleanup.is_none() {
+        runtime::install_legacy(api);
     }
     0
-});
+}
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Mutex, OnceLock};
+
+    fn registration() -> &'static Registration {
+        static REGISTRATION: OnceLock<Registration> = OnceLock::new();
+        REGISTRATION.get_or_init(Registration::default)
+    }
 
     #[test]
     fn guide_env_override_is_tri_state() {
@@ -337,8 +317,7 @@ mod tests {
         assert!(!active_goal_from("not json"));
     }
 
-    /// The graph is process-global by design, so graph-mutating tests must not
-    /// interleave. A poisoned lock is recovered (a failed test still releases it).
+    /// These tests reuse a fixture registration. A failed test still releases its lock.
     static GRAPH_TEST_LOCK: Mutex<()> = Mutex::new(());
 
     fn graph_test_guard() -> MutexGuard<'static, ()> {
@@ -348,7 +327,7 @@ mod tests {
     fn params_for(session: Option<&str>) -> Value {
         match session {
             Some(id) => serde_json::json!({
-                rpi_plugin_sdk::HOST_CONTEXT_KEY: { "cwd": "/tmp/p", "sessionId": id }
+                rpi_plugin_sdk::HOST_CONTEXT_KEY: { "sessionId": id }
             }),
             None => serde_json::json!({}),
         }
@@ -367,21 +346,22 @@ mod tests {
         ]);
         let control = crate::control::Control::default();
         let progress = std::sync::mpsc::channel().0;
-        crate::plan::plan(&params, &control, &progress).unwrap();
+        crate::plan::plan(registration(), &params, &control, &progress).unwrap();
         crate::dispatch::dispatch_with(
+            registration(),
             &params,
             &control,
             &progress,
-            |graph, ready, parallel, control, progress, parent| {
+            |graph, ready, parallel, control, progress, parent, cwd| {
                 // Cancel after dispatch marks the ready set running, but
                 // before run_wave starts its first chunk. No child may run.
                 control.cancel();
-                crate::dispatch::run_wave(graph, ready, parallel, control, progress, parent)
+                crate::dispatch::run_wave(graph, ready, parallel, control, progress, parent, cwd)
             },
         )
         .unwrap();
         {
-            let state = lock_graph(&params);
+            let state = lock_graph(registration(), &params);
             for node in &state.graph().nodes {
                 assert_eq!(
                     node.status,
@@ -398,7 +378,8 @@ mod tests {
                        _: usize,
                        _: &crate::control::Control,
                        _: &crate::kit::Progress,
-                       _: &crate::host::Selection| {
+                       _: &crate::host::Selection,
+                       _: Option<&std::path::Path>| {
             ready
                 .iter()
                 .map(|id| (id.clone(), Ok("fixture success".into())))
@@ -406,10 +387,15 @@ mod tests {
         };
         // Retrying without resetting the graph completes the independent nodes,
         // then their dependent on the next wave. The fixture launches no child.
-        crate::dispatch::dispatch_with(&params, &control, &progress, fixture).unwrap();
-        assert_eq!(lock_graph(&params).graph().ready(), vec!["dependent"]);
-        crate::dispatch::dispatch_with(&params, &control, &progress, fixture).unwrap();
-        assert!(lock_graph(&params)
+        crate::dispatch::dispatch_with(registration(), &params, &control, &progress, fixture)
+            .unwrap();
+        assert_eq!(
+            lock_graph(registration(), &params).graph().ready(),
+            vec!["dependent"]
+        );
+        crate::dispatch::dispatch_with(registration(), &params, &control, &progress, fixture)
+            .unwrap();
+        assert!(lock_graph(registration(), &params)
             .graph()
             .nodes
             .iter()
@@ -440,15 +426,22 @@ mod tests {
         params["action"] = serde_json::json!("set");
         params["nodes"] = serde_json::json!([{"id":"x", "task":"original", "verify":verify}]);
         let control = crate::control::Control::default();
-        crate::plan::plan(&params, &control, &std::sync::mpsc::channel().0).unwrap();
+        crate::plan::plan(
+            registration(),
+            &params,
+            &control,
+            &std::sync::mpsc::channel().0,
+        )
+        .unwrap();
         let wave_params = params.clone();
         let wave_control = control.clone();
         let wave = std::thread::spawn(move || {
             crate::dispatch::dispatch_with(
+                registration(),
                 &wave_params,
                 &wave_control,
                 &std::sync::mpsc::channel().0,
-                |_, ready, _, _, _, _| {
+                |_, ready, _, _, _, _, _| {
                     ready
                         .iter()
                         .map(|id| (id.clone(), Ok("fixture result".into())))
@@ -465,6 +458,7 @@ mod tests {
         let show_params = params_for(Some("verification-a"));
         let show = std::thread::spawn(move || {
             let _ = tx.send(crate::plan::plan(
+                registration(),
                 &show_params,
                 &crate::control::Control::default(),
                 &std::sync::mpsc::channel().0,
@@ -472,11 +466,21 @@ mod tests {
         });
         let readable = rx.recv_timeout(Duration::from_millis(500));
         let replacement = if matches!(&readable, Ok(Ok(_))) {
-            let editing = crate::plan::plan(&params, &control, &std::sync::mpsc::channel().0);
+            let editing = crate::plan::plan(
+                registration(),
+                &params,
+                &control,
+                &std::sync::mpsc::channel().0,
+            );
             let mut replacement = params_for(Some("verification-b"));
             replacement["action"] = serde_json::json!("set");
             replacement["nodes"] = serde_json::json!([{"id":"x", "task":"replacement"}]);
-            let result = crate::plan::plan(&replacement, &control, &std::sync::mpsc::channel().0);
+            let result = crate::plan::plan(
+                registration(),
+                &replacement,
+                &control,
+                &std::sync::mpsc::channel().0,
+            );
             Some((editing, result, replacement))
         } else {
             None
@@ -499,7 +503,7 @@ mod tests {
         assert!(editing.unwrap_err().contains("dispatch is running"));
         result.unwrap();
         assert!(wave_result.unwrap_err().contains("stale results discarded"));
-        let state = lock_graph(&replacement);
+        let state = lock_graph(registration(), &replacement);
         assert_eq!(state.graph().get("x").unwrap().task, "replacement");
         assert_eq!(
             state.graph().get("x").unwrap().status,
@@ -516,9 +520,9 @@ mod tests {
         let mut set = params.clone();
         set["action"] = serde_json::json!("set");
         set["nodes"] = serde_json::json!([{"id":"x", "task":"original"}]);
-        crate::plan::plan(&set, &control, &progress).unwrap();
+        crate::plan::plan(registration(), &set, &control, &progress).unwrap();
         let generation = {
-            let mut guard = lock_graph(&params);
+            let mut guard = lock_graph(registration(), &params);
             guard.graph_mut().get_mut("x").unwrap().status = graph::Status::Running;
             guard.generation()
         };
@@ -527,30 +531,38 @@ mod tests {
         update["action"] = serde_json::json!("update");
         update["reset"] = serde_json::json!(["x"]);
         for edit in [&set, &update] {
-            assert!(crate::plan::plan(edit, &control, &progress)
+            assert!(crate::plan::plan(registration(), edit, &control, &progress)
                 .unwrap_err()
                 .contains("dispatch is running"));
         }
-        assert!(crate::plan::plan(&params, &control, &progress)
-            .unwrap()
-            .contains("original"));
-        assert!(crate::dispatch::dispatch(&params, &control, &progress)
-            .unwrap_err()
-            .contains("already running"));
+        assert!(
+            crate::plan::plan(registration(), &params, &control, &progress)
+                .unwrap()
+                .contains("original")
+        );
+        assert!(
+            crate::dispatch::dispatch(registration(), &params, &control, &progress)
+                .unwrap_err()
+                .contains("already running")
+        );
         {
-            let mut guard = lock_graph_for_wave(&params, generation).unwrap();
+            let mut guard = lock_graph_for_wave(registration(), &params, generation).unwrap();
             assert_eq!(
                 guard.graph().get("x").unwrap().status,
                 graph::Status::Running
             );
             guard.graph_mut().get_mut("x").unwrap().status = graph::Status::Done;
         }
-        crate::plan::plan(&update, &control, &progress).unwrap();
+        crate::plan::plan(registration(), &update, &control, &progress).unwrap();
         assert_eq!(
-            lock_graph(&params).graph().get("x").unwrap().status,
+            lock_graph(registration(), &params)
+                .graph()
+                .get("x")
+                .unwrap()
+                .status,
             graph::Status::Pending
         );
-        assert!(lock_graph_for_wave(&params, generation).is_err());
+        assert!(lock_graph_for_wave(registration(), &params, generation).is_err());
     }
 
     #[test]
@@ -558,18 +570,18 @@ mod tests {
         let _serial = graph_test_guard();
         let a = params_for(Some("wave-a"));
         let b = params_for(Some("wave-b"));
-        let old_generation = lock_graph(&a).generation();
+        let old_generation = lock_graph(registration(), &a).generation();
         let control = crate::control::Control::default();
         let progress = std::sync::mpsc::channel().0;
         let mut replacement = b.clone();
         replacement["action"] = serde_json::json!("set");
         replacement["nodes"] = serde_json::json!([{"id":"x", "task":"replacement"}]);
-        crate::plan::plan(&replacement, &control, &progress).unwrap();
-        assert!(lock_graph_for_wave(&a, old_generation).is_err());
+        crate::plan::plan(registration(), &replacement, &control, &progress).unwrap();
+        assert!(lock_graph_for_wave(registration(), &a, old_generation).is_err());
         {
-            // Inspect directly: using lock_graph(&b) would hide an accidental
+            // Inspect directly: using lock_graph(registration(), &b) would hide an accidental
             // reset by a stale completion by switching the session back again.
-            let guard = graph_state().lock().unwrap();
+            let guard = registration().graph.lock().unwrap();
             assert_eq!(guard.session, session_of(&b));
             assert_eq!(guard.graph().get("x").unwrap().task, "replacement");
             assert_eq!(
@@ -579,10 +591,14 @@ mod tests {
         }
         // Returning to A still must not accept an old A wave's results.
         replacement[rpi_plugin_sdk::HOST_CONTEXT_KEY] = a[rpi_plugin_sdk::HOST_CONTEXT_KEY].clone();
-        crate::plan::plan(&replacement, &control, &progress).unwrap();
-        assert!(lock_graph_for_wave(&a, old_generation).is_err());
+        crate::plan::plan(registration(), &replacement, &control, &progress).unwrap();
+        assert!(lock_graph_for_wave(registration(), &a, old_generation).is_err());
         assert_eq!(
-            lock_graph(&a).graph().get("x").unwrap().status,
+            lock_graph(registration(), &a)
+                .graph()
+                .get("x")
+                .unwrap()
+                .status,
             graph::Status::Pending
         );
     }
@@ -597,6 +613,7 @@ mod tests {
         let b = params_for(Some("session-b"));
 
         let result = crate::plan::plan(
+            registration(),
             &serde_json::json!({
                 "action": "set",
                 "nodes": [{"id": "only-a", "task": "a-task"}],
@@ -609,13 +626,13 @@ mod tests {
         assert!(result.contains("only-a"));
 
         {
-            let guard = lock_graph(&a);
+            let guard = lock_graph(registration(), &a);
             assert_eq!(guard.graph().nodes.len(), 1);
             assert!(guard.graph().get("only-a").is_some());
         }
         // A different session must not inherit that plan.
         {
-            let guard = lock_graph(&b);
+            let guard = lock_graph(registration(), &b);
             assert!(
                 guard.graph().nodes.is_empty(),
                 "session B saw session A's plan"
@@ -631,15 +648,15 @@ mod tests {
         let a = params_for(Some("session-a"));
         let b = params_for(Some("session-b"));
         for params in [&a, &b] {
-            let mut guard = lock_graph(params);
+            let mut guard = lock_graph(registration(), params);
             *guard.graph_mut() = graph::Graph::default();
             guard.graph_mut().nodes.push(
                 graph::Node::from_value(&serde_json::json!({"id": "x", "task": "t"})).unwrap(),
             );
         }
         // Touch B, then come back to A: A's graph is reset, not restored.
-        drop(lock_graph(&b));
-        let guard = lock_graph(&a);
+        drop(lock_graph(registration(), &b));
+        let guard = lock_graph(registration(), &a);
         assert!(
             guard.graph().nodes.is_empty(),
             "a stale plan survived a session round-trip"
@@ -647,20 +664,20 @@ mod tests {
     }
 
     /// A host without `__rpi` (or an ephemeral session with no id) still works:
-    /// it shares the single `None` bucket instead of refusing to serve.
+    /// it can plan within its registration.
     #[test]
-    fn missing_session_id_falls_back_to_one_shared_graph() {
+    fn missing_session_id_uses_its_registration_graph() {
         let _serial = graph_test_guard();
         let none = params_for(None);
         assert!(session_of(&none).is_none());
         {
-            let mut guard = lock_graph(&none);
+            let mut guard = lock_graph(registration(), &none);
             *guard.graph_mut() = graph::Graph::from_nodes_value(&serde_json::json!([
                 {"id": "fallback", "task": "t"}
             ]))
             .unwrap();
         }
-        let guard = lock_graph(&params_for(None));
+        let guard = lock_graph(registration(), &params_for(None));
         assert!(guard.graph().get("fallback").is_some());
     }
 }

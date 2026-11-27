@@ -15,11 +15,11 @@
 //! safe default, mirroring the upstream Pi permission-gate example.
 
 use rpi_plugin_sdk::{
-    register_entrypoint, EventTag, FreeStringFn, PluginApi, RuntimeActionFn, RuntimeActionId,
-    StbString, StbStringRef, EVENT_HANDLER_ABORT, EVENT_HANDLER_CONTINUE,
+    EventTag, FreeStringFn, RuntimeActionFn, RuntimeActionId, StbString, StbStringRef,
+    EVENT_HANDLER_ABORT, EVENT_HANDLER_CONTINUE,
 };
 use serde_json::{json, Value};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::OnceLock;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -30,38 +30,35 @@ const BYPASS_FLAG: &str = "bypass";
 const GATE_ENV: &str = "RPI_PERMISSION_GATE";
 
 #[derive(Clone, Copy)]
-struct HostRuntime {
+struct RuntimeFns {
     action: RuntimeActionFn,
     free: FreeStringFn,
-    user_data: *mut std::ffi::c_void,
 }
-// SAFETY: the host warrants the runtime-action fn + its opaque `user_data` are
-// safe to call from any thread (the same contract every host-runtime plugin
-// relies on, e.g. rpi-ask-user / rpi-goal).
-unsafe impl Send for HostRuntime {}
-unsafe impl Sync for HostRuntime {}
 
-static RUNTIME: OnceLock<HostRuntime> = OnceLock::new();
-static ENABLED: AtomicBool = AtomicBool::new(false);
+struct HostRuntime {
+    functions: RuntimeFns,
+    owner: *mut std::ffi::c_void,
+}
+
+// Shared Host registrations use the same native trampolines. The registration's
+// opaque owner is passed through the host event registry on each callback.
+static RUNTIME: OnceLock<RuntimeFns> = OnceLock::new();
 static REQUEST_SEQ: AtomicU64 = AtomicU64::new(0);
 
-fn get_cli_flag(name: &str) -> Option<Value> {
-    let runtime = *RUNTIME.get()?;
+fn get_cli_flag(runtime: &HostRuntime, name: &str) -> Option<Value> {
     let args = json!({"name": name}).to_string();
     let mut out = StbString::empty();
-    let rc = (runtime.action)(
+    let rc = (runtime.functions.action)(
         RuntimeActionId::GetCliFlag as u32,
         StbStringRef::from_str(&args),
         &mut out,
-        runtime.user_data,
+        runtime.owner,
     );
-    let text = if rc == 0 {
-        Some(out.to_string_lossy())
-    } else {
-        None
-    };
-    (runtime.free)(out);
-    let value: Value = serde_json::from_str(&text?).ok()?;
+    let text = rpi_plugin_sdk::stb_take!(out, Some(runtime.functions.free));
+    if rc != 0 {
+        return None;
+    }
+    let value: Value = serde_json::from_str(&text).ok()?;
     value.get("value").cloned()
 }
 
@@ -98,14 +95,13 @@ fn next_request_id() -> String {
 fn invoke_ui_dialog(runtime: &HostRuntime, args: &Value) -> Result<Value, String> {
     let input = args.to_string();
     let mut out = StbString::empty();
-    let rc = (runtime.action)(
+    let rc = (runtime.functions.action)(
         RuntimeActionId::UiDialog as u32,
         StbStringRef::from_str(&input),
         &mut out,
-        runtime.user_data,
+        runtime.owner,
     );
-    let text = out.to_string_lossy();
-    (runtime.free)(out);
+    let text = rpi_plugin_sdk::stb_take!(out, Some(runtime.functions.free));
     if rc != 0 {
         if let Ok(value) = serde_json::from_str::<Value>(&text) {
             if let Some(error) = value.get("error").and_then(Value::as_str) {
@@ -255,20 +251,17 @@ fn is_gated_tool(tool_name: &str) -> bool {
 rpi_plugin_sdk::event_handler! {
 /// pi `on("tool_call")`: confirm dangerous tools before they run, and veto
 /// (`EVENT_HANDLER_ABORT`) when the user declines or no UI can answer.
-fn on_tool_call(event, _data) {
-    if !ENABLED.load(Ordering::Acquire) {
-        return EVENT_HANDLER_CONTINUE;
-    }
+fn on_tool_call(event, owner) {
     let Some(call) = event.tool_call() else {
         return EVENT_HANDLER_CONTINUE;
     };
     if !is_gated_tool(&call.tool_name) {
         return EVENT_HANDLER_CONTINUE;
     }
-    let Some(runtime) = RUNTIME.get().copied() else {
-        // No host runtime captured — fail closed.
+    let Some(functions) = RUNTIME.get().copied().filter(|_| !owner.is_null()) else {
         return EVENT_HANDLER_ABORT;
     };
+    let runtime = HostRuntime { functions, owner };
     let args: Value = serde_json::from_str(&call.params).unwrap_or(Value::Null);
 
     match confirm(&runtime, &call.tool_call_id, &call.tool_name, &args) {
@@ -285,58 +278,97 @@ fn on_tool_call(event, _data) {
 }
 }
 
-#[no_mangle]
-// The host resolves this symbol and calls it with the unified-ABI signature; the
-// raw pointer is validated by `register_entrypoint` before use.
-#[allow(clippy::not_unsafe_ptr_arg_deref)]
-pub extern "C" fn rpi_plugin_register(api: *const PluginApi) -> i32 {
-    unsafe {
-        register_entrypoint(api, |api| {
-            // Capture the host callbacks first so the flag can be read during
-            // register (the `PluginApi` pointer is only valid for this call).
-            let _ = RUNTIME.set(HostRuntime {
-                action: api.runtime_action,
-                free: api.free_string,
-                user_data: api.user_data,
-            });
+// The host owns activation and the event callback identity per registration.
+rpi_plugin_sdk::export_shared_plugin!(|api| {
+    let runtime = HostRuntime {
+        functions: RuntimeFns {
+            action: api.runtime_action,
+            free: api.free_string,
+        },
+        owner: api.user_data,
+    };
 
-            if let Some(register_flag) = api.register_flag {
-                let _ = register_flag(
-                    StbStringRef::from_str(BYPASS_FLAG),
-                    StbStringRef::from_str(
-                        "Skip permission-gate approvals for this process and ACP sessions",
-                    ),
-                );
-                let _ = register_flag(
-                    StbStringRef::from_str(GATE_FLAG),
-                    StbStringRef::from_str(
-                        "Confirm dangerous bash/write/edit tool calls via the host UI dialog",
-                    ),
-                );
-            }
-
-            // Off unless explicitly enabled — a gate can hang a headless run
-            // whose client cannot answer UI dialogs.
-            if !gate_enabled(
-                flag_is_on(get_cli_flag(BYPASS_FLAG).as_ref()),
-                flag_is_on(get_cli_flag(GATE_FLAG).as_ref()),
-                env_flag(GATE_ENV),
-            ) {
-                return 0;
-            }
-            ENABLED.store(true, Ordering::Release);
-
-            match api.register_event_handler {
-                Some(register) => register(EventTag::ToolCall, on_tool_call, std::ptr::null_mut()),
-                None => 0,
-            }
-        })
+    if let Some(register_flag) = api.register_flag {
+        let _ = register_flag(
+            StbStringRef::from_str(BYPASS_FLAG),
+            StbStringRef::from_str(
+                "Skip permission-gate approvals for this process and ACP sessions",
+            ),
+        );
+        let _ = register_flag(
+            StbStringRef::from_str(GATE_FLAG),
+            StbStringRef::from_str(
+                "Confirm dangerous bash/write/edit tool calls via the host UI dialog",
+            ),
+        );
     }
-}
+
+    // Off unless explicitly enabled — a gate can hang a headless run
+    // whose client cannot answer UI dialogs.
+    if !gate_enabled(
+        flag_is_on(get_cli_flag(&runtime, BYPASS_FLAG).as_ref()),
+        flag_is_on(get_cli_flag(&runtime, GATE_FLAG).as_ref()),
+        env_flag(GATE_ENV),
+    ) {
+        return 0;
+    }
+    match api.register_event_handler {
+        Some(register) => {
+            RUNTIME.get_or_init(|| runtime.functions);
+            register(EventTag::ToolCall, on_tool_call, runtime.owner)
+        }
+        None => 0,
+    }
+});
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    rpi_plugin_sdk::string_handler! {
+        fn test_dialog(action, input, out, owner) {
+            if action != RuntimeActionId::UiDialog as u32 {
+                return 1;
+            }
+            let request: Value = serde_json::from_str(input).unwrap();
+            let response = match request["op"].as_str() {
+                Some("open") => json!({}),
+                Some("poll") => json!({"status":"answered", "answer": {
+                    "value": if owner as usize == 1 { "yes" } else { "no" },
+                }}),
+                _ => return 1,
+            };
+            out.write(response.to_string());
+            0
+        }
+    }
+
+    #[test]
+    fn callbacks_route_dialogs_to_their_supplied_owners() {
+        let free = rpi_plugin_sdk::callbacks::free_string;
+        RUNTIME.get_or_init(|| RuntimeFns {
+            action: test_dialog,
+            free,
+        });
+        for (owner, expected) in [
+            (1, EVENT_HANDLER_CONTINUE),
+            (2, EVENT_HANDLER_ABORT),
+            (1, EVENT_HANDLER_CONTINUE),
+            (0, EVENT_HANDLER_ABORT),
+        ] {
+            use rpi_plugin_sdk::StablePluginEvent;
+
+            let id = StbString::from_string("call-1".into());
+            let tool = StbString::from_string("edit".into());
+            let params = StbString::from_string("{}".into());
+            let event = StablePluginEvent::tool_call(EventTag::ToolCall, id, tool, params);
+            let actual = on_tool_call(event, owner as *mut std::ffi::c_void);
+            for value in [id, tool, params] {
+                let _ = rpi_plugin_sdk::stb_take!(value, Some(free));
+            }
+            assert_eq!(actual, expected);
+        }
+    }
 
     #[test]
     fn bypass_overrides_both_gate_activation_methods() {

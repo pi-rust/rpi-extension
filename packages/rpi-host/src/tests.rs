@@ -7,8 +7,9 @@ static WORKER_TEST: Mutex<()> = Mutex::new(());
 #[test]
 fn registered_schema_has_all_supported_commands_and_no_endpoint_override() {
     let schema = schema();
-    assert_eq!(schema.name.to_string_lossy(), "host");
-    let parameters: Value = serde_json::from_str(&schema.parameters.to_string_lossy()).unwrap();
+    assert_eq!(rpi_plugin_sdk::stb_text!(schema.name), "host");
+    let parameters: Value =
+        serde_json::from_str(&rpi_plugin_sdk::stb_text!(schema.parameters)).unwrap();
     assert_eq!(parameters["required"], json!(["command"]));
     assert_eq!(parameters["additionalProperties"], false);
     assert_eq!(parameters["x-rpi-result-envelope"], 1);
@@ -38,7 +39,7 @@ fn registered_schema_has_all_supported_commands_and_no_endpoint_override() {
     }
     assert!(parameters["properties"].get("token").is_none());
     assert!(parameters["properties"].get("config").is_none());
-    let description = schema.description.to_string_lossy();
+    let description = rpi_plugin_sdk::stb_text!(schema.description);
     for guidance in [
         "wire v1.5",
         "outcome_unknown",
@@ -162,7 +163,7 @@ fn abi_cancel_after_mutation_send_returns_original_receipt_then_destroy_joins() 
     cancel(handle);
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
     let report = loop {
-        match rpi_plugin_sdk::take_step_result!(poll(handle, None, std::ptr::null_mut())) {
+        match rpi_plugin_sdk::take_step!(poll(handle, None, std::ptr::null_mut())) {
             rpi_plugin_sdk::callbacks::Step::Pending(_) => {
                 assert!(std::time::Instant::now() < deadline);
                 std::thread::sleep(std::time::Duration::from_millis(5));

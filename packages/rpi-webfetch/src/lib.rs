@@ -1,4 +1,4 @@
-#![deny(unsafe_code)]
+#![forbid(unsafe_code)]
 // `export_plugin!` generates extern "C" entry points; the SDK's `guard`
 // wrapper owns the safety contract (same allow as sibling extension crates).
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
@@ -10,7 +10,7 @@ use rpi_plugin_sdk::{
 use serde_json::{json, Value};
 use std::ffi::c_void;
 use std::io::Read;
-use std::net::{IpAddr, ToSocketAddrs};
+use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 use url::Url;
@@ -23,6 +23,13 @@ struct Drive {
     done: bool,
 }
 fn validate(input: &str) -> Result<Url, String> {
+    validate_with_resolver(input, |host, port| (host, port).to_socket_addrs())
+}
+
+fn validate_with_resolver<I: IntoIterator<Item = SocketAddr>>(
+    input: &str,
+    resolve: impl FnOnce(&str, u16) -> std::io::Result<I>,
+) -> Result<Url, String> {
     let u = Url::parse(input).map_err(|e| format!("invalid URL: {e}"))?;
     if !matches!(u.scheme(), "http" | "https") {
         return Err("only http and https URLs are allowed".into());
@@ -50,7 +57,7 @@ fn validate(input: &str) -> Result<Url, String> {
         // link-local, multicast, or other non-public addresses. This catches
         // the common DNS-based SSRF case that a literal-IP check misses.
         let port = u.port_or_known_default().unwrap_or(443);
-        if let Ok(addrs) = (h, port).to_socket_addrs() {
+        if let Ok(addrs) = resolve(h, port) {
             if addrs.into_iter().any(|addr| blocked_ip(addr.ip())) {
                 return Err("hostname resolves to a private or local IP".into());
             }
@@ -166,8 +173,7 @@ extern "C" fn execute(
     params: StbString,
     free: Option<FreeStringFn>,
 ) -> StepHandle {
-    let t = params.to_string_lossy();
-    params.free_with(free);
+    let t = rpi_plugin_sdk::stb_take!(params, free);
     HANDLES.insert(Drive {
         params: serde_json::from_str(&t).unwrap_or(Value::Null),
         done: false,
@@ -245,11 +251,8 @@ fn tool_schema() -> StableToolSchema {
 
 // Matches the Host's optional shared-session ABI export. Keep the standard
 // entrypoint for hosts using the published SDK and isolated library images.
-#[allow(unsafe_code)] // Only the symbol name crosses this additional ABI boundary.
-#[no_mangle]
-pub extern "C" fn rpi_plugin_shared_sessions_v1() {}
 
-rpi_plugin_sdk::export_plugin!(|api| {
+rpi_plugin_sdk::export_shared_plugin!(|api| {
     let Some(register) = api.register_tool else {
         return 1;
     };
@@ -293,8 +296,8 @@ mod tests {
     fn registered_schema_contract() {
         // Inspect the same builder used by register_tool, not a reconstructed schema.
         let schema = tool_schema();
-        assert_eq!(schema.name.to_string_lossy(), "webfetch");
-        let description = schema.description.to_string_lossy();
+        assert_eq!(rpi_plugin_sdk::stb_text!(schema.name), "webfetch");
+        let description = rpi_plugin_sdk::stb_text!(schema.description);
         for guidance in [
             "untrusted",
             "1 MiB + 1 byte",
@@ -310,7 +313,8 @@ mod tests {
                 "missing guidance: {guidance}"
             );
         }
-        let params: Value = serde_json::from_str(&schema.parameters.to_string_lossy()).unwrap();
+        let params: Value =
+            serde_json::from_str(&rpi_plugin_sdk::stb_text!(schema.parameters)).unwrap();
         assert_eq!(params["type"], "object");
         assert_eq!(params["required"], json!(["url"]));
         assert_eq!(params["additionalProperties"], true); // Allows host __rpi metadata.
@@ -359,14 +363,13 @@ mod adv_tests {
 
     #[test]
     fn adv_rejects_hostname_resolving_to_private() {
-        // `localhost.` may resolve via /etc/hosts; the string check catches
-        // the common case, the resolver check catches the rest on this host.
-        assert!(validate("http://localhost.").is_err() || true);
-        // On this cloud host, `ip6-localhost` maps to ::1 in /etc/hosts.
-        match validate("http://ip6-localhost") {
-            Err(_) => {} // resolved + blocked: good
-            Ok(_) => panic!("ip6-localhost resolved to loopback but was allowed"),
-        }
+        let error = validate_with_resolver("https://example.test", |host, port| {
+            assert_eq!(host, "example.test");
+            assert_eq!(port, 443);
+            Ok([SocketAddr::new(std::net::Ipv6Addr::LOCALHOST.into(), port)])
+        })
+        .unwrap_err();
+        assert_eq!(error, "hostname resolves to a private or local IP");
     }
 
     #[test]
@@ -379,6 +382,7 @@ mod adv_tests {
     #[test]
     fn adv_blocked_ip_covers_edge_ranges() {
         assert!(blocked_ip("0.1.2.3".parse().unwrap())); // 0.0.0.0/8
+
         // Document current boundary semantics explicitly: CGNAT 100.64/10,
         // benchmarking 198.18/15 and the broadcast address are NOT blocked.
         // These are asserted so any future tightening is caught here.

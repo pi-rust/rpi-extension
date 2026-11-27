@@ -779,22 +779,32 @@ async fn stop_all_prompt_tasks(prompt_tasks: &mut HashMap<String, PromptTask>) {
 ///
 /// The owner reports the returned code to the host's stdio lifecycle. The
 /// stop receiver also lets SessionShutdown end an idle server without input.
-pub async fn run(
+pub async fn run(stop: watch::Receiver<bool>, input: StdinLines, pending: Option<String>) -> i32 {
+    run_with_bypass(stop, input, pending, crate::session::permission_bypass()).await
+}
+
+pub(crate) async fn run_with_bypass(
     stop: watch::Receiver<bool>,
     mut input: StdinLines,
     pending: Option<String>,
+    bypass: bool,
 ) -> i32 {
-    run_connection(
+    run_connection_with_opener(
         stop,
         || input.poll_line(),
         pending,
         Arc::new(Writer::new()),
         crate::history::session_root(),
+        Arc::new(Mutex::new(HashMap::new())),
+        move |id, cwd, saved, servers| async move {
+            open_session_with_bypass(&id, cwd, saved.as_deref(), servers, bypass).await
+        },
     )
     .await
 }
 
 // The same dispatcher is exercised by model-free transport fixtures.
+#[cfg(test)]
 async fn run_connection(
     stop: watch::Receiver<bool>,
     poll_line: impl FnMut() -> std::io::Result<rpi_plugin_sdk::stdio::InputLine>,
@@ -813,6 +823,7 @@ async fn run_connection(
     .await
 }
 
+#[cfg(test)]
 async fn run_connection_with_sessions(
     stop: watch::Receiver<bool>,
     poll_line: impl FnMut() -> std::io::Result<rpi_plugin_sdk::stdio::InputLine>,
@@ -828,7 +839,9 @@ async fn run_connection_with_sessions(
         writer,
         list_root,
         sessions,
-        |id, cwd, servers| async move { open_session_with_tools(&id, cwd, None, servers).await },
+        |id, cwd, saved, servers| async move {
+            open_session_with_tools(&id, cwd, saved.as_deref(), servers).await
+        },
     )
     .await
 }
@@ -854,9 +867,17 @@ where
         writer,
         list_root,
         sessions,
-        |id, cwd, servers| {
-            assert!(servers.is_empty());
-            open(id, cwd)
+        |id, cwd, saved, servers| {
+            let opening = saved.is_none().then(|| {
+                assert!(servers.is_empty());
+                open(id.clone(), cwd.clone())
+            });
+            async move {
+                match opening {
+                    Some(opening) => opening.await,
+                    None => open_session_with_tools(&id, cwd, saved.as_deref(), servers).await,
+                }
+            }
         },
     )
     .await
@@ -958,7 +979,7 @@ async fn run_connection_with_opener<F, Fut>(
     open: F,
 ) -> i32
 where
-    F: FnMut(String, PathBuf, Vec<rpi_extcore::external_tools::ToolServer>) -> Fut,
+    F: FnMut(String, PathBuf, Option<PathBuf>, Vec<rpi_extcore::external_tools::ToolServer>) -> Fut,
     Fut: std::future::Future<Output = Result<(Arc<Session>, Value), String>>,
 {
     let (tx, rx) = tokio::sync::mpsc::channel(INPUT_QUEUE_CAPACITY);
@@ -989,7 +1010,7 @@ async fn dispatch_connection<F, Fut>(
     mut open: F,
 ) -> i32
 where
-    F: FnMut(String, PathBuf, Vec<rpi_extcore::external_tools::ToolServer>) -> Fut,
+    F: FnMut(String, PathBuf, Option<PathBuf>, Vec<rpi_extcore::external_tools::ToolServer>) -> Fut,
     Fut: std::future::Future<Output = Result<(Arc<Session>, Value), String>>,
 {
     let mut configuration_watchers: HashMap<String, configuration::Forwarder> = HashMap::new();
@@ -1173,7 +1194,7 @@ where
                     }
                 };
                 let session_id = uuid::Uuid::new_v4().to_string();
-                match open(session_id.clone(), cwd, servers).await {
+                match open(session_id.clone(), cwd, None, servers).await {
                     Ok((session, state)) => {
                         if let Err(error) = session.configure_file_io(&writer, &session_id).await {
                             session.kill().await;
@@ -1344,10 +1365,10 @@ where
                 } else {
                     match crate::history::saved_session(session_id) {
                         Ok(path) => {
-                            open_session_with_tools(
-                                session_id,
+                            open(
+                                session_id.to_owned(),
                                 cwd,
-                                Some(&path),
+                                Some(path),
                                 servers.unwrap_or_default(),
                             )
                             .await
@@ -1967,11 +1988,22 @@ async fn open_session(
     open_session_with_tools(id, cwd, saved, Vec::new()).await
 }
 
+#[cfg(test)]
 async fn open_session_with_tools(
     id: &str,
     cwd: PathBuf,
     saved: Option<&std::path::Path>,
     servers: Vec<rpi_extcore::external_tools::ToolServer>,
+) -> Result<(Arc<Session>, Value), String> {
+    open_session_with_bypass(id, cwd, saved, servers, crate::session::permission_bypass()).await
+}
+
+async fn open_session_with_bypass(
+    id: &str,
+    cwd: PathBuf,
+    saved: Option<&std::path::Path>,
+    servers: Vec<rpi_extcore::external_tools::ToolServer>,
+    bypass: bool,
 ) -> Result<(Arc<Session>, Value), String> {
     for server in &servers {
         server
@@ -1979,7 +2011,7 @@ async fn open_session_with_tools(
             .map_err(|_| "invalid MCP configuration".to_owned())?;
     }
     validate_session_workspace(id, &cwd, saved, !servers.is_empty())?;
-    let session = Session::spawn(id.to_owned(), cwd.clone(), saved).await?;
+    let session = Session::spawn_with_bypass(id.to_owned(), cwd.clone(), saved, bypass).await?;
     match prepare_session_tools(&session, id, cwd, Some(servers)).await {
         Ok(state) => Ok((session, state)),
         Err(error) => {

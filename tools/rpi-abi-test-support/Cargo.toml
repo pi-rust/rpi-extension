@@ -1,0 +1,9 @@
+[package]
+name = "rpi-abi-test-support"
+version = "0.0.0"
+edition = "2021"
+rust-version = "1.88"
+publish = false
+
+[dependencies]
+rpi-plugin-sdk = { version = "=0.31.0", default-features = false }

@@ -1,6 +1,6 @@
 [package]
 name = "rpi-orchestrator"
-version.workspace = true
+version = "0.1.19"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
@@ -27,4 +27,11 @@ crate-type = ["cdylib", "rlib"]
 [dependencies]
 rpi-plugin-sdk = { workspace = true, features = ["process"] }
 serde_json = { workspace = true }
-wait-timeout = { workspace = true }
+[target.'cfg(unix)'.dependencies]
+rustix = { version = "1", features = ["fs"] }
+
+[dev-dependencies]
+rpi-abi-test-support = { path = "../../tools/rpi-abi-test-support" }
+
+[lints]
+workspace = true

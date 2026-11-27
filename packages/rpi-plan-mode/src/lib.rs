@@ -1,69 +1,33 @@
 #![forbid(unsafe_code)]
 
+mod lifecycle;
+mod runtime;
+
+pub use lifecycle::rpi_plugin_register;
+
 use rpi_plugin_sdk::handles::ToolHandles;
 use rpi_plugin_sdk::{
-    EventHandlerFn, EventTag, FreeStringFn, PluginApi, RuntimeActionId, StablePluginEvent,
-    StableToolSchema, StbString, StbStringRef, StepHandle, StepResult, ToolPartialCb,
+    EventHandlerFn, EventTag, FreeStringFn, PluginApi, RuntimeActionId, StableToolSchema,
+    StbString, StbStringRef, StepHandle, StepResult, ToolPartialCb,
 };
+use runtime::Binding;
 use serde_json::{json, Value};
 use std::ffi::c_void;
-use std::sync::{Mutex, OnceLock};
 
 const MAX_PLAN_CHARS: usize = 50_000;
 const PLAN_TOOL: &str = "plan_mode_complete";
 const START_TOOL: &str = "plan_mode_start";
 const PLAN_ENTRY: &str = "plan-mode";
 
-// Reuse the SDK's host-context lifetime and thread-safety contract.
-type Runtime = PluginApi;
-
-static RUNTIME: OnceLock<Runtime> = OnceLock::new();
-static STATE: OnceLock<Mutex<PlanState>> = OnceLock::new();
-
+#[derive(Default)]
 struct PlanState {
     active: bool,
     plan: Option<String>,
     previous_tools: Option<Vec<String>>,
 }
 
-fn state() -> &'static Mutex<PlanState> {
-    STATE.get_or_init(|| {
-        Mutex::new(PlanState {
-            active: false,
-            plan: None,
-            previous_tools: None,
-        })
-    })
-}
-
-fn call_runtime(id: RuntimeActionId, args: Value) -> Result<Value, String> {
-    let runtime = *RUNTIME.get().ok_or("plan mode runtime is unavailable")?;
-    let input = args.to_string();
-    let mut output = StbString::empty();
-    let rc = (runtime.runtime_action)(
-        id as u32,
-        StbStringRef::from_str(&input),
-        &mut output,
-        runtime.user_data,
-    );
-    let text = output.to_string_lossy();
-    (runtime.free_string)(output);
-    if rc != 0 {
-        return Err(if text.is_empty() {
-            format!("runtime action {id:?} failed")
-        } else {
-            text
-        });
-    }
-    if text.trim().is_empty() {
-        Ok(Value::Null)
-    } else {
-        serde_json::from_str(&text).map_err(|e| format!("invalid runtime response: {e}"))
-    }
-}
-
-fn current_tools() -> Result<Vec<String>, String> {
-    let value = call_runtime(RuntimeActionId::GetActiveTools, json!({}))?;
+fn current_tools(binding: &Binding) -> Result<Vec<String>, String> {
+    let value = binding.call(RuntimeActionId::GetActiveTools, json!({}))?;
     value
         .get("tools")
         .and_then(Value::as_array)
@@ -80,50 +44,80 @@ fn current_tools() -> Result<Vec<String>, String> {
         })
 }
 
-fn set_tools(tools: &[String]) -> Result<(), String> {
-    call_runtime(RuntimeActionId::SetActiveTools, json!({"tools": tools}))?;
+fn set_tools(binding: &Binding, tools: &[String]) -> Result<(), String> {
+    binding.call(RuntimeActionId::SetActiveTools, json!({"tools": tools}))?;
     Ok(())
 }
 
-fn persist_state(active: bool, plan: Option<&str>) {
-    let _ = call_runtime(
+fn persist_state(binding: &Binding, state: &PlanState) {
+    let _ = binding.call(
         RuntimeActionId::AppendEntry,
-        json!({"customType": PLAN_ENTRY, "data": {"active": active, "plan": plan}}),
+        json!({"customType": PLAN_ENTRY, "data": {
+            "active": state.active, "plan": state.plan, "previousTools": state.previous_tools
+        }}),
     );
 }
 
-fn restore_state() {
-    let Ok(value) = call_runtime(
+fn restore_state(binding: &Binding) -> Result<(), String> {
+    let mut state = binding
+        .registration
+        .state
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    let value = binding.call(
         RuntimeActionId::GetSessionBranch,
         json!({"customTypes": [PLAN_ENTRY]}),
-    ) else {
-        return;
-    };
+    )?;
     if value.get("filtered").and_then(Value::as_bool) != Some(true) {
-        return;
+        return Err("GetSessionBranch did not confirm filtering".into());
     }
-    let mut restored = None;
-    if let Some(entries) = value.get("entries").and_then(Value::as_array) {
-        for entry in entries {
-            if entry.get("type").and_then(Value::as_str) == Some("custom")
-                && entry.get("customType").and_then(Value::as_str) == Some(PLAN_ENTRY)
-            {
-                restored = entry.get("data").cloned();
-            }
+    let entries = value
+        .get("entries")
+        .and_then(Value::as_array)
+        .ok_or("GetSessionBranch did not return entries")?;
+    let data = entries
+        .iter()
+        .rev()
+        .find(|entry| {
+            entry["type"].as_str() == Some("custom")
+                && entry["customType"].as_str() == Some(PLAN_ENTRY)
+        })
+        .map(|entry| &entry["data"])
+        .unwrap_or(&Value::Null);
+    let active = data["active"].as_bool().unwrap_or(false);
+    let plan = data["plan"].as_str().map(str::to_owned);
+    let previous_tools = if active {
+        let tools = planning_tools();
+        let current = current_tools(binding)?;
+        let previous = serde_json::from_value(data["previousTools"].clone())
+            .ok()
+            .or_else(|| state.previous_tools.clone())
+            .or_else(|| (current != tools).then(|| current.clone()));
+        if current != tools {
+            set_tools(binding, &tools)?;
         }
-    }
-    if let Some(data) = restored {
-        let mut guard = state().lock().unwrap_or_else(|p| p.into_inner());
-        guard.active = data.get("active").and_then(Value::as_bool).unwrap_or(false);
-        guard.plan = data.get("plan").and_then(Value::as_str).map(str::to_owned);
-    }
+        previous
+    } else {
+        if let Some(previous) = &state.previous_tools {
+            set_tools(binding, previous)?;
+        }
+        None
+    };
+    *state = PlanState {
+        active,
+        plan,
+        previous_tools,
+    };
+    Ok(())
 }
 
-extern "C" fn handle_event(event: StablePluginEvent, _: *mut c_void) -> i32 {
-    if matches!(event.tag, EventTag::SessionStart | EventTag::SessionTree) {
-        restore_state();
+rpi_plugin_sdk::event_handler! {
+fn handle_event(_event, owner) {
+    if let Some(binding) = runtime::callback(owner) {
+        let _ = restore_state(&binding);
     }
     0
+}
 }
 
 fn planning_tools() -> Vec<String> {
@@ -240,54 +234,63 @@ fn markdown_plan(plan: Option<&str>, active: bool) -> String {
     format!("**Plan · {status}**\n\n{body}\n\n{hint}")
 }
 
-fn activate() -> Result<bool, String> {
-    let mut guard = state()
+fn activate(binding: &Binding) -> Result<bool, String> {
+    let mut state = binding
+        .registration
+        .state
         .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    if guard.active {
+        .unwrap_or_else(|p| p.into_inner());
+    if state.active {
         return Ok(false);
     }
-    let previous = current_tools()?;
-    set_tools(&planning_tools())?;
-    guard.previous_tools = Some(previous);
-    guard.active = true;
-    guard.plan = None;
-    drop(guard);
-    persist_state(true, None);
+    let previous = current_tools(binding)?;
+    set_tools(binding, &planning_tools())?;
+    *state = PlanState {
+        active: true,
+        plan: None,
+        previous_tools: Some(previous),
+    };
+    persist_state(binding, &state);
     Ok(true)
 }
 
-fn deactivate() -> Result<bool, String> {
-    let mut guard = state()
+fn deactivate(binding: &Binding, plan: Option<&str>) -> Result<bool, String> {
+    let mut state = binding
+        .registration
+        .state
         .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    if !guard.active {
+        .unwrap_or_else(|p| p.into_inner());
+    if !state.active {
         return Ok(false);
     }
-    if let Some(previous) = guard.previous_tools.take() {
-        set_tools(&previous)?;
+    if let Some(previous) = &state.previous_tools {
+        set_tools(binding, previous)?;
     }
-    guard.active = false;
-    let plan = guard.plan.clone();
-    drop(guard);
-    persist_state(false, plan.as_deref());
+    state.previous_tools = None;
+    state.active = false;
+    if let Some(plan) = plan {
+        state.plan = Some(plan.to_owned());
+    }
+    persist_state(binding, &state);
     Ok(true)
 }
 
-fn plan_status() -> String {
-    let guard = state()
+fn plan_status(binding: &Binding) -> String {
+    let state = binding
+        .registration
+        .state
         .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    markdown_plan(guard.plan.as_deref(), guard.active)
+        .unwrap_or_else(|p| p.into_inner());
+    markdown_plan(state.plan.as_deref(), state.active)
 }
 
-fn start_plan(raw: &Value) -> Result<String, String> {
+fn start_plan(binding: &Binding, raw: &Value) -> Result<String, String> {
     let request = raw
         .get("request")
         .and_then(Value::as_str)
         .map(str::trim)
         .filter(|request| !request.is_empty());
-    activate()?;
+    activate(binding)?;
     let message = request
         .map(|value| format!("Plan mode started for: {value}"))
         .unwrap_or_else(|| {
@@ -300,7 +303,7 @@ fn start_plan(raw: &Value) -> Result<String, String> {
     .to_string())
 }
 
-fn complete_plan(raw: &Value) -> Result<String, String> {
+fn parse_plan(raw: &Value) -> Result<&str, String> {
     let plan = raw
         .get("plan")
         .and_then(Value::as_str)
@@ -310,21 +313,14 @@ fn complete_plan(raw: &Value) -> Result<String, String> {
     if plan.chars().count() > MAX_PLAN_CHARS {
         return Err(format!("plan must not exceed {MAX_PLAN_CHARS} characters"));
     }
-    {
-        let guard = state()
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if !guard.active {
-            return Err("plan_mode_complete is only available while plan mode is active".into());
-        }
+    Ok(plan)
+}
+
+fn complete_plan(binding: &Binding, raw: &Value) -> Result<String, String> {
+    let plan = parse_plan(raw)?;
+    if !deactivate(binding, Some(plan))? {
+        return Err("plan_mode_complete is only available while plan mode is active".into());
     }
-    {
-        let mut guard = state()
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        guard.plan = Some(plan.to_string());
-    }
-    deactivate()?;
     Ok(json!({
         "content": [{"type": "text", "text": markdown_plan(Some(plan), false)}],
         "details": {"kind": "plan", "plan": plan, "outline": plan_outline(plan), "active": false, "markdown": true}
@@ -365,18 +361,20 @@ static HANDLES: ToolHandles<Drive> = ToolHandles::new();
 
 struct Drive {
     params: Value,
+    binding: Result<Binding, String>,
     done: bool,
 }
 
-extern "C" fn execute(
+extern "C" fn execute<const SLOT: usize>(
     _: StbStringRef,
     params: StbString,
     free: Option<FreeStringFn>,
 ) -> StepHandle {
-    let text = params.to_string_lossy();
-    params.free_with(free);
+    let text = rpi_plugin_sdk::stb_take!(params, free);
+    let params = serde_json::from_str(&text).unwrap_or(Value::Null);
     HANDLES.insert(Drive {
-        params: serde_json::from_str(&text).unwrap_or(Value::Null),
+        binding: runtime::tool::<SLOT>(&params),
+        params,
         done: false,
     })
 }
@@ -401,10 +399,10 @@ extern "C" fn poll(handle: StepHandle, _: Option<ToolPartialCb>, _: *mut c_void)
         ));
     }
     drive.done = true;
-    let result = if drive.params.get("plan").is_some() {
-        complete_plan(&drive.params)
-    } else {
-        start_plan(&drive.params)
+    let result = match &drive.binding {
+        Ok(binding) if drive.params.get("plan").is_some() => complete_plan(binding, &drive.params),
+        Ok(binding) => start_plan(binding, &drive.params),
+        Err(error) => Err(error.clone()),
     };
     match result {
         Ok(value) => StepResult::done(StbString::from_string(value)),
@@ -431,9 +429,11 @@ fn command_output(out: &mut rpi_plugin_sdk::callbacks::Output<'_>, value: Value)
 }
 
 rpi_plugin_sdk::string_handler! {
-fn plan_command(args_json, out, _user_data) {
-    let raw = args_json.to_owned();
-    let envelope: Value = serde_json::from_str(&raw).unwrap_or(Value::Null);
+fn plan_command(args_json, out, owner) {
+    let Some(binding) = runtime::callback(owner) else {
+        return command_output(out, json!({"kind":"message","text":"Plan mode runtime is unavailable"}));
+    };
+    let envelope: Value = serde_json::from_str(args_json).unwrap_or(Value::Null);
     let args = envelope
         .get("args")
         .and_then(Value::as_str)
@@ -441,7 +441,7 @@ fn plan_command(args_json, out, _user_data) {
         .trim();
     let first = args.split_whitespace().next().unwrap_or("").to_lowercase();
     let result = match first.as_str() {
-        "start" => match activate() {
+        "start" => match activate(&binding) {
             Ok(true) => {
                 "Plan mode enabled. Inspect the codebase and call `plan_mode_complete` when ready."
                     .to_string()
@@ -449,9 +449,9 @@ fn plan_command(args_json, out, _user_data) {
             Ok(false) => "Plan mode is already active.".to_string(),
             Err(error) => format!("Unable to enter plan mode: {error}"),
         },
-        "show" | "status" | "" => plan_status(),
+        "show" | "status" | "" => plan_status(&binding),
         "finalize" => {
-            if state()
+            if binding.registration.state
                 .lock()
                 .unwrap_or_else(|p| p.into_inner())
                 .plan
@@ -462,20 +462,20 @@ fn plan_command(args_json, out, _user_data) {
                 "No plan yet. Complete plan mode with `plan_mode_complete` first.".to_string()
             }
         }
-        "exit" | "off" => match deactivate() {
+        "exit" | "off" => match deactivate(&binding, None) {
             Ok(true) => "Plan mode disabled. Full tool access restored.".to_string(),
             Ok(false) => "Plan mode is not active.".to_string(),
             Err(error) => format!("Unable to leave plan mode: {error}"),
         },
-        _ => match activate() {
+        _ => match activate(&binding) {
             Ok(_) => {
                 let prompt = format!(
                     "You are now in Plan mode. Do not edit files or implement changes.\n\nUser request: {args}\n\nInspect the repository, resolve important decisions, and call `plan_mode_complete` with a complete implementation-ready Markdown plan when finished."
                 );
                 if let Err(error) =
-                    call_runtime(RuntimeActionId::SendUserMessage, json!({"text": prompt}))
+                    binding.call(RuntimeActionId::SendUserMessage, json!({"text": prompt}))
                 {
-                    let _ = deactivate();
+                    let _ = deactivate(&binding, None);
                     format!("Unable to start planning request: {error}")
                 } else {
                     "Plan mode started and the planning request was submitted.".to_string()
@@ -486,16 +486,25 @@ fn plan_command(args_json, out, _user_data) {
     };
     let mut output = json!({"kind": "message", "text": result});
     if !result.starts_with("Unable to") {
-        let guard = state().lock().unwrap_or_else(|p| p.into_inner());
+        let guard = binding.registration.state.lock().unwrap_or_else(|p| p.into_inner());
         output["details"] = json!({"kind":"plan","plan":guard.plan,"active":guard.active,"expanded":first == "show"});
     }
     command_output(out, output)
 }
 }
-rpi_plugin_sdk::export_plugin!(|api| {
+fn register(api: &PluginApi, cleanup: Option<lifecycle::Register>) -> i32 {
+    let slot = match runtime::install(*api, cleanup) {
+        Ok(slot) => slot,
+        Err(rc) => return rc,
+    };
+    let table: [rpi_plugin_sdk::ToolExecuteFn; runtime::SLOTS] = lifecycle::execute_table!(execute);
+    let execute = table
+        .get(slot)
+        .copied()
+        .unwrap_or(execute::<{ runtime::SLOTS }>);
     if let Some(register_event) = api.register_event_handler {
         for tag in [EventTag::SessionStart, EventTag::SessionTree] {
-            if register_event(tag, handle_event as EventHandlerFn, std::ptr::null_mut()) != 0 {
+            if register_event(tag, handle_event as EventHandlerFn, api.user_data) != 0 {
                 return 1;
             }
         }
@@ -503,7 +512,6 @@ rpi_plugin_sdk::export_plugin!(|api| {
     let Some(register) = api.register_tool else {
         return 1;
     };
-    let _ = RUNTIME.set(*api);
     let schema = Box::new(complete_schema());
     let rc = register(&*schema, execute, poll, cancel, destroy, free_string);
     drop(schema);
@@ -519,10 +527,10 @@ rpi_plugin_sdk::export_plugin!(|api| {
     if let Some(register_command) = api.register_command {
         let name = StbStringRef::from_str("plan");
         let description = StbStringRef::from_str("Enter, inspect, or exit CodeX-like plan mode");
-        let _ = register_command(name, description, plan_command);
+        return register_command(name, description, plan_command);
     }
     0
-});
+}
 
 #[cfg(test)]
 mod tests {
@@ -532,8 +540,9 @@ mod tests {
     fn registered_schemas_are_json_objects_with_runtime_parameter_rules() {
         for (tool, name) in [(start_schema(), START_TOOL), (complete_schema(), PLAN_TOOL)] {
             // Exercise the constructors used for actual registration.
-            assert_eq!(tool.name.to_string_lossy(), name);
-            let schema: Value = serde_json::from_str(&tool.parameters.to_string_lossy()).unwrap();
+            assert_eq!(rpi_plugin_sdk::stb_text!(tool.name), name);
+            let schema: Value =
+                serde_json::from_str(&rpi_plugin_sdk::stb_text!(tool.parameters)).unwrap();
             assert_eq!(schema["type"], "object");
             assert_eq!(schema["additionalProperties"], true);
             let props = schema["properties"].as_object().unwrap();
@@ -554,7 +563,7 @@ mod tests {
                     .unwrap()
                     .contains(&MAX_PLAN_CHARS.to_string()));
             }
-            assert!(tool.description.to_string_lossy().contains("DAG"));
+            assert!(rpi_plugin_sdk::stb_text!(tool.description).contains("DAG"));
         }
     }
 
@@ -568,7 +577,7 @@ mod tests {
             json!({"plan":" \n\t"}),
         ] {
             assert_eq!(
-                complete_plan(&input).unwrap_err(),
+                parse_plan(&input).unwrap_err(),
                 "plan must be a non-empty string"
             );
         }
@@ -576,7 +585,7 @@ mod tests {
         // precedes the active-mode check and does not access runtime/global state.
         let long = format!("  {}  ", "界".repeat(MAX_PLAN_CHARS + 1));
         assert_eq!(
-            complete_plan(&json!({"plan":long,"__rpi":{"trace":[{"id":1}]}})).unwrap_err(),
+            parse_plan(&json!({"plan":long,"__rpi":{"trace":[{"id":1}]}})).unwrap_err(),
             format!("plan must not exceed {MAX_PLAN_CHARS} characters")
         );
     }
@@ -590,7 +599,7 @@ mod tests {
 
     #[test]
     fn rejects_empty_plan() {
-        assert!(complete_plan(&json!({"plan": ""})).is_err());
+        assert!(parse_plan(&json!({"plan": ""})).is_err());
     }
 
     #[test]
@@ -643,11 +652,17 @@ mod tests {
         assert!(!rendered.contains("Next:"));
     }
 
+    use std::sync::{Arc, Mutex};
+
     static BRANCH: Mutex<Value> = Mutex::new(Value::Null);
 
     rpi_plugin_sdk::string_handler! {
     fn branch_runtime(action, args, out, _user_data) {
         let args: Value = serde_json::from_str(args).unwrap();
+        if action == RuntimeActionId::GetActiveTools as u32 {
+            out.write(json!({"tools": planning_tools()}).to_string());
+            return 0;
+        }
         assert_eq!(action, RuntimeActionId::GetSessionBranch as u32);
         assert_eq!(args, json!({"customTypes": ["plan-mode"]}));
         out.write(BRANCH.lock().unwrap().to_string());
@@ -657,7 +672,7 @@ mod tests {
 
     #[test]
     fn filtered_branch_restores_latest_plan_and_rejects_unconfirmed_replies() {
-        let _ = RUNTIME.set(PluginApi {
+        let binding = Arc::new(runtime::Registration::new(PluginApi {
             abi_version: rpi_plugin_sdk::RPI_PLUGIN_ABI_VERSION_UNIFIED,
             struct_size: std::mem::size_of::<PluginApi>() as u32,
             runtime_action: branch_runtime,
@@ -677,29 +692,45 @@ mod tests {
             declare: None,
             register_before_agent_start: None,
             register_oauth_provider: None,
-        });
+            register_streaming_provider: None,
+            register_tool_with_wake: None,
+            register_plugin_lifecycle: None,
+            register_tool_prompt: None,
+            register_oauth_provider_cancellable: None,
+            register_tool_result: None,
+            register_autocomplete_provider: None,
+            register_command_completions: None,
+            register_argument_suggester: None,
+        }))
+        .binding();
         *BRANCH.lock().unwrap() = json!({"filtered":true,"entries":[
             {"type":"custom","customType":"plan-mode","data":{"active":true,"plan":"older"}},
             {"type":"custom","customType":"goal-state","data":{"active":true,"plan":"unrelated"}},
             {"type":"custom","customType":"plan-mode","data":{"active":false,"plan":"latest"}}
         ]});
-        restore_state();
-        assert_eq!(state().lock().unwrap().plan.as_deref(), Some("latest"));
-        assert!(!state().lock().unwrap().active);
+        let _ = restore_state(&binding);
+        assert_eq!(
+            binding.registration.state.lock().unwrap().plan.as_deref(),
+            Some("latest")
+        );
+        assert!(!binding.registration.state.lock().unwrap().active);
         for filtered in [Value::Null, json!(false), json!("true")] {
             *BRANCH.lock().unwrap() = json!({"filtered":filtered,"entries":[
                 {"type":"custom","customType":"plan-mode","data":{"active":true,"plan":"wrong"}}
             ]});
-            restore_state();
-            assert_eq!(state().lock().unwrap().plan.as_deref(), Some("latest"));
-            assert!(!state().lock().unwrap().active);
+            let _ = restore_state(&binding);
+            assert_eq!(
+                binding.registration.state.lock().unwrap().plan.as_deref(),
+                Some("latest")
+            );
+            assert!(!binding.registration.state.lock().unwrap().active);
         }
         *BRANCH.lock().unwrap() = json!({"filtered":true,"entries":[
             {"type":"custom","customType":"plan-mode","data":{"active":true,"plan":null}}
         ]});
-        restore_state();
-        assert!(state().lock().unwrap().active);
-        assert!(state().lock().unwrap().plan.is_none());
-        state().lock().unwrap().active = false;
+        let _ = restore_state(&binding);
+        assert!(binding.registration.state.lock().unwrap().active);
+        assert!(binding.registration.state.lock().unwrap().plan.is_none());
+        binding.registration.state.lock().unwrap().active = false;
     }
 }

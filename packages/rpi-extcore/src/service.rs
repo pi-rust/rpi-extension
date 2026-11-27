@@ -138,6 +138,7 @@ impl Default for BackendConfig {
 #[derive(Clone)]
 pub struct Service {
     pub config: BackendConfig,
+    local_host_socket: Option<PathBuf>,
     projects: Arc<RwLock<Projects>>,
     default_project_id: String,
     sessions: Arc<RwLock<HashMap<String, Arc<HostSession>>>>,
@@ -163,6 +164,38 @@ impl Service {
     pub fn new(
         config: BackendConfig,
     ) -> Result<Arc<Self>, Box<dyn std::error::Error + Send + Sync>> {
+        Self::build(config, None)
+    }
+
+    /// Use one prestarted local Host for all native sessions owned by this service.
+    pub async fn with_local_host_socket(
+        config: BackendConfig,
+        socket: PathBuf,
+    ) -> Result<Arc<Self>, Box<dyn std::error::Error + Send + Sync>> {
+        #[cfg(unix)]
+        {
+            if !config
+                .session_dir
+                .as_deref()
+                .is_some_and(std::path::Path::is_absolute)
+            {
+                return Err("local Host socket requires an explicit absolute sessionDir".into());
+            }
+            // A connection without an opening frame allocates no native session.
+            crate::host::local_socket::connect(&socket).await?;
+            Self::build(config, Some(socket))
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = (config, socket);
+            Err("local Host socket requires Unix-domain sockets".into())
+        }
+    }
+
+    fn build(
+        config: BackendConfig,
+        local_host_socket: Option<PathBuf>,
+    ) -> Result<Arc<Self>, Box<dyn std::error::Error + Send + Sync>> {
         let mut projects = vec![Project::new(&config.project)?];
         for path in &config.projects {
             let project = Project::new(path)?;
@@ -186,6 +219,7 @@ impl Service {
         let registry = Registry::load(config.registry.clone())?;
         Ok(Arc::new(Self {
             config,
+            local_host_socket,
             projects: Arc::new(RwLock::new(projects)),
             default_project_id,
             sessions: Arc::new(RwLock::new(HashMap::new())),
@@ -205,6 +239,28 @@ impl Service {
             host_version: Arc::new(tokio::sync::OnceCell::new()),
         }))
     }
+    async fn start_native_session(
+        &self,
+        options: crate::host::SessionOptions,
+        fork_cut: Option<&str>,
+        reopening: bool,
+    ) -> Result<Arc<HostSession>, String> {
+        if let Some(socket) = &self.local_host_socket {
+            #[cfg(unix)]
+            return HostSession::connect_local_socket(options, fork_cut, socket).await;
+            #[cfg(not(unix))]
+            {
+                let _ = socket;
+                return Err("local Host socket requires Unix-domain sockets".into());
+            }
+        }
+        if reopening {
+            HostSession::reopen_options(options).await
+        } else {
+            HostSession::spawn_options_with_fork_cut(options, fork_cut).await
+        }
+    }
+
     /// The native host's own version.
     ///
     /// The RPC `ready` frame carries no version, and a client cannot tell an
@@ -763,11 +819,7 @@ async fn spawn_host(
     let options = resources::host_options(state, id, project)
         .await
         .map_err(|e| e.to_string())?;
-    let session = if reopening {
-        HostSession::reopen_options(options).await?
-    } else {
-        HostSession::spawn_options(options).await?
-    };
+    let session = state.start_native_session(options, None, reopening).await?;
     match resources::prepare_open_observation(state, id, &session).await {
         Ok(record) => Ok((session, record)),
         Err(error) => {
@@ -986,17 +1038,19 @@ async fn fork_session_owned(
     }
     fork_options.session_id = requested_id.clone();
     fork_options.fork_source = Some(source_id.to_owned());
-    let session =
-        match HostSession::spawn_options_with_fork_cut(fork_options, entry_id.as_deref()).await {
-            Ok(session) => session,
-            Err(error) => {
-                return (
-                    ReplyKind::HostUnavailable,
-                    json!({"error": error, "code": "host_start_failed"}),
-                )
-                    .into_reply()
-            }
-        };
+    let session = match state
+        .start_native_session(fork_options, entry_id.as_deref(), false)
+        .await
+    {
+        Ok(session) => session,
+        Err(error) => {
+            return (
+                ReplyKind::HostUnavailable,
+                json!({"error": error, "code": "host_start_failed"}),
+            )
+                .into_reply()
+        }
+    };
     let state_response = session
         .send(json!({"type": "get_state", "id": uuid::Uuid::new_v4().to_string()}))
         .await;
