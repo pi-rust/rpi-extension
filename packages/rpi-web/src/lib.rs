@@ -9,5 +9,6 @@ mod file_links;
 mod plugin;
 mod server;
 mod startup;
+mod updates;
 
 pub use server::{run, AppConfig};
