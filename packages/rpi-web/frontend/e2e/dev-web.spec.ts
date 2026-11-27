@@ -7487,6 +7487,62 @@ for (const source of ["snapshot", "live"]) {
   });
 }
 
+test("compact commands show a compacting label while other runs keep processing", async ({
+  page,
+}) => {
+  await page.addInitScript(
+    (value) => localStorage.setItem("rpi-web-language", value),
+    "en",
+  );
+  const seed = {
+    role: "user",
+    entryId: "compact-status-seed",
+    content: "before compact",
+  };
+  await mockHost(page, { snapshotMessages: [seed] });
+  let activeOperation: Record<string, unknown> | null = {
+    runId: "run-compact",
+    kind: "compact",
+  };
+  await page.route(
+    `**/api/v1/sessions/${sessionId}/commands`,
+    async (route) => {
+      if (route.request().postDataJSON().type !== "get_state")
+        return route.fallback();
+      return route.fulfill({
+        json: response(
+          {
+            sessionId,
+            leafId: "leaf-1",
+            activeOperation,
+            queue: { steeringCount: 0, followUpCount: 0 },
+            stats: {
+              messageCount: 0,
+              cachedTokens: 0,
+              uncachedTokens: 0,
+              totalTokens: 0,
+              costTotal: 0,
+            },
+          },
+          "get_state",
+        ),
+      });
+    },
+  );
+  await page.route(`**/api/v1/sessions/${sessionId}/events?*`, (route) =>
+    route.fulfill({
+      contentType: "text/event-stream",
+      body: 'id: 7\nevent: operation_accepted\ndata: {"type":"operation_accepted","command":"compact"}\n\n',
+    }),
+  );
+  await page.goto("/");
+  await expect(page.locator(".working-indicator")).toContainText("Compacting…");
+
+  activeOperation = { runId: "run-prompt", kind: "run" };
+  await page.reload();
+  await expect(page.locator(".working-indicator")).toContainText("Processing…");
+});
+
 test("a rejected compact command releases the composer and restores its draft", async ({
   page,
 }) => {

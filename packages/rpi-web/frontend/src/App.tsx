@@ -1141,6 +1141,12 @@ export default function App() {
   const attachmentPreviews = useRef(new Set<string>());
   const fileInputRef = useRef<HTMLInputElement>(null);
   const [status, setStatus] = useState("connecting");
+  const compactingRef = useRef(false);
+  const [compacting, setCompacting] = useState(false);
+  const patchCompacting = useCallback((next: boolean) => {
+    compactingRef.current = next;
+    setCompacting(next);
+  }, []);
   /** Set when the native host reports `host_closed`; cleared on session switch. */
   const hostClosedRef = useRef(false);
   const [loadingSession, setLoadingSession] = useState(false);
@@ -1979,8 +1985,10 @@ export default function App() {
   const busy =
     runActive ||
     status === "running" ||
+    status === "compacting" ||
     status === "starting" ||
     status === "awaiting_input";
+  const activeCompacting = compacting && status === "compacting";
   // Agents create linked worktrees while a run is in progress and then report
   // the files they wrote there. Refresh the roots once the run settles so those
   // paths become previewable without a page reload; a failed refresh keeps the
@@ -2044,7 +2052,11 @@ export default function App() {
     [language],
   );
   const connectionLabel = t(
-    (status === "awaiting_input" ? "waitingForAnswer" : status) as MessageKey,
+    (status === "awaiting_input"
+      ? "waitingForAnswer"
+      : status === "compacting"
+        ? "compacting"
+        : status) as MessageKey,
   );
   const current = sessions.find((session) => session.sessionId === sessionId);
   const hostVersion = capabilities?.hostVersion?.trim() ?? "";
@@ -2075,6 +2087,7 @@ export default function App() {
   );
   const activeSessionRunning = [
     "running",
+    "compacting",
     "starting",
     "awaiting_input",
   ].includes(activeSession?.status ?? "");
@@ -2178,19 +2191,24 @@ export default function App() {
         dialogEventSeq.current = seq;
       switch (event.type) {
         case "agent_start":
-        case "operation_accepted":
+        case "operation_accepted": {
+          const isCompacting =
+            event.type === "operation_accepted" && event.command === "compact";
+          patchCompacting(isCompacting);
           setRows((previous) =>
             previous.filter((row) => row.id !== "retry-note"),
           );
           setRunActive(true);
-          setStatus("running");
+          setStatus(isCompacting ? "compacting" : "running");
           setInterrupted(false);
           setFailedRun(false);
           setError("");
           break;
+        }
         case "agent_settled": {
           setRows(stopToolTimers);
           setRunActive(false);
+          patchCompacting(false);
           if (freshDialogEvent) {
             dialogRequests.current.clear();
             activeDialogId.current = "";
@@ -2288,6 +2306,7 @@ export default function App() {
         case "host_closed":
           setRows(stopToolTimers);
           setRunActive(false);
+          patchCompacting(false);
           dialogRequests.current.clear();
           activeDialogId.current = "";
           hostClosedRef.current = true;
@@ -2482,7 +2501,7 @@ export default function App() {
           break;
       }
     },
-    [notifySessionCompletion, showNextDialog, traceEvent],
+    [notifySessionCompletion, patchCompacting, showNextDialog, traceEvent],
   );
 
   const handleEvent = useCallback(
@@ -2534,6 +2553,7 @@ export default function App() {
     setDialog(null);
     resolveTextRequest(null);
     setRuntime(null);
+    patchCompacting(false);
     setModels([]);
     setAuthProviders([]);
     setAuthProvider("");
@@ -2546,7 +2566,7 @@ export default function App() {
     setSettingsOpen(false);
     setDraft("");
     clearDrafts();
-  }, [clearDrafts, clearTrace]);
+  }, [clearDrafts, clearTrace, patchCompacting]);
 
   const refreshSessions = useCallback(
     (force = true) => {
@@ -3038,6 +3058,7 @@ export default function App() {
     setError(initialSelectionError.current);
     initialSelectionError.current = "";
     setConnectionFailed(false);
+    patchCompacting(false);
     hostClosedRef.current = false;
     setStatus("connecting");
     setLoadingSession(Boolean(sessionId));
@@ -3101,8 +3122,13 @@ export default function App() {
         stats: latestMessageStats(snapshot.messages),
       });
       if (snapshot.status && !preserveDialogs) {
-        setStatus(snapshot.status);
-        setRunActive(["running", "awaiting_input"].includes(snapshot.status));
+        const restoringCompacting =
+          compactingRef.current && snapshot.status !== "ready";
+        setStatus(restoringCompacting ? "compacting" : snapshot.status);
+        setRunActive(
+          ["running", "awaiting_input"].includes(snapshot.status) ||
+            restoringCompacting,
+        );
       }
       if (
         !preserveDialogs &&
@@ -3301,6 +3327,10 @@ export default function App() {
           setRuntime((previous) =>
             previous ? { ...state, ...previous } : state,
           );
+          const activeCompacting = state.activeOperation?.kind === "compact";
+          if (activeCompacting || !state.activeOperation) {
+            patchCompacting(activeCompacting);
+          }
         }
         return state;
       };
@@ -3341,8 +3371,15 @@ export default function App() {
           const state = await readRuntime();
           if (!isCurrent()) return;
           stateLoaded = true;
+          const activeCompacting = state.activeOperation?.kind === "compact";
           setRunActive(Boolean(state.activeOperation));
-          setStatus(state.activeOperation ? "running" : "ready");
+          setStatus(
+            activeCompacting
+              ? "compacting"
+              : state.activeOperation
+                ? "running"
+                : "ready",
+          );
         }
         if (snapshot) {
           restoreSnapshotStatus(snapshot);
@@ -3432,6 +3469,7 @@ export default function App() {
     capabilities,
     clearAccess,
     handleEvent,
+    patchCompacting,
     sessionId,
     connectionRevision,
     showNextDialog,
@@ -3807,7 +3845,8 @@ export default function App() {
           note("compact is not advertised by this host.");
           return;
         }
-        setStatus("running");
+        patchCompacting(true);
+        setStatus("compacting");
         setRunActive(true);
         await commandData(
           sessionId,
@@ -3912,6 +3951,7 @@ export default function App() {
         updateDraft(raw, targetSession);
       if (navigation !== navigationRevision.current) return;
       if (name === "/compact" && cursor === lastSeq.current) {
+        patchCompacting(false);
         setStatus((current) =>
           current === "reconnecting" ? current : priorStatus,
         );
@@ -4943,7 +4983,9 @@ export default function App() {
   function retirementBusy(session: SessionSummary) {
     const state =
       session.sessionId === activeSessionRef.current ? status : session.status;
-    if (!["running", "starting", "awaiting_input"].includes(state))
+    if (
+      !["running", "compacting", "starting", "awaiting_input"].includes(state)
+    )
       return false;
     setError(errorText(new ApiError("", 409, "session_busy")));
     if (window.innerWidth < 768) setSidebar(false);
@@ -6204,7 +6246,9 @@ export default function App() {
                     {t(
                       activeSession?.status === "awaiting_input"
                         ? "sessionAwaitingAnswer"
-                        : "running",
+                        : activeSession?.status === "compacting"
+                          ? "compacting"
+                          : "running",
                     )}
                   </small>
                 )}
@@ -6363,9 +6407,11 @@ export default function App() {
                     const selected = entry.sessionId === sessionId;
                     const entryAwaitingAnswer =
                       entry.status === "awaiting_input";
-                    const entryRunning = ["running", "starting"].includes(
-                      entry.status ?? "",
-                    );
+                    const entryRunning = [
+                      "running",
+                      "compacting",
+                      "starting",
+                    ].includes(entry.status ?? "");
                     return (
                       <button
                         type="button"
@@ -6383,7 +6429,8 @@ export default function App() {
                           <strong>{entry.title || t("newSession")}</strong>
                           <small>
                             {entryProject?.name ?? "rpi"}
-                            {entryRunning && ` · ${t("running")}`}
+                            {entryRunning &&
+                              ` · ${t(entry.status === "compacting" ? "compacting" : "running")}`}
                           </small>
                         </span>
                         <SessionAnswerBadge
@@ -6817,7 +6864,9 @@ export default function App() {
                   {!historical.active && busy && rows.length > 0 && (
                     <div className="working-indicator">
                       <Loader2 size={14} className="spin" />{" "}
-                      {dialog ? t("waitingForAnswer") : t("waiting")}
+                      {dialog
+                        ? t("waitingForAnswer")
+                        : t(activeCompacting ? "compacting" : "waiting")}
                     </div>
                   )}
                 </div>
