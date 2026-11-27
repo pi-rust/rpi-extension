@@ -47,7 +47,6 @@ import {
   Sparkles,
   SquarePen,
   Sun,
-  Timer,
   Volume2,
   VolumeX,
   X,
@@ -135,6 +134,7 @@ import {
 } from "./useRunTimings";
 import { groupTodoUpdates, isTodoTool } from "./todoGroups";
 import { RunElapsed } from "./RunElapsed";
+import { SessionWork } from "./SessionWork";
 import { ExecutionTrace } from "./ExecutionTracePanel";
 import {
   ToolProgramChildren,
@@ -499,18 +499,6 @@ function formatTokens(value: number) {
   if (value >= 1_000)
     return `${(value / 1_000).toFixed(value >= 10_000 ? 0 : 1)}k`;
   return String(Math.round(value));
-}
-
-/** Compact tabular duration for the footer, e.g. 2m 18s or 1h 01m. */
-function formatRunDuration(value: number) {
-  if (!Number.isFinite(value) || value <= 0) return "0s";
-  const seconds = Math.floor(value / 1000);
-  const hours = Math.floor(seconds / 3600);
-  const minutes = Math.floor(seconds / 60) % 60;
-  if (hours > 0) return `${hours}h ${String(minutes).padStart(2, "0")}m`;
-  if (minutes > 0)
-    return `${minutes}m ${String(seconds % 60).padStart(2, "0")}s`;
-  return `${seconds}s`;
 }
 
 function statNumber(
@@ -1339,6 +1327,13 @@ export default function App() {
         : null,
     [sessionTimings],
   );
+  // Fast transcript refreshes omit native history. Keep the start tied to the
+  // selected session and run boundary independently of the diagnostics page.
+  const runClockBinding = `${traceBinding}:${settleTick}`;
+  const [nativeRunStart, setNativeRunStart] = useState<{
+    binding: string;
+    timestamp: number;
+  }>();
   const runFooters = useMemo(
     () => timingByRow(displayedRows, displayedTimings),
     [displayedRows, displayedTimings],
@@ -3695,6 +3690,21 @@ export default function App() {
         jobs.push(async () => {
           const value = await api.history(id, {}, controller.signal);
           if (!current()) return;
+          if (runActive) {
+            const timestamp = value.openOperations?.find((record) => {
+              const intent = record.intent as
+                | { kind?: unknown }
+                | null
+                | undefined;
+              return record.lane === "main" && intent?.kind === "run";
+            })?.timestamp;
+            if (
+              typeof timestamp === "number" &&
+              Number.isSafeInteger(timestamp) &&
+              timestamp > 0
+            )
+              setNativeRunStart({ binding: runClockBinding, timestamp });
+          }
           setHistory(value);
           setHistoryHasMore(value.hasMore);
         });
@@ -3738,6 +3748,7 @@ export default function App() {
       showQueueHistory,
       clearAccess,
       runActive,
+      runClockBinding,
       refreshQueue,
     ],
   );
@@ -7502,18 +7513,17 @@ export default function App() {
                         : "—"}
                     </strong>
                   </span>
-                  <span
-                    className="composer-metric"
-                    title={t("sessionWorkTotal")}
-                    aria-label={`${t("sessionWork")}: ${sessionWorkMs == null ? "—" : formatRunDuration(sessionWorkMs)}`}
-                  >
-                    <Timer size={12} aria-hidden="true" />
-                    <strong>
-                      {sessionWorkMs == null
-                        ? "—"
-                        : formatRunDuration(sessionWorkMs)}
-                    </strong>
-                  </span>
+                  <SessionWork
+                    key={runClockBinding}
+                    completedMs={sessionWorkMs}
+                    running={runActive && !loadingSession && !connectionFailed}
+                    startedAt={
+                      nativeRunStart?.binding === runClockBinding
+                        ? nativeRunStart.timestamp
+                        : undefined
+                    }
+                    language={language}
+                  />
                   <button
                     type="button"
                     className="slim-metrics-more"

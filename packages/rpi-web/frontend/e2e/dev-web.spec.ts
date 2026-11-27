@@ -10756,6 +10756,118 @@ test.describe("run timing regressions", () => {
     ).toBeVisible();
   });
 
+  test("composer footer ticks during an active run and settles to recorded time", async ({
+    page,
+  }) => {
+    await mockHost(page);
+    const messages = [finalMessage()];
+    const liveRun = "current-run";
+    const now = new Date("2026-11-27T12:00:00Z");
+    const historyData = {
+      records: [],
+      hasMore: false,
+      openOperations: [
+        {
+          id: liveRun,
+          lane: "main",
+          intent: { kind: "run" },
+          timestamp: now.getTime() - 20_000,
+        },
+      ],
+    };
+    const nativeStart = gate();
+    const refresh = gate();
+    const completion = gate();
+    let refreshed = false;
+    let settled = false;
+    await page.clock.install({ time: now });
+    await page.route(snapshotRoute, (route) =>
+      route.fulfill({
+        json: {
+          sessionId,
+          messages: refreshed
+            ? [...messages, finalMessage("refreshed", "Refreshed transcript")]
+            : messages,
+          events: [],
+          lastSeq: settled ? 6 : refreshed ? 5 : 4,
+          status: settled ? "ready" : "running",
+        },
+      }),
+    );
+    await page.route(`**/api/v1/sessions/${sessionId}/open`, (route) =>
+      route.fulfill({ json: session }),
+    );
+    await page.route(`**/api/v1/sessions/${sessionId}/commands`, async (route) => {
+      if (route.request().postDataJSON().type !== "get_history")
+        return route.fallback();
+      await nativeStart.promise;
+      return route.fulfill({ json: response(historyData) });
+    });
+    await page.route(timingRoute, (route) =>
+      route.fulfill({
+        json: timingPage([
+          nativeTiming(undefined, "previous-run", "completed", 2_000),
+          ...(settled ? [nativeTiming(undefined, liveRun, "completed", 36_000)] : []),
+        ]),
+      }),
+    );
+    await page.route(`**/api/v1/sessions/${sessionId}/events?*`, async (route) => {
+      if (!refreshed) {
+        await refresh.promise;
+        refreshed = true;
+        return route.fulfill({
+          contentType: "text/event-stream",
+          body: 'retry: 100\nid: 5\nevent: agent_start\ndata: {"type":"agent_start"}\n\n',
+        });
+      }
+      await completion.promise;
+      const event = { type: "agent_settled", runId: liveRun, outcome: "completed" };
+      return route.fulfill({
+        contentType: "text/event-stream",
+        body: `retry: 60000\nid: 6\nevent: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`,
+      });
+    });
+
+    try {
+      await page.goto(`/?session=${sessionId}`);
+      const metric = page.getByLabel(/^Session work:/);
+      await expect(metric).toHaveAttribute(
+        "title",
+        "Recorded work time plus time since this page detected the current run",
+      );
+      nativeStart.release();
+      await expect(metric).toHaveAttribute(
+        "title",
+        "Recorded work time plus the current run",
+      );
+      refresh.release();
+      await expect(page.getByText("Refreshed transcript")).toBeVisible();
+      await expect(metric).toHaveAttribute(
+        "title",
+        "Recorded work time plus the current run",
+      );
+      const elapsedSeconds = async () => {
+        const text = await metric.innerText();
+        const part = (unit: string) =>
+          Number(text.match(new RegExp(`(\\d+)${unit}`))?.[1] ?? 0);
+        return part("h") * 3600 + part("m") * 60 + part("s");
+      };
+      await expect.poll(elapsedSeconds).toBeGreaterThanOrEqual(22);
+      const before = await elapsedSeconds();
+      await page.clock.runFor(2500);
+      await expect.poll(elapsedSeconds).toBeGreaterThanOrEqual(before + 2);
+      settled = true;
+      completion.release();
+      await expect(metric).toHaveText("38s");
+      await page.clock.runFor(3000);
+      await expect(metric).toHaveText("38s");
+    } finally {
+      nativeStart.release();
+      refresh.release();
+      completion.release();
+    }
+  });
+
   test("composer footer shows unknown work when native timings are unavailable", async ({
     page,
   }) => {
