@@ -171,6 +171,13 @@ process-local window before reactions, local commands and queueing. Bot/app
 messages, disallowed chats, invalid/missing IDs and oversized content are
 ignored. A malformed callback does not mark a healthy connection as failed.
 
+`allowChats` gates group conversations by `chat_id`. Direct (p2p) chats are
+accepted by default regardless of the whitelist: a fresh installation cannot
+know its own chat id before the first message, and a 1:1 conversation is only
+reachable by the user initiating it. Set `allowDirectChats: false` to gate p2p
+chats behind the whitelist as well. `mentionRequired` applies to group
+conversations only; p2p chats never carry mentions.
+
 Feishu REST operations (messages, reactions and progress updates) have a
 3-second total local request budget, including token acquisition. The SDK
 long-connection reader continues to be polled while REST is waiting. `stop`
@@ -223,7 +230,8 @@ delivered as Markdown.
 | `botSecret` / `botSecretEnv` | Required | Bot secret, or the name of the environment variable holding it. Configure only one; the environment variable is recommended. |
 | `wsUrl` | Official endpoint | Absolute `ws://` or `wss://` URL for private deployments. |
 | `heartbeatIntervalSeconds` | `30` | Integer `5..300`. Two consecutive missed `ping` acknowledgements close the connection and trigger reconnect. |
-| `allowChats` | All chats | Incoming conversation IDs to accept. For single chats this is the sender `userid`; for groups it is the `chatid`. Depending on how the bot was created, WeCom may return an encrypted `userid`; use the value actually observed in callbacks. |
+| `allowChats` | All chats | Incoming group conversation IDs to accept (the `chatid`). Direct (single) chats are accepted by default regardless of the whitelist — a fresh installation cannot know the chat id upfront; set `allowDirectChats: false` to gate them behind this list too. Depending on how the bot was created, WeCom may return an encrypted `userid`; use the value actually observed in callbacks. |
+| `allowDirectChats` | `true` | When `true`, direct (single) chats bypass `allowChats`; set `false` to require them in the whitelist. Groups are always gated by `allowChats`. |
 | `autoReconnect` / `reconnectIntervalSeconds` | `true` / `5` | Reconnects after network loss, heartbeat timeout or server close, doubling the delay up to 60 seconds after repeated failures. A `disconnected_event` (another connection took over) stops instead of reconnecting. |
 | `autoReply`, `autoReplyModel`, `autoReplyTimeoutSeconds` | Same as Feishu | Agent replies use the `im-wecom-` session prefix. |
 | `maxQueueSize` | `256` | Same bounded, process-local queue as Feishu. |
@@ -315,7 +323,8 @@ Feishu conversation and serializes model runs, preserving conversation context
 while avoiding concurrent session writes and provider rate spikes.
 
 With `autoReply` enabled, send these commands directly to the bot (mention it
-first in groups when `mentionRequired` is enabled):
+first in groups when `mentionRequired` is enabled; direct chats need no
+mention):
 
 | Command | Behavior |
 | --- | --- |
