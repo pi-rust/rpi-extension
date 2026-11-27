@@ -88,12 +88,12 @@ fn registered_schema_defaults_match_runtime_and_budgets_are_normalized_not_rejec
         properties["timeoutSeconds"]["default"],
         defaults.timeout_seconds
     );
-    for (name, minimum, maximum) in [("maxTurns", 1, 32), ("timeoutSeconds", 10, 1800)] {
+    for (name, minimum, maximum) in [("maxTurns", 0, 32), ("timeoutSeconds", 10, 1800)] {
         assert_eq!(properties[name]["minimum"], minimum);
         assert_eq!(properties[name]["maximum"], maximum);
     }
     for (value, turns, timeout) in [
-        (json!(0), 1, 10),
+        (json!(0), 0, 10),
         (json!(1), 1, 10),
         (json!(32), 32, 32),
         (json!(1800), 32, 1800),
@@ -118,6 +118,143 @@ fn registered_schema_defaults_match_runtime_and_budgets_are_normalized_not_rejec
             "timeoutSeconds for {value}"
         );
     }
+}
+
+#[test]
+fn operator_can_disable_the_turn_guard_even_for_cached_model_arguments() {
+    for input in [
+        json!({"task":"inspect"}),
+        json!({"task":"inspect","maxTurns":24}),
+        json!({"task":"inspect","maxTurns":999}),
+    ] {
+        let request = parse_request_with_budget_policy(
+            &input,
+            BudgetPolicy {
+                max_turns: Some(0),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(request.max_turns, 0);
+        assert_eq!(request.timeout_seconds, 300);
+    }
+    let request = parse_request_with_budget_policy(
+        &json!({"task":"inspect","maxTurns":0}),
+        BudgetPolicy::default(),
+    )
+    .unwrap();
+    assert_eq!(request.max_turns, 0);
+    let registered = delegate_schema_with_budget_policy(BudgetPolicy {
+        max_turns: Some(0),
+        ..Default::default()
+    });
+    let parameters: Value = serde_json::from_str(&registered.parameters.to_string_lossy()).unwrap();
+    assert_eq!(parameters["properties"]["maxTurns"]["enum"], json!([0]));
+    assert_eq!(parameters["properties"]["timeoutSeconds"]["default"], 300);
+}
+
+#[test]
+fn timeout_policy_is_independent_and_overrides_cached_model_arguments() {
+    let policy = BudgetPolicy {
+        max_turns: Some(0),
+        timeout_seconds: Some(900),
+    };
+    for input in [
+        json!({"task":"inspect"}),
+        json!({"task":"inspect","maxTurns":24,"timeoutSeconds":10}),
+        json!({"task":"inspect","timeoutSeconds":0}),
+    ] {
+        let request = parse_request_with_budget_policy(&input, policy).unwrap();
+        assert_eq!((request.max_turns, request.timeout_seconds), (0, 900));
+    }
+    let parameters: Value = serde_json::from_str(
+        &delegate_schema_with_budget_policy(policy)
+            .parameters
+            .to_string_lossy(),
+    )
+    .unwrap();
+    assert_eq!(
+        parameters["properties"]["timeoutSeconds"]["enum"],
+        json!([900])
+    );
+    assert_eq!(parameters["properties"]["timeoutSeconds"]["default"], 900);
+    let request = parse_request_with_budget_policy(
+        &json!({"task":"inspect","maxTurns":24}),
+        BudgetPolicy {
+            max_turns: None,
+            timeout_seconds: Some(600),
+        },
+    )
+    .unwrap();
+    assert_eq!((request.max_turns, request.timeout_seconds), (24, 600));
+    let request = parse_request_with_budget_policy(
+        &json!({"task":"inspect","timeoutSeconds":600}),
+        BudgetPolicy {
+            max_turns: Some(0),
+            timeout_seconds: None,
+        },
+    )
+    .unwrap();
+    assert_eq!((request.max_turns, request.timeout_seconds), (0, 600));
+}
+
+#[test]
+fn operator_limits_reject_invalid_configuration_without_changing_the_environment() {
+    for value in ["", "-1", "1.0", "abc", "18446744073709551616"] {
+        assert!(parse_operator_limit("turns", value, 0, 32).is_err());
+        assert!(parse_operator_limit("timeout", value, 10, 1800).is_err());
+    }
+    for value in ["0", "9", "1801"] {
+        assert!(parse_operator_limit("timeout", value, 10, 1800).is_err());
+    }
+    assert!(parse_operator_limit("turns", "33", 0, 32).is_err());
+    for seconds in [10, 300, 1800] {
+        assert_eq!(
+            parse_operator_limit("timeout", &format!(" {seconds} "), 10, 1800).unwrap(),
+            seconds
+        );
+    }
+    assert_eq!(parse_operator_limit("turns", "0", 0, 32).unwrap(), 0);
+}
+
+#[test]
+fn resolved_operator_budgets_reach_the_native_start_and_final_report() {
+    let request = parse_request_with_budget_policy(
+        &json!({"task":"inspect","maxTurns":24,"timeoutSeconds":10}),
+        BudgetPolicy {
+            max_turns: Some(0),
+            timeout_seconds: Some(900),
+        },
+    )
+    .unwrap();
+    let (action, calls) = scripted(vec![Ok(json!({"childId":"child-policy"})), Ok(completed())]);
+    let (tx, rx) = mpsc::channel();
+    run_request(
+        request,
+        "policy-call".into(),
+        &*action,
+        tx,
+        Arc::new(AtomicBool::new(false)),
+    )
+    .unwrap();
+    let messages: Vec<_> = rx.try_iter().collect();
+    let text = messages
+        .into_iter()
+        .find_map(|message| {
+            if let JobMessage::Done(text) = message {
+                Some(text)
+            } else {
+                None
+            }
+        })
+        .unwrap();
+    let result: Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(result["maxTurns"], 0);
+    assert_eq!(result["timeoutSeconds"], 900);
+    let calls = calls.lock().unwrap();
+    assert_eq!(calls[0]["maxTurns"], 0);
+    assert_eq!(calls[0]["timeoutSeconds"], 900);
+    assert_eq!(calls.last().unwrap()["op"], "dispose");
 }
 
 #[test]
