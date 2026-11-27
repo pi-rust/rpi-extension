@@ -1327,10 +1327,13 @@ export default function App() {
         : null,
     [sessionTimings],
   );
-  const activeRunStartedAt = historyData?.openOperations?.find((record) => {
-    const intent = record.intent as { kind?: unknown } | null | undefined;
-    return record.lane === "main" && intent?.kind === "run";
-  })?.timestamp;
+  // Fast transcript refreshes omit native history. Keep the start tied to the
+  // selected session and run boundary independently of the diagnostics page.
+  const runClockBinding = `${traceBinding}:${settleTick}`;
+  const [nativeRunStart, setNativeRunStart] = useState<{
+    binding: string;
+    timestamp: number;
+  }>();
   const runFooters = useMemo(
     () => timingByRow(displayedRows, displayedTimings),
     [displayedRows, displayedTimings],
@@ -3687,6 +3690,21 @@ export default function App() {
         jobs.push(async () => {
           const value = await api.history(id, {}, controller.signal);
           if (!current()) return;
+          if (runActive) {
+            const timestamp = value.openOperations?.find((record) => {
+              const intent = record.intent as
+                | { kind?: unknown }
+                | null
+                | undefined;
+              return record.lane === "main" && intent?.kind === "run";
+            })?.timestamp;
+            if (
+              typeof timestamp === "number" &&
+              Number.isSafeInteger(timestamp) &&
+              timestamp > 0
+            )
+              setNativeRunStart({ binding: runClockBinding, timestamp });
+          }
           setHistory(value);
           setHistoryHasMore(value.hasMore);
         });
@@ -3730,6 +3748,7 @@ export default function App() {
       showQueueHistory,
       clearAccess,
       runActive,
+      runClockBinding,
       refreshQueue,
     ],
   );
@@ -7495,14 +7514,12 @@ export default function App() {
                     </strong>
                   </span>
                   <SessionWork
-                    key={`${sessionId}:${settleTick}`}
+                    key={runClockBinding}
                     completedMs={sessionWorkMs}
                     running={runActive && !loadingSession && !connectionFailed}
                     startedAt={
-                      typeof activeRunStartedAt === "number" &&
-                      Number.isSafeInteger(activeRunStartedAt) &&
-                      activeRunStartedAt > 0
-                        ? activeRunStartedAt
+                      nativeRunStart?.binding === runClockBinding
+                        ? nativeRunStart.timestamp
                         : undefined
                     }
                     language={language}

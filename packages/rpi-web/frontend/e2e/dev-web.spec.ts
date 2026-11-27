@@ -10776,16 +10776,20 @@ test.describe("run timing regressions", () => {
       ],
     };
     const nativeStart = gate();
+    const refresh = gate();
     const completion = gate();
+    let refreshed = false;
     let settled = false;
     await page.clock.install({ time: now });
     await page.route(snapshotRoute, (route) =>
       route.fulfill({
         json: {
           sessionId,
-          messages,
+          messages: refreshed
+            ? [...messages, finalMessage("refreshed", "Refreshed transcript")]
+            : messages,
           events: [],
-          lastSeq: settled ? 5 : 4,
+          lastSeq: settled ? 6 : refreshed ? 5 : 4,
           status: settled ? "ready" : "running",
         },
       }),
@@ -10808,11 +10812,19 @@ test.describe("run timing regressions", () => {
       }),
     );
     await page.route(`**/api/v1/sessions/${sessionId}/events?*`, async (route) => {
+      if (!refreshed) {
+        await refresh.promise;
+        refreshed = true;
+        return route.fulfill({
+          contentType: "text/event-stream",
+          body: 'retry: 100\nid: 5\nevent: agent_start\ndata: {"type":"agent_start"}\n\n',
+        });
+      }
       await completion.promise;
       const event = { type: "agent_settled", runId: liveRun, outcome: "completed" };
       return route.fulfill({
         contentType: "text/event-stream",
-        body: `retry: 60000\nid: 5\nevent: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`,
+        body: `retry: 60000\nid: 6\nevent: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`,
       });
     });
 
@@ -10828,8 +10840,14 @@ test.describe("run timing regressions", () => {
         "title",
         "Recorded work time plus the current run",
       );
-      await expect(metric).toHaveText(/^(2[2-9]|3\d)s$/);
+      refresh.release();
+      await expect(page.getByText("Refreshed transcript")).toBeVisible();
+      await expect(metric).toHaveAttribute(
+        "title",
+        "Recorded work time plus the current run",
+      );
       const before = Number.parseInt(await metric.innerText(), 10);
+      expect(before).toBeGreaterThanOrEqual(22);
       await page.clock.runFor(2500);
       const after = Number.parseInt(await metric.innerText(), 10);
       expect(after).toBeGreaterThanOrEqual(before + 2);
@@ -10840,6 +10858,7 @@ test.describe("run timing regressions", () => {
       await expect(metric).toHaveText("38s");
     } finally {
       nativeStart.release();
+      refresh.release();
       completion.release();
     }
   });
