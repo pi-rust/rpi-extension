@@ -204,3 +204,24 @@ Old native hosts return unsupported (HTTP 501); malformed queries return 400,
 invalid host pages 502, and removed snapshot leaves 409. Existing `/api/v1`,
 legacy `get_messages`, snapshot/SSE replay boundaries and native ownership are
 unchanged. Installing/restarting matching runtime layers is a separate step.
+
+## Delegated children / 委派子 Agent
+
+These authenticated routes require the native `childAgents` v1 capability:
+
+- `GET /api/v1/sessions/{id}/delegations`: retained native roster and epoch.
+- `POST .../delegations/{child}/events/query`: `{"epoch":"...","afterSeq":0,"limit":32}`.
+- `POST .../delegations/{child}/cancel`: `{"epoch":"..."}`.
+- `GET .../delegations/{child}/events?epoch=...&afterSeq=0`: bounded polling SSE.
+
+POSTs retain the `X-Rpi-Web: 1` marker requirement; all routes retain cookie,
+Host/Origin and admission checks. SSE uses `delegation_events` pages and
+`resync_required` failures. It deliberately does not reuse root transcript SSE
+IDs or `Last-Event-ID`: reconnect with the complete native epoch/child/nextSeq
+cursor. Revoking the HTTP lease or dropping the stream stops delivery/polling.
+This is a volatile bounded native observation tail, not durable child history
+or an independently resumable child session. See rpi-extcore's limits and gaps.
+
+这些接口继续使用现有认证、Host/Origin、限流及 POST 标记检查。SSE 使用独立的
+原生 epoch/子 ID/序号游标，重连时显式传入，不复用父会话 Last-Event-ID。数据仅为
+有界且易失的原生观察记录；缓存淘汰或宿主变化必须提示重新同步，子任务不可独立续聊。

@@ -9,6 +9,8 @@
 //! The plugin keeps session state in process-wide statics, so every test holds
 //! [`LOCK`] and starts a fresh session.
 
+#![forbid(unsafe_code)]
+
 use rpi_optchat::rpi_plugin_register;
 use rpi_plugin_sdk::{
     CommandHandlerFn, EventHandlerFn, EventTag, PluginApi, RuntimeActionId, StablePluginEvent,
@@ -41,6 +43,9 @@ static QUERIES: Mutex<Vec<Value>> = Mutex::new(Vec::new());
 /// Switch branches from inside the next query with this order.
 static SWITCH_ON_QUERY: Mutex<Option<&str>> = Mutex::new(None);
 
+// GetExecutionContext can report a session cwd different from the host's.
+static PROJECT_DIR: Mutex<Option<std::path::PathBuf>> = Mutex::new(None);
+
 fn lock() -> MutexGuard<'static, ()> {
     let guard = LOCK.lock().unwrap_or_else(|error| error.into_inner());
     *BRANCH.lock().unwrap() = Vec::new();
@@ -51,6 +56,7 @@ fn lock() -> MutexGuard<'static, ()> {
     *MESSAGE_DURING_APPEND.lock().unwrap() = None;
     *HONORS_FILTER.lock().unwrap() = true;
     *SWITCH_ON_QUERY.lock().unwrap() = None;
+    *PROJECT_DIR.lock().unwrap() = None;
     guard
 }
 
@@ -77,7 +83,7 @@ fn runtime_action(action, args, out, _user_data) {
     // and the plugin asks for it by number, so the fake matches on the number too.
     if action == 23 {
         out.write(json!({"model": {"id": "fake-model", "provider": "fake", "api": "openai"},
-                         "thinkingLevel": "off"}).to_string());
+                         "thinkingLevel": "off", "cwd": *PROJECT_DIR.lock().unwrap()}).to_string());
         return 0;
     }
     let id = RuntimeActionId::try_from(action).expect("plugin called an undeclared action");
@@ -197,6 +203,15 @@ fn api() -> PluginApi {
         declare: None,
         register_before_agent_start: None,
         register_oauth_provider: None,
+        register_streaming_provider: None,
+        register_tool_with_wake: None,
+        register_plugin_lifecycle: None,
+        register_tool_prompt: None,
+        register_oauth_provider_cancellable: None,
+        register_tool_result: None,
+        register_autocomplete_provider: None,
+        register_command_completions: None,
+        register_argument_suggester: None,
     };
     api.register_command = Some(register_command);
     api.register_event_handler = Some(register_event);
@@ -211,13 +226,17 @@ fn start() -> MutexGuard<'static, ()> {
     *COMMAND.lock().unwrap() = None;
     *EVENTS.lock().unwrap() = Vec::new();
     *RENDERER.lock().unwrap() = None;
+    // Simulate a primary session even when the test runner is a subagent.
+    std::env::remove_var("RPI_ORCHESTRATOR_SUBAGENT");
+    std::env::remove_var(rpi_plugin_sdk::SUBAGENT_PARENT_TRACE_ID_ENV);
+    std::env::remove_var("RPI_OPTCHAT_COMPACT");
     // Profile mirroring must not write into the checkout, and a developer's
     // environment must not decide which store these tests read.
     let store = std::env::temp_dir().join(format!("optchat-host-test-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&store);
     std::env::set_var("RPI_OPTCHAT_STORE_DIR", &store);
     std::env::set_var("RPI_OPTCHAT_PROFILE", "");
-    rpi_plugin_register(&api());
+    assert_eq!(rpi_plugin_register(&api()), 0);
     emit(
         EventTag::SessionStart,
         StablePluginEvent::empty(EventTag::SessionStart),
@@ -248,8 +267,7 @@ fn command(args: &str) -> Value {
         &mut output,
         std::ptr::null_mut(),
     );
-    let text = output.to_string_lossy();
-    rpi_plugin_sdk::callbacks::free_string(output);
+    let text = rpi_plugin_sdk::stb_take!(output, Some(rpi_plugin_sdk::callbacks::free_string));
     assert_eq!(rc, 0, "command handler failed for `{args}`");
     serde_json::from_str(&text).expect("command returned JSON")
 }
@@ -575,8 +593,7 @@ fn an_entry_renderer_hides_optchat_entries_only() {
             &mut output,
             std::ptr::null_mut(),
         );
-        let text = output.to_string_lossy();
-        rpi_plugin_sdk::callbacks::free_string(output);
+        let text = rpi_plugin_sdk::stb_take!(output, Some(rpi_plugin_sdk::callbacks::free_string));
         (rc, text)
     };
     for value in [
@@ -623,7 +640,44 @@ extern "C" fn register_entry_renderer(
     _free: rpi_plugin_sdk::FreeStringFn,
     _: *mut std::ffi::c_void,
 ) -> i32 {
-    assert_eq!(unsafe { name.as_str() }, "optchat");
+    assert_eq!(rpi_plugin_sdk::stb_text!(name), "optchat");
     *RENDERER.lock().unwrap() = Some(render);
     0
+}
+
+#[test]
+fn profile_paths_and_relative_import_follow_the_session_project() {
+    let _guard = start();
+    let root = std::env::temp_dir().join(format!("optchat-projects-{}", std::process::id()));
+    let left = root.join("left");
+    let right = root.join("right");
+    for dir in [&left, &right] {
+        std::fs::create_dir_all(dir).unwrap();
+    }
+    std::env::remove_var("RPI_OPTCHAT_STORE_DIR");
+    *PROJECT_DIR.lock().unwrap() = Some(left.clone());
+    std::fs::write(left.join("notes.txt"), "imported from left\n").unwrap();
+    assert!(command("import notes.txt")["text"]
+        .as_str()
+        .unwrap()
+        .contains("Imported 1"));
+    assert!(left.join(".rpi/optchat/default.jsonl").is_file());
+    assert!(text("status").contains("`default` (1 stored)"));
+    assert!(text("profile").contains(&left.join(".rpi/optchat").display().to_string()));
+    assert!(command("recall imported from left")["text"]
+        .as_str()
+        .unwrap()
+        .contains("imported from left"));
+
+    *PROJECT_DIR.lock().unwrap() = Some(right.clone());
+    assert!(command("recall imported from left")["text"]
+        .as_str()
+        .unwrap()
+        .contains("holds nothing"));
+    std::env::set_var("RPI_OPTCHAT_STORE_DIR", "my-profiles");
+    command("note only on the right");
+    assert!(right.join("my-profiles/default.jsonl").is_file());
+    assert!(!left.join("my-profiles").exists());
+    std::env::remove_var("RPI_OPTCHAT_STORE_DIR");
+    std::fs::remove_dir_all(root).unwrap();
 }

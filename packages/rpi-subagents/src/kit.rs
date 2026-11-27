@@ -26,8 +26,7 @@ pub fn execute(
     free_params: Option<FreeStringFn>,
     builder: Builder,
 ) -> StepHandle {
-    let text = params.to_string_lossy();
-    params.free_with(free_params);
+    let text = rpi_plugin_sdk::stb_take!(params, free_params);
     let params = serde_json::from_str(&text).unwrap_or(Value::Null);
     HANDLES.insert(Drive {
         params,

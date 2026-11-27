@@ -263,8 +263,7 @@ fn set_status(text: &str) {
         &mut output,
         runtime.user_data,
     );
-    let detail = output.to_string_lossy();
-    (runtime.free_string)(output);
+    let detail = rpi_plugin_sdk::stb_take!(output, Some(runtime.free_string));
     if rc != 0 {
         debug_log(&format!("set_status failed rc={rc}: {detail}"));
     }
@@ -3011,8 +3010,7 @@ pub fn trace(p: &Value) -> Result<String, String> {
 }
 
 fn start(params: StbString, free: Option<FreeStringFn>, builder: Builder) -> StepHandle {
-    let t = params.to_string_lossy();
-    params.free_with(free);
+    let t = rpi_plugin_sdk::stb_take!(params, free);
     let params = serde_json::from_str(&t).unwrap_or(Value::Null);
     HANDLES.insert(Drive {
         params,
@@ -3383,6 +3381,15 @@ mod tests {
             declare: None,
             register_before_agent_start: None,
             register_oauth_provider: None,
+            register_streaming_provider: None,
+            register_tool_with_wake: None,
+            register_plugin_lifecycle: None,
+            register_tool_prompt: None,
+            register_oauth_provider_cancellable: None,
+            register_tool_result: None,
+            register_autocomplete_provider: None,
+            register_command_completions: None,
+            register_argument_suggester: None,
         });
         set_status("langfuse ✓ (trace sent)");
         let captured = CAPTURED_STATUS

@@ -65,17 +65,40 @@ enum FileKind {
     PrimaryTmp,
     Progress,
     ProgressTmp,
+    Preview,
+    PreviewTmp,
+    StartupCheckpoint,
+    StartupCheckpointTmp,
     Timing,
     TimingTmp,
 }
-const KINDS: [FileKind; 6] = [
+const KINDS: [FileKind; 10] = [
     FileKind::Primary,
     FileKind::PrimaryTmp,
     FileKind::Progress,
     FileKind::ProgressTmp,
+    FileKind::Preview,
+    FileKind::PreviewTmp,
+    FileKind::StartupCheckpoint,
+    FileKind::StartupCheckpointTmp,
     FileKind::Timing,
     FileKind::TimingTmp,
 ];
+
+impl FileKind {
+    fn companion_suffix(self) -> Option<&'static str> {
+        match self {
+            Self::PrimaryTmp => Some(".tmp"),
+            Self::Progress => Some(".progress.jsonl"),
+            Self::ProgressTmp => Some(".progress.jsonl.tmp"),
+            Self::Preview => Some(".preview.json"),
+            Self::PreviewTmp => Some(".preview.json.tmp"),
+            Self::StartupCheckpoint => Some(".startup-checkpoint"),
+            Self::StartupCheckpointTmp => Some(".startup-checkpoint.tmp"),
+            _ => None,
+        }
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -242,8 +265,9 @@ fn primary_name(name: &str, id: &str) -> bool {
     name.len() > suffix.len() && name.ends_with(&suffix)
 }
 fn orphan_name(name: &str, id: &str) -> bool {
-    [".tmp", ".progress.jsonl", ".progress.jsonl.tmp"]
-        .iter()
+    KINDS
+        .into_iter()
+        .filter_map(FileKind::companion_suffix)
         .any(|suffix| {
             name.strip_suffix(suffix)
                 .is_some_and(|main| primary_name(main, id))
@@ -322,12 +346,10 @@ impl DeletionPlan {
             }
             _ => {
                 let p = self.root.path.join(self.primary.as_ref()?);
-                let suffix = match kind {
-                    FileKind::Primary => "",
-                    FileKind::PrimaryTmp => ".tmp",
-                    FileKind::Progress => ".progress.jsonl",
-                    FileKind::ProgressTmp => ".progress.jsonl.tmp",
-                    _ => unreachable!(),
+                let suffix = if kind == FileKind::Primary {
+                    ""
+                } else {
+                    kind.companion_suffix()?
                 };
                 Some((append(&p, suffix), &self.root))
             }
@@ -408,8 +430,9 @@ fn discover(
         !retry_orphans.contains(p)
             && found.as_ref().map_or(true, |h| {
                 let h = root.path.join(h);
-                ![".tmp", ".progress.jsonl", ".progress.jsonl.tmp"]
-                    .iter()
+                !KINDS
+                    .into_iter()
+                    .filter_map(FileKind::companion_suffix)
                     .any(|s| append(&h, s) == *p)
             })
     }) {
@@ -731,16 +754,8 @@ fn verify_candidates(plan: &DeletionPlan) -> ServiceResult<()> {
     let allowed: Vec<_> = plan
         .files
         .iter()
-        .filter_map(|file| {
-            if matches!(
-                file.kind,
-                FileKind::PrimaryTmp | FileKind::Progress | FileKind::ProgressTmp
-            ) {
-                plan.path(file.kind).map(|(path, _)| path)
-            } else {
-                None
-            }
-        })
+        .filter(|file| file.kind.companion_suffix().is_some())
+        .filter_map(|file| plan.path(file.kind).map(|(path, _)| path))
         .collect();
     let found = discover(&plan.root, &plan.id, &allowed)?;
     if found.is_some() && found != plan.primary {

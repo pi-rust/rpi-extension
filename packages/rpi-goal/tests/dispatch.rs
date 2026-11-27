@@ -1,5 +1,8 @@
 //! Continuation dispatch: one automatic run per settled boundary, stopped by
 //! pause, replacement, budgets, and the safety circuit breakers.
+
+#![forbid(unsafe_code)]
+
 mod support;
 
 use rpi_plugin_sdk::EventTag;

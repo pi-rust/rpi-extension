@@ -42,13 +42,17 @@ fn library_path() -> PathBuf {
         .expect("first cargo build -p rpi-providers")
 }
 
-fn load() -> (rpi_extensions::ExtensionSession, Vec<Arc<dyn Provider>>) {
-    let session = rpi_extensions::load_session_mixed(
+fn load_session() -> rpi_extensions::ExtensionSession {
+    rpi_extensions::load_session_mixed(
         &[],
         &[library_path()],
         Arc::new(rpi_extensions::NullDiagnostics),
         None,
-    );
+    )
+}
+
+fn load() -> (rpi_extensions::ExtensionSession, Vec<Arc<dyn Provider>>) {
+    let session = load_session();
     let providers = rpi_extensions::PluggableProvider::from_session(
         &session,
         tokio::runtime::Handle::current(),
@@ -629,6 +633,95 @@ async fn shutdown_cancels_active_streams_and_rejects_new_ones() {
             .contains("shutting down"),
         "{error:?}"
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn shared_image_routes_each_registration_and_tears_it_down_independently() {
+    let (first, second) = tokio::join!(
+        tokio::task::spawn_blocking(load_session),
+        tokio::task::spawn_blocking(load_session)
+    );
+    let (first, second) = (first.unwrap(), second.unwrap());
+    let first_snapshot = first.snapshot_arc().unwrap();
+    let second_snapshot = second.snapshot_arc().unwrap();
+    for id in [PROVIDER_ID, rpi_providers::antigravity::PROVIDER_ID] {
+        let first_oauth = first_snapshot.oauth_provider(id).unwrap();
+        let second_oauth = second_snapshot.oauth_provider(id).unwrap();
+        assert_eq!(
+            first_oauth.request_fn as usize,
+            second_oauth.request_fn as usize
+        );
+        assert_ne!(first_oauth.user_data, second_oauth.user_data);
+        for snapshot in [&first_snapshot, &second_snapshot] {
+            let stream = snapshot
+                .providers()
+                .iter()
+                .find(|p| p.provider_id == id)
+                .unwrap();
+            assert_eq!(
+                stream.user_data,
+                snapshot.oauth_provider(id).unwrap().user_data
+            );
+            assert!(!stream.user_data.is_null());
+        }
+    }
+    fn begin(
+        snapshot: &Arc<rpi_extensions::RegistrySnapshot>,
+    ) -> Result<Value, rpi_extensions::OAuthExtensionError> {
+        rpi_extensions::request_oauth(snapshot, PROVIDER_ID, "begin", json!({}))
+    }
+    assert!(begin(&first_snapshot).is_ok());
+    assert!(begin(&second_snapshot).is_ok());
+    let first_provider = codex(&rpi_extensions::PluggableProvider::from_session(
+        &first,
+        tokio::runtime::Handle::current(),
+    ));
+    let second_provider = codex(&rpi_extensions::PluggableProvider::from_session(
+        &second,
+        tokio::runtime::Handle::current(),
+    ));
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move {
+        let mut ids = Vec::new();
+        for _ in 0..3 {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let seen = read_request(&mut socket).await;
+            ids.push(seen.body["prompt_cache_key"].as_str().unwrap().to_owned());
+            respond_json(&mut socket, 400, "{}").await;
+        }
+        assert_ne!(ids[0], ids[1]);
+        assert_eq!(ids[1], ids[2]);
+    });
+    let stream = |provider: Arc<dyn Provider>| {
+        let base = &base;
+        async move {
+            let mut options = options(&access_jwt("acct-shared-image"));
+            options.session_id = Some("same-host-session".into());
+            options.max_retries = Some(0);
+            let mut stream = provider
+                .stream_simple(&model(base), &context(), &options)
+                .await;
+            let (_, terminals) = drain(&mut stream, |_| {}).await;
+            assert_eq!(terminals, 1);
+        }
+    };
+    stream(first_provider).await;
+    stream(second_provider.clone()).await;
+
+    first.begin_shutdown();
+    assert!(begin(&first_snapshot)
+        .unwrap_err()
+        .to_string()
+        .contains("shutting down"));
+    drop(first_snapshot);
+    drop(first);
+    assert!(begin(&second_snapshot).is_ok());
+    stream(second_provider).await;
+    tokio::time::timeout(Duration::from_secs(5), server)
+        .await
+        .unwrap()
+        .unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

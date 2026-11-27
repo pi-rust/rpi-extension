@@ -1,8 +1,8 @@
 # rpi-mcp-core
 
-Caller-owned MCP connections for Rust embedders, without a plugin SDK or ACP
-protocol dependency. This crate is extracted from `rpi-mcp-adapter`; the adapter
-continues to expose its existing four tools and library helpers.
+Caller-owned MCP connections for Rust embedders. This crate is extracted
+from `rpi-mcp-adapter`, which owns the plugin ABI and continues to expose its
+existing four tools and library helpers.
 
 ## Ownership and request context
 
@@ -190,10 +190,10 @@ suspended child, installs a kill-on-close Job Object before resuming, and retain
 cleanup ownership through all fallible setup. Unix uses a dedicated process
 group. Tree termination does not depend on the leader still running.
 
-The crate denies unsafe code by default. Only the private, documented platform
-FFI module has an explicit exception; runtime and protocol modules retain the
-deny lint. The core has **no plugin SDK/ABI dependency**, but is not claimed to be
-entirely unsafe-free.
+The crate forbids unsafe Rust. Windows uses the SDK’s safe process helpers
+behind the private process module. Unix uses `nix` for process-group termination.
+File leases use `fs2` on both platforms. The public Rust API is independent of
+the plugin ABI.
 
 Cleanup depends on OS termination and pipe semantics. Escaped/inherited handles,
 failed OS termination and permanently blocked OS I/O do not acquire a hard

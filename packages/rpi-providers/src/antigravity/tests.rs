@@ -755,6 +755,7 @@ fn direct() -> super::AntigravityProvider {
     super::AntigravityProvider {
         client: reqwest::Client::new(),
         models: super::models(),
+        state: std::sync::Arc::new(super::State::default()),
     }
 }
 
@@ -1006,13 +1007,13 @@ async fn exchange_stores_the_discovered_project_with_the_access() {
     ])
     .await;
     let port = net(endpoints);
-    let logins = Mutex::new(auth::PendingLogins::default());
-    let (state, _) = issue(&mut logins.lock().unwrap(), 3, 4, Instant::now());
+    let owner = super::State::default();
+    let (state, _) = issue(&mut owner.logins.lock().unwrap(), 3, 4, Instant::now());
     let pasted = format!("http://localhost:51121/oauth-callback?code=code-1&state={state}");
     let envelope = super::exchange_credential(
         &port,
         client(FAKE_ID, FAKE_SECRET),
-        &logins,
+        &owner,
         &pasted,
         Instant::now(),
     )
@@ -1045,13 +1046,13 @@ async fn exchange_without_a_discovered_project_stores_a_plain_access() {
     ])
     .await;
     let port = net(endpoints);
-    let logins = Mutex::new(auth::PendingLogins::default());
-    let (state, _) = issue(&mut logins.lock().unwrap(), 5, 6, Instant::now());
+    let owner = super::State::default();
+    let (state, _) = issue(&mut owner.logins.lock().unwrap(), 5, 6, Instant::now());
     let pasted = format!("http://localhost:51121/oauth-callback?code=code-2&state={state}");
     let envelope = super::exchange_credential(
         &port,
         client(FAKE_ID, FAKE_SECRET),
-        &logins,
+        &owner,
         &pasted,
         Instant::now(),
     )
@@ -1075,6 +1076,7 @@ async fn refresh_keeps_the_binding_and_sends_only_the_refresh_token() {
     .await;
     let envelope = super::refresh_credential(
         &net(endpoints),
+        &super::State::default(),
         client(FAKE_ID, FAKE_SECRET),
         "old-access",
         "old-refresh|bound-project",
@@ -1092,14 +1094,20 @@ async fn refresh_keeps_the_binding_and_sends_only_the_refresh_token() {
 async fn revoke_sends_the_plain_token_of_a_bound_access() {
     let (endpoints, server) = token_server(vec![("/revoke", 200, ""), ("/revoke", 200, "")]).await;
     let port = net(endpoints);
+    let owner = super::State::default();
     // No refresh token stored: the plain access token is revoked.
-    super::revoke_credential(&port, "", "ya29.plain|bound-project")
+    super::revoke_credential(&port, &owner, "", "ya29.plain|bound-project")
         .await
         .unwrap();
     // A stored refresh token is revoked in preference to the access token.
-    super::revoke_credential(&port, "kept|bound-project", "ya29.plain|bound-project")
-        .await
-        .unwrap();
+    super::revoke_credential(
+        &port,
+        &owner,
+        "kept|bound-project",
+        "ya29.plain|bound-project",
+    )
+    .await
+    .unwrap();
     let seen = server.await.unwrap();
 
     assert_eq!(form_pairs(&seen[0].1)["token"], "ya29.plain");

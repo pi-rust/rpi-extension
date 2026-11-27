@@ -10,15 +10,29 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 #[derive(Clone, Debug, Default)]
-pub struct Control(Arc<AtomicBool>);
+pub struct Control {
+    cancelled: Arc<AtomicBool>,
+    registration_stop: Option<Arc<AtomicBool>>,
+}
 
 impl Control {
+    pub fn for_worker(&self) -> Self {
+        Self {
+            cancelled: Arc::default(),
+            registration_stop: Some(self.cancelled.clone()),
+        }
+    }
+
     pub fn cancel(&self) {
-        self.0.store(true, Ordering::Release);
+        self.cancelled.store(true, Ordering::Release);
     }
 
     pub fn is_cancelled(&self) -> bool {
-        self.0.load(Ordering::Acquire)
+        self.cancelled.load(Ordering::Acquire)
+            || self
+                .registration_stop
+                .as_ref()
+                .is_some_and(|stop| stop.load(Ordering::Acquire))
     }
 
     /// `Err` once cancelled — the worker's cheap checkpoint.

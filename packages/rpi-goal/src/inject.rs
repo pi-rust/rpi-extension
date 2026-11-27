@@ -6,12 +6,12 @@
 //! OpenAI-compatible providers reject.
 use serde_json::{json, Value};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Mutex, OnceLock};
+use std::sync::Mutex;
 
 use rpi_plugin_sdk::RuntimeActionId;
 
-use crate::prompts;
 use crate::state::{self, Goal, GOAL_CUSTOM_TYPE};
+use crate::{prompts, runtime};
 
 struct Pending {
     revision: u64,
@@ -19,23 +19,27 @@ struct Pending {
     text: String,
 }
 
-fn pending() -> &'static Mutex<Option<Pending>> {
-    static PENDING: OnceLock<Mutex<Option<Pending>>> = OnceLock::new();
-    PENDING.get_or_init(|| Mutex::new(None))
+#[derive(Default)]
+pub(crate) struct Notices {
+    pending: Mutex<Option<Pending>>,
+    last: Mutex<Option<String>>,
+    revision: AtomicU64,
 }
-
-fn last_injected() -> &'static Mutex<Option<String>> {
-    static LAST: OnceLock<Mutex<Option<String>>> = OnceLock::new();
-    LAST.get_or_init(|| Mutex::new(None))
-}
-
-static REVISION: AtomicU64 = AtomicU64::new(0);
 
 /// State changes that the model must see. `text` overrides the default notice
 /// for stop/wait transitions that explain *why* work stopped.
 pub fn queue(goal: &Goal, text: Option<String>) {
-    let mut slot = pending().lock().unwrap_or_else(|p| p.into_inner());
-    let revision = REVISION.fetch_add(1, Ordering::Relaxed).wrapping_add(1);
+    let session = runtime::state();
+    let mut slot = session
+        .notices
+        .pending
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    let revision = runtime::state()
+        .notices
+        .revision
+        .fetch_add(1, Ordering::Relaxed)
+        .wrapping_add(1);
     *slot = Some(Pending {
         revision,
         goal: goal.clone(),
@@ -46,15 +50,25 @@ pub fn queue(goal: &Goal, text: Option<String>) {
 /// Append the queued notice. Returns false when an append failed; the notice is
 /// kept so a later boundary retries it.
 pub fn flush() -> bool {
-    let claimed = pending().lock().unwrap_or_else(|p| p.into_inner()).take();
+    let session = runtime::state();
+    let claimed = session
+        .notices
+        .pending
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .take();
     let Some(notice) = claimed else {
         return true;
     };
     let result = append(&notice.goal, &notice.text);
-    let mut slot = pending().lock().unwrap_or_else(|p| p.into_inner());
+    let mut slot = session
+        .notices
+        .pending
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
     // A newer notice may have been queued *and* delivered while this host call
     // was in flight, so an empty slot alone cannot prove this one is current.
-    if REVISION.load(Ordering::Relaxed) != notice.revision {
+    if runtime::state().notices.revision.load(Ordering::Relaxed) != notice.revision {
         return result.is_ok();
     }
     match result {
@@ -71,8 +85,15 @@ pub fn flush() -> bool {
 
 /// Drop any queued notice (the goal was cleared or replaced).
 pub fn discard() {
-    *pending().lock().unwrap_or_else(|p| p.into_inner()) = None;
-    REVISION.fetch_add(1, Ordering::Relaxed);
+    *runtime::state()
+        .notices
+        .pending
+        .lock()
+        .unwrap_or_else(|p| p.into_inner()) = None;
+    runtime::state()
+        .notices
+        .revision
+        .fetch_add(1, Ordering::Relaxed);
     remember(None);
 }
 
@@ -117,12 +138,18 @@ fn fingerprint(goal: &Goal) -> String {
 }
 
 fn remember(fingerprint: Option<String>) {
-    *last_injected().lock().unwrap_or_else(|p| p.into_inner()) = fingerprint;
+    *runtime::state()
+        .notices
+        .last
+        .lock()
+        .unwrap_or_else(|p| p.into_inner()) = fingerprint;
 }
 
 /// True when this exact goal state has not been injected yet.
 pub fn should_inject(goal: &Goal) -> bool {
-    last_injected()
+    runtime::state()
+        .notices
+        .last
         .lock()
         .unwrap_or_else(|p| p.into_inner())
         .as_deref()
@@ -135,7 +162,9 @@ pub fn mark_injected(goal: &Goal) {
 
 /// Test/diagnostic view of the queued notice.
 pub fn pending_text() -> Option<Value> {
-    pending()
+    runtime::state()
+        .notices
+        .pending
         .lock()
         .unwrap_or_else(|p| p.into_inner())
         .as_ref()
@@ -143,7 +172,9 @@ pub fn pending_text() -> Option<Value> {
 }
 
 pub fn has_pending() -> bool {
-    pending()
+    runtime::state()
+        .notices
+        .pending
         .lock()
         .unwrap_or_else(|p| p.into_inner())
         .is_some()

@@ -45,6 +45,10 @@ impl Fixture {
             append(&self.main, ".tmp"),
             append(&self.main, ".progress.jsonl"),
             append(&self.main, ".progress.jsonl.tmp"),
+            append(&self.main, ".preview.json"),
+            append(&self.main, ".preview.json.tmp"),
+            append(&self.main, ".startup-checkpoint"),
+            append(&self.main, ".startup-checkpoint.tmp"),
             self.timings.join(format!("{}.json", self.id)),
             self.timings.join(format!("{}.json.tmp", self.id)),
         ]
@@ -87,7 +91,7 @@ fn deletes_exact_history_progress_and_known_timing_tmp_keeps_neighbors_and_lock(
     let lock = append(&f.main, ".lock");
     fs::write(&lock, b"stable lock contents").unwrap();
     let plan = f.plan();
-    assert_eq!(plan.files.len(), 6);
+    assert_eq!(plan.files.len(), 1 + f.companions().len());
     assert_eq!(
         plan.primary,
         Some(f.main.strip_prefix(&f.root).unwrap().to_owned())

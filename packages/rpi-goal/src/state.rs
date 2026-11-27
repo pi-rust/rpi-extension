@@ -9,7 +9,7 @@ use serde_json::{json, Value};
 use std::fs;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Mutex, OnceLock};
+use std::sync::Mutex;
 
 use crate::runtime;
 use rpi_plugin_sdk::RuntimeActionId;
@@ -390,32 +390,32 @@ impl Goals {
 /// Serializes read-modify-write of goal state. Held only around the read and the
 /// queued write: never across a host call, so a re-entrant callback cannot
 /// deadlock against it.
-static MUTATION: Mutex<()> = Mutex::new(());
-
-pub fn lock() -> std::sync::MutexGuard<'static, ()> {
-    MUTATION.lock().unwrap_or_else(|p| p.into_inner())
+#[derive(Default)]
+pub(crate) struct BranchState {
+    mutation: Mutex<()>,
+    revision: AtomicU64,
+    // AppendEntry can be deferred until the current turn commits.
+    desired: Mutex<Option<Goals>>,
 }
 
-/// Monotonic in-process state revision. A continuation dispatched before a
-/// mutation is discarded when the revision moved underneath it.
-static REVISION: AtomicU64 = AtomicU64::new(0);
+pub(crate) fn lock(session: &runtime::Session) -> std::sync::MutexGuard<'_, ()> {
+    session
+        .branch
+        .mutation
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+}
 
 pub fn revision() -> u64 {
-    REVISION.load(Ordering::SeqCst)
+    runtime::state().branch.revision.load(Ordering::SeqCst)
 }
 
 fn next_revision() -> u64 {
-    REVISION.fetch_add(1, Ordering::SeqCst).wrapping_add(1)
-}
-
-/// The newest local intent. It stays authoritative until a branch read shows an
-/// entry at least that new, because `AppendEntry` is *queued* while a run is
-/// active and committed only after the current turn. Dropping the intent as soon
-/// as the host accepted it would make `/goal status` report "no active goal"
-/// for the rest of that turn.
-fn desired() -> &'static Mutex<Option<Goals>> {
-    static DESIRED: OnceLock<Mutex<Option<Goals>>> = OnceLock::new();
-    DESIRED.get_or_init(|| Mutex::new(None))
+    runtime::state()
+        .branch
+        .revision
+        .fetch_add(1, Ordering::SeqCst)
+        .wrapping_add(1)
 }
 
 /// Queue a state write for the next safe boundary. Writing immediately from a
@@ -425,22 +425,40 @@ pub fn queue(goals: &Goals) -> u64 {
     let mut goals = goals.clone();
     let revision = next_revision();
     goals.revision = revision;
-    *desired().lock().unwrap_or_else(|p| p.into_inner()) = Some(goals);
+    *runtime::state()
+        .branch
+        .desired
+        .lock()
+        .unwrap_or_else(|p| p.into_inner()) = Some(goals);
     revision
 }
 
 /// Forget the local intent: a session switch or teardown means the queued state
 /// belongs to a branch this process no longer serves.
 pub fn discard_desired() {
-    *desired().lock().unwrap_or_else(|p| p.into_inner()) = None;
+    *runtime::state()
+        .branch
+        .desired
+        .lock()
+        .unwrap_or_else(|p| p.into_inner()) = None;
 }
 
 fn desired_goals() -> Option<Goals> {
-    desired().lock().unwrap_or_else(|p| p.into_inner()).clone()
+    runtime::state()
+        .branch
+        .desired
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .clone()
 }
 
 fn confirm_desired(revision: u64) {
-    let mut slot = desired().lock().unwrap_or_else(|p| p.into_inner());
+    let session = runtime::state();
+    let mut slot = session
+        .branch
+        .desired
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
     if slot.as_ref().map(|goals| goals.revision <= revision) == Some(true) {
         *slot = None;
     }
@@ -455,7 +473,8 @@ fn confirm_desired(revision: u64) {
 /// `AppendEntry`, which does not re-enter this plugin, so no callback can observe
 /// the lock held here.
 pub fn flush() -> bool {
-    let _guard = lock();
+    let session = runtime::state();
+    let _guard = lock(&session);
     let Some(goals) = desired_goals() else {
         return true;
     };
@@ -487,6 +506,12 @@ pub fn read() -> Result<Goals, String> {
                     break;
                 }
             }
+        }
+        if let Some(goals) = &committed {
+            runtime::state()
+                .branch
+                .revision
+                .fetch_max(goals.revision, Ordering::SeqCst);
         }
         // A queued write is not on the branch yet; keep serving the newest local
         // intent until the branch confirms that revision.
@@ -533,7 +558,8 @@ pub fn queue_locked(goals: &Goals) {
 /// Persist immediately, making queued state visible before the next prompt.
 pub fn persist(goals: &Goals) -> Result<(), String> {
     {
-        let _guard = lock();
+        let session = runtime::state();
+        let _guard = lock(&session);
         queue(goals);
     }
     if flush() {

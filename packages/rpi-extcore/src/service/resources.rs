@@ -672,7 +672,7 @@ impl Service {
                 resources: Some(ResourceStartup::Transition(transition.clone())),
             };
             let candidate = self
-                .start_native_session(options, None)
+                .start_native_session(options, None, false)
                 .await
                 .map_err(ResourceError::unavailable)?;
             let verified = async {

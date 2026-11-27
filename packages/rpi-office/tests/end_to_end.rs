@@ -6,12 +6,12 @@
 
 // The harness plays the host here; `take_step!` keeps the union-arm read and the
 // reclaim inside the SDK, so this file needs no `unsafe` of its own.
-#![deny(unsafe_code)]
+#![forbid(unsafe_code)]
 
 mod support;
 
 use futures_util::{SinkExt, StreamExt};
-use rpi_plugin_sdk::{EventTag, StbString, StbStringRef, StepResultTag};
+use rpi_plugin_sdk::{EventTag, StbString, StbStringRef, StepHandle, StepResultTag};
 use serde_json::{json, Value};
 use std::time::Duration;
 use tokio_tungstenite::tungstenite::Message;
@@ -60,19 +60,27 @@ fn hello() -> Value {
 /// Run one tool call through the registered `execute`/`poll` callbacks.
 fn run_tool(name: &str, params: Value) -> Result<Value, String> {
     let (_, _, callbacks) = support::tool(name).unwrap_or_else(|| panic!("{name} is registered"));
+    finish_tool(callbacks, start_tool(callbacks, params))
+}
+
+fn start_tool(callbacks: support::RegisteredTool, params: Value) -> StepHandle {
     let handle = (callbacks.execute)(
         StbStringRef::from_str("call-1"),
         StbString::from_string(params.to_string()),
         Some(rpi_plugin_sdk::callbacks::free_string),
     );
-    assert!(!handle.is_null(), "{name} returned a null handle");
+    assert!(!handle.is_null(), "tool returned a null handle");
+    handle
+}
+
+fn finish_tool(callbacks: support::RegisteredTool, handle: StepHandle) -> Result<Value, String> {
     let mut polls = 0;
     let result = loop {
         let result = (callbacks.poll)(handle, None, std::ptr::null_mut());
         match result.tag {
             StepResultTag::Pending => {
                 polls += 1;
-                assert!(polls < 2000, "{name} never finished");
+                assert!(polls < 2000, "tool never finished");
                 std::thread::sleep(Duration::from_millis(5));
             }
             _ => break result,
@@ -90,7 +98,7 @@ fn run_tool(name: &str, params: Value) -> Result<Value, String> {
 
 #[tokio::test]
 async fn pane_drives_a_tool_and_receives_streamed_replies() {
-    support::register_plugin();
+    support::register_plugin_for(11);
     // A print-mode session never dispatches SessionStart, so AgentStart must be
     // enough to resolve flags and reconcile the active tool set.
     support::run_empty_event(EventTag::AgentStart);
@@ -322,8 +330,183 @@ async fn pane_drives_a_tool_and_receives_streamed_replies() {
         0,
         "finish_shutdown is idempotent"
     );
-    // Everything was released: a reloaded session can claim the port again.
+    assert!(
+        support::run_command("office", &format!("connect {port}"))["text"]
+            .as_str()
+            .unwrap()
+            .contains("shutting down")
+    );
+
+    // A new registration can claim the port and start its own host worker.
+    let (old_begin, old_finish, old_context) = support::lifecycle_hooks().unwrap();
+    let sent_count = support::sent_messages().len();
+    assert_eq!(support::sent_message_owners(), vec![11; sent_count]);
+    support::register_plugin_for(22);
+    old_begin(old_context as *mut std::ffi::c_void);
+    assert_eq!(old_finish(old_context as *mut std::ffi::c_void), 0);
+    support::run_empty_event(EventTag::AgentStart);
     support::run_command("office", &format!("connect {port}"));
-    assert_eq!(support::health(port)["ok"], json!(true));
-    support::run_command("office", "close");
+    let mut ws = connect(port).await;
+    send_frame(&mut ws, hello()).await;
+    assert_eq!(recv_frame(&mut ws).await["type"], json!("welcome"));
+    send_frame(
+        &mut ws,
+        json!({"type": "user_message", "text": "prompt after reload"}),
+    )
+    .await;
+    support::wait_until("the new worker to deliver the prompt", || {
+        support::sent_messages().len() == sent_count + 1
+    });
+    assert_eq!(support::sent_message_owners().last(), Some(&22));
+    support::run_begin_shutdown();
+    assert_eq!(support::run_finish_shutdown(), 0);
+
+    shared_registrations_interleave().await;
+}
+
+async fn shared_registrations_interleave() {
+    const FIRST: usize = 31;
+    const SECOND: usize = 32;
+    support::register_plugin_for(FIRST);
+    support::run_empty_event(EventTag::SessionStart);
+    let first_port = support::free_port();
+    let first_status = support::run_command("office", &format!("connect {first_port}"));
+    assert!(first_status["text"].as_str().unwrap().contains("listening"));
+    let mut first = connect(first_port).await;
+    send_frame(&mut first, hello()).await;
+    assert_eq!(recv_frame(&mut first).await["type"], "welcome");
+    let first_tool = support::tool("office_excel_read_range").unwrap().2;
+
+    support::register_plugin_for(SECOND);
+    support::run_empty_event(EventTag::AgentStart);
+    assert!(support::active_tools().is_empty());
+    let conflict = support::run_command("office", &format!("connect {first_port}"));
+    assert!(conflict["text"]
+        .as_str()
+        .unwrap()
+        .contains("already in use"));
+    let second_port = support::free_port();
+    let second_status = support::run_command("office", &format!("connect {second_port}"));
+    assert!(second_status["text"]
+        .as_str()
+        .unwrap()
+        .contains("listening"));
+    let mut second = connect(second_port).await;
+    let mut second_hello = hello();
+    // Keep the same pane ID across registrations and use different documents.
+    second_hello["document"]["id"] = json!("id-2");
+    second_hello["document"]["name"] = json!("Book2.xlsx");
+    second_hello["ops"] = json!(["excel.read_range"]);
+    send_frame(&mut second, second_hello).await;
+    assert_eq!(recv_frame(&mut second).await["type"], "welcome");
+    let second_tool = support::tool("office_excel_read_range").unwrap().2;
+
+    for (owner, name, other, port, overview) in [
+        (FIRST, "Book1.xlsx", "Book2.xlsx", first_port, true),
+        (SECOND, "Book2.xlsx", "Book1.xlsx", second_port, false),
+    ] {
+        support::select_host(owner);
+        support::wait_until("the Office tool set to reconcile", || {
+            support::active_tools().contains(&"office_excel_read_range".to_string())
+        });
+        assert_eq!(
+            support::active_tools().contains(&"office_excel_get_overview".to_string()),
+            overview
+        );
+        let status = support::run_command("office", "status");
+        let status = status["text"].as_str().unwrap();
+        assert!(
+            status.contains(&port.to_string()) && status.contains(name) && !status.contains(other)
+        );
+        let prompt = support::run_before_agent_start("original").unwrap();
+        assert!(prompt.contains(name) && !prompt.contains(other));
+        let mentions = support::run_autocomplete("#", "#").unwrap();
+        assert_eq!(mentions["items"].as_array().unwrap().len(), 1);
+        assert_eq!(mentions["items"][0]["text"], format!("#{name}"));
+        assert!(support::run_command_completions("office", "co").is_some());
+        let listing = run_tool("office_list_documents", json!({})).unwrap();
+        let listing = listing["content"][0]["text"].as_str().unwrap();
+        assert!(listing.contains(name) && !listing.contains(other));
+    }
+
+    let first_call = start_tool(first_tool, json!({"range": "A1"}));
+    let second_call = start_tool(second_tool, json!({"range": "B2"}));
+    assert_eq!(recv_frame(&mut first).await["documentId"], "id-1");
+    let second_frame = recv_frame(&mut second).await;
+    assert_eq!(second_frame["documentId"], "id-2");
+    (first_tool.cancel)(first_call);
+    assert!(finish_tool(first_tool, first_call)
+        .unwrap_err()
+        .contains("aborted"));
+    send_frame(
+        &mut second,
+        json!({"type":"tool_result", "id":second_frame["id"], "ok":true, "text":"second result"}),
+    )
+    .await;
+    assert_eq!(
+        finish_tool(second_tool, second_call).unwrap()["content"][0]["text"],
+        "second result"
+    );
+
+    let sent_count = support::sent_messages().len();
+    send_frame(
+        &mut first,
+        json!({"type":"user_message", "text":"first prompt"}),
+    )
+    .await;
+    send_frame(
+        &mut second,
+        json!({"type":"user_message", "text":"second prompt"}),
+    )
+    .await;
+    support::wait_until("both pane prompts to reach the host", || {
+        support::sent_messages().len() == sent_count + 2
+    });
+    let messages = support::sent_messages();
+    let owners = support::sent_message_owners();
+    for (owner, text) in [(FIRST, "first prompt"), (SECOND, "second prompt")] {
+        let i = messages.iter().position(|m| m.ends_with(text)).unwrap();
+        assert_eq!(owners[i], owner);
+        support::select_host(owner);
+        support::run_message_event(
+            EventTag::MessageStart,
+            json!({"role":"user", "content":messages[i]}),
+        );
+    }
+    support::select_host(FIRST);
+    support::run_empty_event(EventTag::SessionShutdown);
+    let (first_begin, first_finish, first_cookie) = support::lifecycle_hooks().unwrap();
+    support::run_begin_shutdown();
+    assert_eq!(support::run_finish_shutdown(), 0);
+    assert!(std::net::TcpListener::bind(("127.0.0.1", first_port)).is_ok());
+    assert!(support::status().is_none());
+    assert!(support::run_autocomplete("#", "#").is_none());
+    assert!(support::run_command_completions("office", "co").is_none());
+    assert!(run_tool("office_list_documents", json!({})).is_err());
+
+    // Reuse the released slot and port while SECOND still has a bound prompt.
+    support::register_plugin_for(33);
+    support::run_empty_event(EventTag::SessionStart);
+    first_begin(first_cookie as *mut std::ffi::c_void);
+    assert_eq!(first_finish(first_cookie as *mut std::ffi::c_void), 0);
+    let restarted = support::run_command("office", &format!("connect {first_port}"));
+    assert!(restarted["text"].as_str().unwrap().contains("listening"));
+    support::select_host(FIRST);
+    support::run_empty_event(EventTag::SessionShutdown); // retired callback cookie
+    assert_eq!(support::health(first_port)["ok"], true);
+
+    support::select_host(SECOND);
+    support::run_message_event(
+        EventTag::MessageEnd,
+        json!({"role":"assistant", "content":"second reply"}),
+    );
+    let reply = recv_frame(&mut second).await;
+    assert_eq!(reply["kind"], "final");
+    assert_eq!(reply["text"], "second reply");
+    assert_eq!(support::health(second_port)["ok"], true);
+    support::run_begin_shutdown();
+    assert_eq!(support::run_finish_shutdown(), 0);
+    support::select_host(33);
+    support::run_begin_shutdown();
+    assert_eq!(support::run_finish_shutdown(), 0);
 }

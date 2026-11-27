@@ -9,14 +9,14 @@ use rpi_plugin_sdk::{StbString, StbStringRef, StepHandle, StepResult, ToolPartia
 use serde_json::{json, Value};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, OnceLock};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-// ABI-compatible with RuntimeActionId::ChildAgent in the host SDK. Like
-// rpi-ask-user, retain the published SDK until that enum is released.
+// Stable runtime action IDs while this package uses the published SDK.
 const GET_EXECUTION_CONTEXT: u32 = 23;
 const CHILD_AGENT: u32 = 24;
+const INDEPENDENT_RUN: u32 = 33;
 const MAX_OUTPUT_BYTES: usize = 4 * 1024 * 1024;
 const MAX_PARTIAL_EVENTS: usize = 8192;
 static JOBS: ToolHandles<Job> = ToolHandles::new();
@@ -25,9 +25,17 @@ static JOBS: ToolHandles<Job> = ToolHandles::new();
 #[derive(Clone, Copy)]
 struct RuntimeFns {
     action: extern "C" fn(u32, StbStringRef, *mut StbString, *mut std::ffi::c_void) -> i32,
-    free: extern "C" fn(StbString),
+    free: rpi_plugin_sdk::FreeStringFn,
 }
-static HOST: Mutex<Option<RuntimeFns>> = Mutex::new(None);
+// The native host uses a process-lifetime trampoline and allocator for all
+// registrations of this image. A different table must never replace them.
+static HOST: OnceLock<RuntimeFns> = OnceLock::new();
+
+fn install_host(host: RuntimeFns) -> bool {
+    let installed = HOST.get_or_init(|| host);
+    installed.action as usize == host.action as usize
+        && installed.free as usize == host.free as usize
+}
 
 enum JobMessage {
     Partial(String),
@@ -51,7 +59,51 @@ struct Request {
     timeout_seconds: u64,
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+struct BudgetPolicy {
+    max_turns: Option<u64>,
+    timeout_seconds: Option<u64>,
+}
+
 fn parse_request(params: &Value) -> Result<Request, String> {
+    parse_request_with_budget_policy(params, configured_budget_policy()?)
+}
+
+/// Independent operator policies. Neither changes native cancellation, output
+/// bounds or ownership; zero disables only the turn guard.
+fn configured_budget_policy() -> Result<BudgetPolicy, String> {
+    Ok(BudgetPolicy {
+        max_turns: configured_limit("RPI_SUBAGENT_MAX_TURNS", 0, 32)?,
+        timeout_seconds: configured_limit("RPI_SUBAGENT_TIMEOUT_SECONDS", 10, 1800)?,
+    })
+}
+
+fn configured_limit(name: &str, minimum: u64, maximum: u64) -> Result<Option<u64>, String> {
+    match std::env::var(name) {
+        Err(std::env::VarError::NotPresent) => Ok(None),
+        Ok(value) => parse_operator_limit(name, &value, minimum, maximum).map(Some),
+        Err(_) => Err(format!("{name} must be valid UTF-8")),
+    }
+}
+
+fn parse_operator_limit(
+    name: &str,
+    value: &str,
+    minimum: u64,
+    maximum: u64,
+) -> Result<u64, String> {
+    value
+        .trim()
+        .parse::<u64>()
+        .ok()
+        .filter(|value| (minimum..=maximum).contains(value))
+        .ok_or_else(|| format!("{name} must be an integer between {minimum} and {maximum}"))
+}
+
+fn parse_request_with_budget_policy(
+    params: &Value,
+    policy: BudgetPolicy,
+) -> Result<Request, String> {
     let task = params
         .get("task")
         .and_then(Value::as_str)
@@ -70,27 +122,45 @@ fn parse_request(params: &Value) -> Result<Request, String> {
     Ok(Request {
         task: task.into(),
         role: role.into(),
-        max_turns: params
-            .get("maxTurns")
-            .and_then(Value::as_u64)
-            .unwrap_or(8)
-            .clamp(1, 32),
-        timeout_seconds: params
-            .get("timeoutSeconds")
-            .and_then(Value::as_u64)
-            .unwrap_or(300)
-            .clamp(10, 1800),
+        max_turns: policy.max_turns.unwrap_or_else(|| {
+            params
+                .get("maxTurns")
+                .and_then(Value::as_u64)
+                .unwrap_or(8)
+                .clamp(0, 32)
+        }),
+        timeout_seconds: policy.timeout_seconds.unwrap_or_else(|| {
+            params
+                .get("timeoutSeconds")
+                .and_then(Value::as_u64)
+                .unwrap_or(300)
+                .clamp(10, 1800)
+        }),
     })
 }
 
-type Action = dyn Fn(Value) -> Result<Value, String> + Send + Sync;
+enum ActionError {
+    UnknownAction,
+    Failed(String),
+}
+
+impl std::fmt::Display for ActionError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::UnknownAction => f.write_str("unsupported runtime action"),
+            Self::Failed(message) => f.write_str(message),
+        }
+    }
+}
+
+type Action = dyn Fn(u32, Value) -> Result<Value, ActionError> + Send + Sync;
 
 fn host_action(
     host: &RuntimeFns,
     runtime_handle: usize,
     action: u32,
     args: Value,
-) -> Result<Value, String> {
+) -> Result<Value, ActionError> {
     let encoded = args.to_string();
     let mut out = StbString::empty();
     let rc = (host.action)(
@@ -99,21 +169,26 @@ fn host_action(
         &mut out,
         runtime_handle as *mut std::ffi::c_void,
     );
-    let text = out.to_string_lossy();
-    (host.free)(out);
+    let text = rpi_plugin_sdk::stb_take!(out, Some(host.free));
     let value: Value = serde_json::from_str(&text)
-        .map_err(|e| format!("invalid child response (status {rc}): {e}"))?;
+        .map_err(|e| ActionError::Failed(format!("invalid runtime response (status {rc}): {e}")))?;
     if rc != 0 {
-        return Err(value
+        let message = value
             .get("error")
             .and_then(Value::as_str)
-            .unwrap_or("child action failed")
-            .into());
+            .unwrap_or("runtime action failed");
+        return Err(
+            if rc == 2 && message == format!("unknown runtime action id {action}") {
+                ActionError::UnknownAction
+            } else {
+                ActionError::Failed(message.into())
+            },
+        );
     }
     Ok(value)
 }
 
-/// Fail closed if another registration of this DLL replaced its host context.
+/// Check the invocation bridge against the host-injected tool context.
 fn validate_context(expected: &Value, actual: &Value) -> Result<(), String> {
     if let Some(id) = expected.get("sessionId").and_then(Value::as_str) {
         if actual.get("sessionId").and_then(Value::as_str) == Some(id) {
@@ -130,17 +205,87 @@ fn validate_context(expected: &Value, actual: &Value) -> Result<(), String> {
 /// Always release the host handle, including malformed replies and local cancellation.
 struct Child<'a> {
     action: &'a Action,
+    action_id: u32,
+    id_key: &'static str,
     id: String,
+    session_id: Value,
+}
+impl<'a> Child<'a> {
+    fn start(
+        action: &'a Action,
+        request: &Request,
+        tool_call_id: &str,
+        tools: &[Value],
+    ) -> Result<Self, String> {
+        let Request {
+            task,
+            role,
+            max_turns,
+            timeout_seconds,
+        } = request;
+        let input = format!("You are a delegated {role} subagent. Complete the task in at most {max_turns} turns. Do not delegate, spawn, or ask another agent to do work. Work only in the current project and return a concise final report.\n\nTask:\n{task}");
+        // The extension owns its tool selection. The host checks the subset and
+        // also prevents re-entry through aliases using invocation provenance.
+        let tools: Vec<_> = tools
+            .iter()
+            .filter_map(Value::as_str)
+            .filter(|name| *name != "delegate_task")
+            .collect();
+        let generic = action(
+            INDEPENDENT_RUN,
+            json!({
+                "op": "start", "input": input, "tools": tools,
+                "maxTurns": max_turns, "timeoutSeconds": timeout_seconds,
+            }),
+        );
+        let (action_id, id_key, reply) = match generic {
+            // An unknown action is rejected before admission. Other errors may
+            // have come from an admitted run and must never trigger a retry.
+            Err(ActionError::UnknownAction) => (
+                CHILD_AGENT,
+                "childId",
+                action(
+                    CHILD_AGENT,
+                    json!({
+                        "op": "start", "task": task, "role": role, "maxTurns": max_turns,
+                        "timeoutSeconds": timeout_seconds, "toolCallId": tool_call_id,
+                    }),
+                ),
+            ),
+            reply => (INDEPENDENT_RUN, "runId", reply),
+        };
+        let mut reply = reply.map_err(|error| format!("Cannot start a host-managed subagent: {error}. This plugin requires host support for IndependentRun or ChildAgent."))?;
+        let id = reply
+            .get(id_key)
+            .and_then(Value::as_str)
+            .filter(|id| !id.is_empty())
+            .ok_or_else(|| format!("run start returned no {id_key}"))?
+            .to_owned();
+        let session_id = reply.get_mut("sessionId").map_or(Value::Null, Value::take);
+        Ok(Self {
+            action,
+            action_id,
+            id_key,
+            id,
+            session_id,
+        })
+    }
+
+    fn call(&self, op: &str) -> Result<Value, String> {
+        (self.action)(self.action_id, json!({"op":op,(self.id_key):self.id}))
+            .map_err(|error| error.to_string())
+    }
 }
 impl Drop for Child<'_> {
     fn drop(&mut self) {
-        let _ = (self.action)(json!({"op":"dispose","childId":self.id}));
+        let _ = self.call("dispose");
     }
 }
 
 fn run_request(
     request: Request,
     tool_call_id: String,
+    tools: &[Value],
     action: &Action,
     output: Sender<JobMessage>,
     cancelled: Arc<AtomicBool>,
@@ -148,28 +293,19 @@ fn run_request(
     if cancelled.load(Ordering::Acquire) {
         return Err("subagent cancelled".into());
     }
-    let start = action(json!({"op":"start","task":request.task,"role":request.role,
-        "maxTurns":request.max_turns,"timeoutSeconds":request.timeout_seconds,"toolCallId":tool_call_id}))
-        .map_err(|error| format!("Cannot start a host-managed subagent: {error}. This plugin requires a host supporting ChildAgent; no default-config subprocess fallback is used."))?;
-    let id = start
-        .get("childId")
-        .and_then(Value::as_str)
-        .filter(|id| !id.is_empty())
-        .ok_or("child start returned no childId")?
-        .to_owned();
-    let child = Child { action, id };
+    let child = Child::start(action, &request, &tool_call_id, tools)?;
     let deadline = Instant::now() + Duration::from_secs(request.timeout_seconds + 3);
     let mut bytes = 0usize;
     let mut events = 0usize;
     loop {
         if cancelled.load(Ordering::Acquire) {
-            let _ = action(json!({"op":"cancel","childId":child.id}));
+            let _ = child.call("cancel");
             return Err("subagent cancelled".into());
         }
         if Instant::now() >= deadline {
             return Err("host-managed subagent timed out".into());
         }
-        let value = action(json!({"op":"poll","childId":child.id}))?;
+        let value = child.call("poll")?;
         if let Some(deltas) = value.get("deltas").and_then(Value::as_array) {
             for delta in deltas {
                 let text = delta.as_str().ok_or("invalid child text delta")?;
@@ -215,7 +351,7 @@ fn run_request(
                 }
                 output.send(JobMessage::Done(json!({"kind":"rpi-delegation", "task":request.task,
                     "role":request.role, "maxTurns":request.max_turns, "timeoutSeconds":request.timeout_seconds,
-                    "childId":child.id, "sessionId":start.get("sessionId"), "status":"completed",
+                    "childId":child.id, "sessionId":child.session_id, "status":"completed",
                     "turns":result.get("turns"), "turnLimited":result.get("turnLimited"), "report":report}).to_string()))
                     .map_err(|_| "subagent receiver closed")?;
                 return Ok(());
@@ -231,13 +367,12 @@ fn tool_result(text: &str) -> String {
 
 rpi_plugin_sdk::execute_handler!(fn execute(tool_call_id, params, free_params) {
     rpi_plugin_sdk::guard(|| {
-        let text = params.to_string_lossy();
-        params.free_with(free_params);
+        let text = rpi_plugin_sdk::stb_take!(params, free_params);
         let id = tool_call_id.to_owned();
         let value = serde_json::from_str::<Value>(&text).unwrap_or(Value::Null);
         let expected_context = value.get("__rpi").cloned().unwrap_or(Value::Null);
-        // Capture one registration for the entire worker, including disposal.
-        let host = *HOST.lock().unwrap_or_else(|error| error.into_inner());
+        // The worker uses its invocation handle through disposal.
+        let host = HOST.get().copied();
         let (sender, receiver) = mpsc::channel();
         let cancelled = Arc::new(AtomicBool::new(false));
         let worker = match parse_request(&value) {
@@ -250,15 +385,16 @@ rpi_plugin_sdk::execute_handler!(fn execute(tool_call_id, params, free_params) {
                             .and_then(|id| usize::try_from(id).ok()).filter(|id| *id != 0)
                             .ok_or("ChildAgent requires a host-provided tool invocation runtimeHandle; upgrade the host")?;
                         let actual = host_action(&host, runtime_handle, GET_EXECUTION_CONTEXT, json!({})).map_err(|error|
-                            format!("Cannot read execution context: {error}; upgrade to a host supporting GetExecutionContext/ChildAgent"))?;
+                            format!("Cannot read execution context: {error}; upgrade to a host supporting GetExecutionContext"))?;
                         validate_context(&expected_context, &actual)?;
                         let runtime_key = expected_context.get("runtimeKey").and_then(Value::as_str)
                             .ok_or("ChildAgent requires a host-provided invocation runtimeKey; upgrade the host")?.to_owned();
-                        let action = move |mut args: Value| {
+                        let action = move |action_id, mut args: Value| {
                             args["__rpiRuntimeKey"] = json!(runtime_key);
-                            host_action(&host, runtime_handle, CHILD_AGENT, args)
+                            host_action(&host, runtime_handle, action_id, args)
                         };
-                        run_request(request, id, &action, sender.clone(), token)
+                        let tools = actual["tools"].as_array().map(Vec::as_slice).unwrap_or_default();
+                        run_request(request, id, tools, &action, sender.clone(), token)
                     });
                     match result {
                         Ok(Ok(())) => {},
@@ -342,9 +478,13 @@ extern "C" fn destroy(handle: StepHandle) {
 
 /// Keep registration and schema tests on the same metadata path.
 fn delegate_schema() -> rpi_plugin_sdk::StableToolSchema {
-    schema(
+    delegate_schema_with_budget_policy(configured_budget_policy().unwrap_or_default())
+}
+
+fn delegate_schema_with_budget_policy(policy: BudgetPolicy) -> rpi_plugin_sdk::StableToolSchema {
+    let mut registered = schema(
         "delegate_task",
-        "Delegate one bounded, non-recursive task to a host-managed in-memory child session, not a subagent subprocess or isolated worktree. The child inherits the current model/provider, tools, cwd and approval hooks; it shares the workspace and extension state. Supply necessary context, exact scope/file ownership, constraints, acceptance checks and expected report in task; do not assume the child knows the parent conversation. Coordinate overlapping writes. role is a label, not a tool/permission profile. The child cannot delegate further. Streams progress and returns a JSON report; review the report and verify acceptance, including turnLimited. Requires host ChildAgent support.",
+        "Delegate one bounded, non-recursive task to a host-managed in-memory child session, not a subagent subprocess or isolated worktree. The child inherits the current model/provider, tools, cwd and approval hooks; it shares the workspace and extension state. Supply necessary context, exact scope/file ownership, constraints, acceptance checks and expected report in task; do not assume the child knows the parent conversation. Coordinate overlapping writes. role is a label, not a tool/permission profile. The child cannot delegate further. Streams progress and returns a JSON report; review the report and verify acceptance, including turnLimited. Requires a host supporting independent runs or legacy delegation.",
         r#"{
             "type": "object",
             "properties": {
@@ -360,41 +500,60 @@ fn delegate_schema() -> rpi_plugin_sdk::StableToolSchema {
                 },
                 "maxTurns": {
                     "type": "integer",
-                    "minimum": 1,
+                    "minimum": 0,
                     "maximum": 32,
                     "default": 8,
-                    "description": "Per-child turn budget, 1-32; default 8. A completed report may be turnLimited; verify task acceptance."
+                    "description": "Per-child turn budget: 0 disables the turn limit and requires host support; 1-32 selects a finite budget; default 8 unless overridden by operator policy. A completed report may be turnLimited; verify task acceptance."
                 },
                 "timeoutSeconds": {
                     "type": "integer",
                     "minimum": 10,
                     "maximum": 1800,
                     "default": 300,
-                    "description": "Child timeout in seconds, 10-1800; default 300. Timeout/cancellation triggers host-managed cleanup."
+                    "description": "Child total wall-clock timeout in seconds, 10-1800; default 300 unless overridden by operator policy. Includes model generation, tools and waiting; independent of maxTurns. Timeout/cancellation triggers host-managed cleanup."
                 }
             },
             "required": ["task"],
             "additionalProperties": true
         }"#,
-    )
+    );
+    let mut parameters: Value =
+        serde_json::from_str(&rpi_plugin_sdk::stb_text!(registered.parameters))
+            .expect("static delegate schema");
+    if let Some(turns) = policy.max_turns {
+        parameters["properties"]["maxTurns"] = json!({"type":"integer", "enum":[turns], "default":turns,
+            "description":if turns == 0 { "Operator policy disables the turn limit. Timeout and cancellation still apply; omit maxTurns or use 0.".to_string() } else { format!("Operator policy fixes the per-child turn budget at {turns}.") }});
+    }
+    if let Some(seconds) = policy.timeout_seconds {
+        parameters["properties"]["timeoutSeconds"] = json!({"type":"integer", "enum":[seconds], "default":seconds,
+            "description":format!("Operator policy fixes the child total wall-clock timeout at {seconds} seconds. Includes model generation, tools and waiting; independent of maxTurns.")});
+    }
+    registered.parameters = StbString::from_string(parameters.to_string());
+    registered
 }
 
-rpi_plugin_sdk::export_plugin!(|api| {
+fn register_plugin(api: &rpi_plugin_sdk::PluginApi) -> i32 {
     if std::env::var("RPI_SUBAGENT_CHILD").ok().as_deref() == Some("1") {
         return 0;
     }
     let Some(register) = api.register_tool else {
         return 1;
     };
-    *HOST.lock().unwrap_or_else(|error| error.into_inner()) = Some(RuntimeFns {
+    if !install_host(RuntimeFns {
         action: api.runtime_action,
         free: api.free_string,
-    });
+    }) {
+        return 1;
+    }
     let schema = Box::new(delegate_schema());
     let result = register(&*schema, execute, poll, cancel, destroy, plugin_free_string);
     drop(schema);
     result
-});
+}
+
+// Opt in to sharing the library image across native Host registrations.
+
+rpi_plugin_sdk::export_shared_plugin!(register_plugin);
 
 #[cfg(test)]
 mod tests;

@@ -149,8 +149,7 @@ extern "C" fn execute(
     params: StbString,
     free: Option<FreeStringFn>,
 ) -> StepHandle {
-    let text = params.to_string_lossy();
-    params.free_with(free);
+    let text = rpi_plugin_sdk::stb_take!(params, free);
     HANDLES.insert(Drive::start(
         &text,
         CONFIG.get_or_init(config::from_environment),

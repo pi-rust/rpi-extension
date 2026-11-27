@@ -1,5 +1,5 @@
 //! Real loopback HTTP fixtures exercise headers, initialization, SSE and ABI results.
-use crate::{mcp_call, mcp_list, Control};
+use crate::{mcp_call, mcp_list, runtime, Control};
 use serde_json::{json, Value};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpListener;
@@ -166,20 +166,24 @@ fn managed_fixture(sse: bool) -> Server {
 }
 fn managed_flow(sse: bool) {
     let server = managed_fixture(sse);
+    let runtime = runtime::new_runtime();
     let params = json!({"url":server.url,"tool":"image","arguments":{}});
-    let first = mcp_call(&params, &Control::default()).unwrap();
+    let context = runtime::context(&params);
+    let first = mcp_call(&runtime, &context, &params, &Control::default()).unwrap();
     assert_eq!(first["content"][0]["type"], "image");
     assert_eq!(first["content"][0]["data"], "aGVsbG8=");
     assert_eq!(
         first["details"]["mcpResult"]["structuredContent"]["count"],
         1
     );
-    let second = mcp_call(&params, &Control::default()).unwrap();
+    let second = mcp_call(&runtime, &context, &params, &Control::default()).unwrap();
     assert_eq!(
         second["details"]["mcpResult"]["structuredContent"]["count"],
         2
     );
     let error = mcp_call(
+        &runtime,
+        &context,
         &json!({"url":server.url,"tool":"fail"}),
         &Control::default(),
     )
@@ -189,8 +193,13 @@ fn managed_flow(sse: bool) {
         "{error}; seen={:?}",
         server.seen.lock().unwrap()
     );
-    let discovery = mcp_list(&json!({"url":server.url}), &Control::default())
-        .unwrap_or_else(|e| panic!("{e}; seen={:?}", server.seen.lock().unwrap()));
+    let discovery = mcp_list(
+        &runtime,
+        &context,
+        &json!({"url":server.url}),
+        &Control::default(),
+    )
+    .unwrap_or_else(|e| panic!("{e}; seen={:?}", server.seen.lock().unwrap()));
     let discovery: Value =
         serde_json::from_str(discovery["content"][0]["text"].as_str().unwrap()).unwrap();
     assert_eq!(
@@ -198,6 +207,8 @@ fn managed_flow(sse: bool) {
         json!({"type":"object"})
     );
     mcp_list(
+        &runtime,
+        &context,
         &json!({"url":server.url,"action":"close"}),
         &Control::default(),
     )
@@ -311,12 +322,16 @@ fn expired_session_is_reinitialized_without_replaying_tool() {
                 .into_bytes(),
         )
     });
+    let runtime = runtime::new_runtime();
     let params = json!({"url":server.url,"tool":"tool"});
-    assert!(mcp_call(&params, &Control::default())
+    let context = runtime::context(&params);
+    assert!(mcp_call(&runtime, &context, &params, &Control::default())
         .unwrap_err()
         .contains("expired"));
-    assert!(mcp_call(&params, &Control::default()).is_ok());
+    assert!(mcp_call(&runtime, &context, &params, &Control::default()).is_ok());
     mcp_list(
+        &runtime,
+        &context,
         &json!({"url":server.url,"action":"close"}),
         &Control::default(),
     )

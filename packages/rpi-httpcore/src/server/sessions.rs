@@ -225,6 +225,16 @@ pub(super) async fn message_window(
     HttpReply(service::message_window(&state.backend, id, query).await)
 }
 
+pub(super) async fn session_preview(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    (
+        [(axum::http::header::CACHE_CONTROL, "no-store")],
+        HttpReply(service::session_preview(&state.backend, id).await),
+    )
+}
+
 pub(super) async fn snapshot(
     State(state): State<AppState>,
     Path(id): Path<String>,
@@ -278,6 +288,10 @@ pub(super) fn routes() -> axum::Router<AppState> {
         .route(
             "/api/v1/sessions/{id}/commands",
             axum::routing::post(command),
+        )
+        .route(
+            "/api/v1/sessions/{id}/preview",
+            axum::routing::get(session_preview),
         )
         .route(
             "/api/v1/sessions/{id}/snapshot",

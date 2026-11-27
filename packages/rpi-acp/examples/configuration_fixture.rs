@@ -2,8 +2,7 @@
 //! Test-only native runtime-action probe. Never install this example as a package.
 use rpi_plugin_sdk::handles::ToolHandles;
 use rpi_plugin_sdk::{
-    FreeStringFn, PluginApi, RuntimeActionId, StableToolSchema, StbString, StbStringRef,
-    StepHandle, StepResult, ToolPartialCb,
+    PluginApi, RuntimeActionId, StableToolSchema, StbString, StepHandle, StepResult, ToolPartialCb,
 };
 use serde_json::{json, Value};
 use std::ffi::c_void;
@@ -21,15 +20,7 @@ fn call_runtime(id: RuntimeActionId, args: Value) -> Result<Value, String> {
         .get()
         .ok_or("configuration fixture runtime unavailable")?;
     let input = args.to_string();
-    let mut output = StbString::empty();
-    let rc = (runtime.runtime_action)(
-        id as u32,
-        StbStringRef::from_str(&input),
-        &mut output,
-        runtime.user_data,
-    );
-    let text = output.to_string_lossy();
-    (runtime.free_string)(output);
+    let (rc, text) = rpi_plugin_sdk::call_action!(&runtime, id, &input);
     if rc != 0 {
         return Err(format!("runtime action {id:?}: {text}"));
     }
@@ -40,18 +31,13 @@ fn call_runtime(id: RuntimeActionId, args: Value) -> Result<Value, String> {
     }
 }
 
-extern "C" fn execute(
-    _: StbStringRef,
-    params: StbString,
-    free: Option<FreeStringFn>,
-) -> StepHandle {
-    let text = params.to_string_lossy();
-    params.free_with(free);
+rpi_plugin_sdk::execute_handler!(fn execute(_id, params, free) {
+    let text = rpi_plugin_sdk::stb_take!(params, free);
     HANDLES.insert(Drive {
         params: serde_json::from_str(&text).unwrap_or(Value::Null),
         done: false,
     })
-}
+});
 
 extern "C" fn poll(handle: StepHandle, _: Option<ToolPartialCb>, _: *mut c_void) -> StepResult {
     let Some(entry) = HANDLES.get(handle) else {

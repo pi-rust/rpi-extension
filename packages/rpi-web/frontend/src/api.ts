@@ -1292,6 +1292,11 @@ export const api = {
       method: "POST",
       body: JSON.stringify({ title }),
     }),
+  sessionPreview: (id: string, signal?: AbortSignal) =>
+    request<{ sessionId: string; messages: unknown[]; hasMore: boolean } | undefined>(
+      `/sessions/${id}/preview`,
+      { signal },
+    ),
   openSession: (id: string, signal?: AbortSignal) =>
     request<SessionSummary>(`/sessions/${id}/open`, { method: "POST", signal }),
   runtimeState: (id: string, signal?: AbortSignal) =>

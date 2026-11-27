@@ -21,7 +21,7 @@
 //! stops and joins the server thread before the plugin is unloaded.
 
 #![forbid(unsafe_code)]
-// The SDK's `export_plugin!` macro expands to the `pub extern "C" fn
+// The SDK's `export_shared_plugin!` macro expands to the `pub extern "C" fn
 // rpi_plugin_register(*const PluginApi)` entrypoint and validates/dereferences
 // the pointer via `register_entrypoint`; clippy attributes that generated deref
 // here. The ABI signature is fixed, so the lint is not actionable.
@@ -40,13 +40,11 @@ pub mod session;
 mod session_list;
 pub mod zed;
 
-use rpi_plugin_sdk::{
-    EventTag, FreeStringFn, RuntimeActionFn, RuntimeActionId, StablePluginEvent, StbString,
-    StbStringRef,
-};
+use rpi_plugin_sdk::{EventTag, PluginApi, RuntimeActionId, StablePluginEvent, StbStringRef};
 use serde_json::{json, Value};
-use std::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
-use std::sync::{Mutex, OnceLock};
+use std::ffi::c_void;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::thread;
 
 /// The CLI flag that turns an ordinary `rpi` invocation into an ACP agent.
@@ -60,86 +58,116 @@ const PRINT_ZED_FLAG: &str = "print-zed";
 /// auth method, then exit `0` only once the provider is verified usable.
 const SETUP_FLAG: &str = "setup";
 
-// Host callbacks captured during `register`. The `PluginApi` pointer is only
-// valid for that call, so the function pointers + the opaque `user_data` (the
-// host's action bridge) are copied out here, exactly like `rpi-server` /
-// `rpi-im-message`. They are used to read the parsed CLI flag before the host
-// decides whether to drain stdin.
-static RUNTIME_ACTION: OnceLock<RuntimeActionFn> = OnceLock::new();
-static RUNTIME_USER_DATA: AtomicPtr<std::ffi::c_void> = AtomicPtr::new(std::ptr::null_mut());
-static HOST_FREE_STRING: OnceLock<FreeStringFn> = OnceLock::new();
+// Passive registrations keep no state. The active registration holds the
+// slot until its worker has joined, so a replacement cannot overlap stdio.
+static OWNER: Mutex<Option<Arc<Owner>>> = Mutex::new(None);
+static NEXT_OWNER: AtomicUsize = AtomicUsize::new(1);
 
-/// Set once `--acp` was seen during register.
-static ACP_ENABLED: AtomicBool = AtomicBool::new(false);
-/// Set once `--install-zed` was seen: register and exit instead of serving.
-static INSTALL_ZED: AtomicBool = AtomicBool::new(false);
-/// Set once `--print-zed` was seen: print the snippet and exit.
-static PRINT_ZED: AtomicBool = AtomicBool::new(false);
-/// Set once `--setup` was seen: run credential setup and exit instead of serving.
-static SETUP: AtomicBool = AtomicBool::new(false);
-/// Guards against starting the server twice (SessionStart can fire on reload).
-static SERVER_STARTED: AtomicBool = AtomicBool::new(false);
-static SERVER_STOP: OnceLock<tokio::sync::watch::Sender<bool>> = OnceLock::new();
-static SERVER_THREAD: Mutex<Option<thread::JoinHandle<()>>> = Mutex::new(None);
-
-fn lifecycle_action(op: &str, code: i32) -> bool {
-    let Some(action) = RUNTIME_ACTION.get() else {
-        return false;
-    };
-    let args = json!({"op": op, "exitCode": code}).to_string();
-    let mut out = StbString::empty();
-    let rc = action(
-        RuntimeActionId::StdioLifecycle as u32,
-        StbStringRef::from_str(&args),
-        &mut out,
-        RUNTIME_USER_DATA.load(Ordering::Acquire),
-    );
-    if let Some(free) = HOST_FREE_STRING.get() {
-        free(out);
-    }
-    rc == 0
+struct Owner {
+    token: usize,
+    host: Host,
+    mode: Mode,
+    stop: tokio::sync::watch::Sender<bool>,
+    worker: Mutex<Worker>,
 }
 
-extern "C" fn on_session_shutdown(_: StablePluginEvent, _: *mut std::ffi::c_void) -> i32 {
-    if let Some(stop) = SERVER_STOP.get() {
-        let _ = stop.send(true);
-    }
-    if let Some(thread) = SERVER_THREAD.lock().unwrap().take() {
-        let _ = thread.join();
-    }
-    0
+#[derive(Default)]
+struct Worker {
+    started: bool,
+    thread: Option<std::thread::JoinHandle<()>>,
 }
 
-/// Read a parsed CLI flag through the host's `GetCliFlag` runtime action.
-fn get_cli_flag(name: &str) -> Option<Value> {
-    let runtime_action = *RUNTIME_ACTION.get()?;
-    let user_data = RUNTIME_USER_DATA.load(Ordering::Acquire);
-    if user_data.is_null() {
-        return None;
+#[derive(Clone, Copy)]
+enum Mode {
+    Setup,
+    Zed { write: bool },
+    Serve { bypass: bool },
+}
+
+#[derive(Clone, Copy)]
+struct Host(PluginApi);
+
+impl Host {
+    fn lifecycle(self, op: &str, code: i32) -> bool {
+        let (rc, _) = rpi_plugin_sdk::call_action!(
+            self.0,
+            RuntimeActionId::StdioLifecycle,
+            &json!({"op": op, "exitCode": code}).to_string()
+        );
+        rc == 0
     }
 
-    let args = json!({"name": name}).to_string();
-    let args_ref = StbStringRef::from_str(&args);
-    let mut out = StbString::empty();
-
-    let rc = runtime_action(
-        RuntimeActionId::GetCliFlag as u32,
-        args_ref,
-        &mut out,
-        user_data,
-    );
-
-    let result_str = if rc == 0 {
-        Some(out.to_string_lossy())
-    } else {
-        None
-    };
-    if let Some(free) = HOST_FREE_STRING.get() {
-        free(out);
+    fn finish(self, code: i32) -> i32 {
+        if !self.lifecycle("finish", code) {
+            diagln!("[rpi-acp] failed to finish the host stdio lifecycle");
+        }
+        0
     }
 
-    let value: Value = serde_json::from_str(&result_str?).ok()?;
-    value.get("value").cloned()
+    fn flag(self, name: &str) -> Option<Value> {
+        if self.0.user_data.is_null() {
+            return None;
+        }
+        let (rc, body) = rpi_plugin_sdk::call_action!(
+            self.0,
+            RuntimeActionId::GetCliFlag,
+            &json!({"name": name}).to_string()
+        );
+        if rc != 0 {
+            return None;
+        }
+        serde_json::from_str::<Value>(&body)
+            .ok()?
+            .get("value")
+            .cloned()
+    }
+}
+
+fn find_owner(token: usize) -> Option<Arc<Owner>> {
+    OWNER
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .as_ref()
+        .filter(|owner| owner.token == token)
+        .cloned()
+}
+
+extern "C" fn begin_shutdown(context: *mut c_void) {
+    rpi_plugin_sdk::guard_or((), || {
+        if let Some(owner) = find_owner(context as usize) {
+            owner.stop.send_replace(true);
+        }
+    });
+}
+
+extern "C" fn finish_shutdown(context: *mut c_void) -> i32 {
+    rpi_plugin_sdk::guard_or(1, || {
+        let Some(owner) = find_owner(context as usize) else {
+            return 0;
+        };
+        owner.stop.send_replace(true);
+        // Start holds this lock until it publishes the worker handle. Keep the
+        // slot occupied until the worker has released the process streams.
+        let mut worker = owner
+            .worker
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if let Some(thread) = worker.thread.take() {
+            let _ = thread.join();
+        }
+        let mut slot = OWNER.lock().unwrap_or_else(|error| error.into_inner());
+        if slot
+            .as_ref()
+            .is_some_and(|current| current.token == owner.token)
+        {
+            *slot = None;
+        }
+        0
+    })
+}
+
+extern "C" fn on_session_shutdown(_: StablePluginEvent, context: *mut c_void) -> i32 {
+    finish_shutdown(context)
 }
 
 /// Whether a `GetCliFlag` result means the switch is ON. A bare `--flag` yields
@@ -200,14 +228,6 @@ fn ensure_zed_registration() {
     }
 }
 
-/// Report a one-shot action's status to the host, which then exits with it.
-fn finish_with(code: i32) -> i32 {
-    if !lifecycle_action("finish", code) {
-        diagln!("[rpi-acp] failed to finish the host stdio lifecycle");
-    }
-    0
-}
-
 /// Treat unset/empty/`0`/`false` as off, anything else as on.
 fn env_flag(name: &str) -> bool {
     std::env::var(name)
@@ -218,28 +238,35 @@ fn env_flag(name: &str) -> bool {
         .unwrap_or(false)
 }
 
-extern "C" fn on_session_start(event: StablePluginEvent, _: *mut std::ffi::c_void) -> i32 {
+extern "C" fn on_session_start(event: StablePluginEvent, context: *mut c_void) -> i32 {
     if event.tag != EventTag::SessionStart {
         return 0;
     }
-    // `--install-zed` / `--print-zed` / `--setup` are one-shot: do the work, hand
-    // the host a status code, and let it exit. They take precedence over `--acp`,
-    // which is what lets an ACP client's terminal-auth invocation
-    // (`rpi --acp --setup`) run setup instead of a second server.
-    if SETUP.load(Ordering::Acquire) {
-        let args: Vec<String> = std::env::args().skip(1).collect();
-        return finish_with(auth::run(&args));
-    }
-    if INSTALL_ZED.load(Ordering::Acquire) || PRINT_ZED.load(Ordering::Acquire) {
-        let write = INSTALL_ZED.load(Ordering::Acquire);
-        return finish_with(zed::run_default_action(write));
-    }
-    if !ACP_ENABLED.load(Ordering::Acquire) {
+    rpi_plugin_sdk::guard_or(1, || start_owner(context as usize))
+}
+
+fn start_owner(token: usize) -> i32 {
+    let Some(owner) = find_owner(token) else {
+        return 0;
+    };
+    let mut worker = owner
+        .worker
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    let receiver = owner.stop.subscribe();
+    if worker.started || *receiver.borrow() {
         return 0;
     }
-    if SERVER_STARTED.swap(true, Ordering::AcqRel) {
-        return 0;
-    }
+    worker.started = true;
+    let host = owner.host;
+    let bypass = match owner.mode {
+        Mode::Setup => {
+            let args: Vec<String> = std::env::args().skip(1).collect();
+            return host.finish(auth::run(&args));
+        }
+        Mode::Zed { write } => return host.finish(zed::run_default_action(write)),
+        Mode::Serve { bypass } => bypass,
+    };
 
     // Take stdin *here*, synchronously, before spawning the server: a terminal
     // cannot carry ACP, and the host has already parked in its headless
@@ -255,7 +282,7 @@ extern "C" fn on_session_start(event: StablePluginEvent, _: *mut std::ffi::c_voi
                  other end of a pipe."
             );
             diagln!("[rpi-acp] To register rpi in Zed from a terminal, run: rpi --install-zed");
-            return finish_with(2);
+            return host.finish(2);
         }
     };
 
@@ -271,9 +298,7 @@ extern "C" fn on_session_start(event: StablePluginEvent, _: *mut std::ffi::c_voi
             .unwrap_or_else(|_| "?".into()),
     );
     ensure_zed_registration();
-    let (stop, receiver) = tokio::sync::watch::channel(false);
-    let _ = SERVER_STOP.set(stop);
-    let server = thread::spawn(move || {
+    let server = thread::Builder::new().spawn(move || {
         let runtime = match tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .worker_threads(2)
@@ -282,25 +307,26 @@ extern "C" fn on_session_start(event: StablePluginEvent, _: *mut std::ffi::c_voi
             Ok(runtime) => runtime,
             Err(error) => {
                 diagln!("[rpi-acp] failed to create tokio runtime: {error}");
-                lifecycle_action("finish", 2);
+                host.finish(2);
                 return;
             }
         };
 
-        let code = runtime.block_on(protocol::run(receiver, input, pending));
-        if !lifecycle_action("finish", code) {
-            diagln!("[rpi-acp] failed to finish the host stdio lifecycle");
-        }
+        let code = runtime.block_on(protocol::run_with_bypass(receiver, input, pending, bypass));
+        host.finish(code);
     });
-    *SERVER_THREAD.lock().unwrap() = Some(server);
-
+    match server {
+        Ok(server) => worker.thread = Some(server),
+        Err(error) => {
+            diagln!("[rpi-acp] failed to start server thread: {error}");
+            host.finish(2);
+        }
+    }
     0
 }
 
-fn register_plugin(api: &rpi_plugin_sdk::PluginApi) -> i32 {
-    let _ = RUNTIME_ACTION.set(api.runtime_action);
-    RUNTIME_USER_DATA.store(api.user_data, Ordering::Release);
-    let _ = HOST_FREE_STRING.set(api.free_string);
+fn register_plugin(api: &PluginApi) -> i32 {
+    let host = Host(*api);
 
     // Document the flags. They are always readable via `GetCliFlag` (unknown
     // long flags are retained by the parser), but registering them puts them in
@@ -333,25 +359,34 @@ fn register_plugin(api: &rpi_plugin_sdk::PluginApi) -> i32 {
     // Decide NOW, during register: the host only learns whether to defer
     // `read_piped_stdin` from the `ownsStdio` declaration, which must be in the
     // registry before `build()` returns.
-    let acp = flag_is_on(get_cli_flag(ACP_FLAG).as_ref());
-    session::set_permission_bypass(flag_is_on(get_cli_flag(BYPASS_FLAG).as_ref()));
-    let install = flag_is_on(get_cli_flag(INSTALL_ZED_FLAG).as_ref());
-    let print = flag_is_on(get_cli_flag(PRINT_ZED_FLAG).as_ref());
-    let setup = flag_is_on(get_cli_flag(SETUP_FLAG).as_ref());
-    if !acp && !install && !print && !setup {
+    let mode = if flag_is_on(host.flag(SETUP_FLAG).as_ref()) {
+        Mode::Setup
+    } else if flag_is_on(host.flag(INSTALL_ZED_FLAG).as_ref()) {
+        Mode::Zed { write: true }
+    } else if flag_is_on(host.flag(PRINT_ZED_FLAG).as_ref()) {
+        Mode::Zed { write: false }
+    } else if flag_is_on(host.flag(ACP_FLAG).as_ref()) {
+        Mode::Serve {
+            bypass: flag_is_on(host.flag(BYPASS_FLAG).as_ref()),
+        }
+    } else {
         return 0;
-    }
+    };
     for other in ["mcp", "http", "webserver", "web", "server", "webui"] {
-        if flag_is_on(get_cli_flag(other).as_ref()) {
+        if flag_is_on(host.flag(other).as_ref()) {
             diagln!("[rpi-acp] ACP actions cannot be combined with --{other}");
             return 1;
         }
     }
 
-    if !lifecycle_action("status", 0) {
+    if !host.lifecycle("status", 0) {
         diagln!("[rpi-acp] host must support the StdioLifecycle runtime action");
         return 1;
     }
+    let Some(register) = api.register_event_handler else {
+        diagln!("[rpi-acp] host must support session lifecycle event registration");
+        return 1;
+    };
     let Some(declare) = api.declare else {
         diagln!(
             "[rpi-acp] this rpi host does not support the `declare` ABI; \
@@ -359,41 +394,61 @@ fn register_plugin(api: &rpi_plugin_sdk::PluginApi) -> i32 {
         );
         return 1;
     };
+    #[allow(deprecated)] // `try_update` requires a newer Rust version.
+    let Ok(token) = NEXT_OWNER.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |next| {
+        next.checked_add(1)
+    }) else {
+        return 1;
+    };
+    // The host round-trips this token without dereferencing it. Reusing a
+    // host pointer as the key would let a stale event address a new owner.
+    let context = token as *mut c_void;
+    // Older isolated hosts fall back to SessionShutdown. The shared Host
+    // supplies loader cleanup even when registration fails or reloads.
+    if let Some(lifecycle) = api.register_plugin_lifecycle {
+        let code = lifecycle(begin_shutdown, finish_shutdown, context);
+        if code != 0 {
+            return code;
+        }
+    }
+    for (tag, callback) in [
+        (
+            EventTag::SessionShutdown,
+            on_session_shutdown as rpi_plugin_sdk::EventHandlerFn,
+        ),
+        (EventTag::SessionStart, on_session_start),
+    ] {
+        let code = register(tag, callback, context);
+        if code != 0 {
+            return code;
+        }
+    }
+    // Publish only after both hooks and the stdio claim succeed. A partially
+    // installed hook has no matching owner, even if the host calls it.
+    let mut slot = OWNER.lock().unwrap_or_else(|error| error.into_inner());
+    if slot.is_some() {
+        return 1;
+    }
     let payload = json!({"ownsStdio": true}).to_string();
     if declare(StbStringRef::from_str(&payload)) != 0 {
         diagln!("[rpi-acp] host rejected the `ownsStdio` declaration");
         return 1;
     }
 
-    // One-shot actions own the headless lifecycle without starting an ACP server.
-    INSTALL_ZED.store(install, Ordering::Release);
-    PRINT_ZED.store(print, Ordering::Release);
-    SETUP.store(setup, Ordering::Release);
-    ACP_ENABLED.store(acp && !install && !print && !setup, Ordering::Release);
-
-    if let Some(register) = api.register_event_handler {
-        let rc = register(
-            EventTag::SessionShutdown,
-            on_session_shutdown,
-            api.user_data,
-        );
-        if rc != 0 {
-            return rc;
-        }
-        let rc = register(
-            EventTag::SessionStart,
-            on_session_start,
-            std::ptr::null_mut(),
-        );
-        if rc != 0 {
-            return rc;
-        }
-    }
+    *slot = Some(Arc::new(Owner {
+        token,
+        host,
+        mode,
+        stop: tokio::sync::watch::channel(false).0,
+        worker: Mutex::new(Worker::default()),
+    }));
 
     0
 }
 
-rpi_plugin_sdk::export_plugin!(register_plugin);
+// Passive registrations share the image. The active stdio owner retains its
+// own callbacks and worker until the host finishes that registration.
+rpi_plugin_sdk::export_shared_plugin!(register_plugin);
 
 #[cfg(test)]
 mod tests {

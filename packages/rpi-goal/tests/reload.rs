@@ -1,12 +1,15 @@
 //! Reload fixture: a DLL can be registered again without resetting its statics.
 //! The second registration must rebind commands, tools and events to the new
 //! owner, and an in-flight tool call must keep the owner that started it.
+
+#![forbid(unsafe_code)]
+
 mod support;
 
+use rpi_abi_test_support::{tool_registrar, ToolCallbacks, ToolRegistration, ToolSchema};
 use rpi_plugin_sdk::{
-    CommandHandlerFn, EventHandlerFn, EventTag, FreeStringFn, PluginApi, StablePluginEvent,
-    StableToolSchema, StbString, StbStringRef, ToolCancelFn, ToolDestroyFn, ToolExecuteFn,
-    ToolPollFn,
+    CommandHandlerFn, EventHandlerFn, EventTag, PluginApi, StablePluginEvent, StbString,
+    StbStringRef,
 };
 use serde_json::{json, Value};
 use std::ffi::c_void;
@@ -27,19 +30,13 @@ extern "C" fn event(tag: EventTag, handler: EventHandlerFn, _: *mut c_void) -> i
     0
 }
 
-extern "C" fn tool(
-    schema: *const StableToolSchema,
-    execute: ToolExecuteFn,
-    poll: ToolPollFn,
-    _: ToolCancelFn,
-    _: ToolDestroyFn,
-    _: FreeStringFn,
-) -> i32 {
-    // SAFETY: the host owns the schema for this call.
-    let name = unsafe { &*schema }.name.to_string_lossy();
-    TOOLS.lock().unwrap().push(name);
-    let _ = (execute, poll);
-    0
+struct ToolRegistrar;
+
+impl ToolRegistration for ToolRegistrar {
+    fn register_tool(schema: ToolSchema, _: ToolCallbacks) -> i32 {
+        TOOLS.lock().unwrap().push(schema.name);
+        0
+    }
 }
 
 rpi_plugin_sdk::string_handler! {
@@ -58,7 +55,7 @@ fn api(owner: usize) -> PluginApi {
         free_string: rpi_plugin_sdk::callbacks::free_string,
         user_data: owner as *mut c_void,
         register_command: Some(command),
-        register_tool: Some(tool),
+        register_tool: Some(tool_registrar::<ToolRegistrar>()),
         register_shortcut: None,
         register_flag: None,
         register_provider: None,
@@ -71,6 +68,15 @@ fn api(owner: usize) -> PluginApi {
         declare: None,
         register_before_agent_start: None,
         register_oauth_provider: None,
+        register_streaming_provider: None,
+        register_tool_with_wake: None,
+        register_plugin_lifecycle: None,
+        register_tool_prompt: None,
+        register_oauth_provider_cancellable: None,
+        register_tool_result: None,
+        register_autocomplete_provider: None,
+        register_command_completions: None,
+        register_argument_suggester: None,
     }
 }
 
@@ -83,8 +89,7 @@ fn invoke(args: &str) -> Value {
         &mut output,
         std::ptr::null_mut(),
     );
-    let text = output.to_string_lossy();
-    rpi_plugin_sdk::callbacks::free_string(output);
+    let text = rpi_plugin_sdk::stb_take!(output, Some(rpi_plugin_sdk::callbacks::free_string));
     assert_eq!(rc, 0);
     serde_json::from_str(&text).unwrap_or(Value::Null)
 }

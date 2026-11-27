@@ -23,14 +23,11 @@ use rpi_ai::{
     event_stream::create_assistant_message_event_stream, AssistantMessageEventStream, Context,
     Model, Provider, SimpleStreamOptions, ThinkingLevel,
 };
-use rpi_plugin_sdk::{
-    callbacks::free_string, provider::ProviderContext, PluginApi, StbString, StbStringRef,
-};
+use rpi_plugin_sdk::{callbacks::free_string, provider::ProviderContext, PluginApi, StbStringRef};
 use serde_json::{json, Value};
 use std::{
-    ffi::c_void,
     future::Future,
-    sync::{Arc, Mutex, OnceLock},
+    sync::{Arc, Mutex},
     time::Instant,
 };
 use transport::{Live, Net};
@@ -39,11 +36,11 @@ pub const PROVIDER_ID: &str = "openai-codex";
 /// The endpoint Pi's stream sends to when the model has no override.
 pub const ENDPOINT: &str = "https://chatgpt.com/backend-api";
 
-/// Process state: issued login attempts only. Credentials arrive per request and the
-/// account id is derived from the access JWT at request time, so nothing else is cached.
-fn shared() -> &'static Mutex<PendingLogins> {
-    static SHARED: OnceLock<Mutex<PendingLogins>> = OnceLock::new();
-    SHARED.get_or_init(|| Mutex::new(PendingLogins::default()))
+/// OAuth attempts and upstream conversation IDs owned by one registration.
+#[derive(Default)]
+struct State {
+    logins: Mutex<PendingLogins>,
+    sessions: transport::Sessions,
 }
 
 /// The default catalog models, in Pi's order.
@@ -61,10 +58,11 @@ fn root(model: &Model) -> String {
     }
 }
 
-/// Holds the pooled client only. Credentials arrive per request.
+/// Holds a pooled client and this registration’s vendor state.
 pub struct CodexProvider {
     client: reqwest::Client,
     models: Vec<Model>,
+    state: Arc<State>,
 }
 
 #[async_trait::async_trait]
@@ -90,6 +88,7 @@ impl Provider for CodexProvider {
                 user_agent: default_user_agent(),
             }),
             root,
+            state: self.state.clone(),
             idle: options.stream_idle_timeout(),
         };
         // Pi omits the reasoning option for "off"; only real levels reach the wire map.
@@ -125,31 +124,33 @@ impl Provider for CodexProvider {
 fn create(
     context: &ProviderContext,
     model: &Model,
-    _options: &SimpleStreamOptions,
+    state: Arc<State>,
 ) -> Result<Arc<dyn Provider>, String> {
     Ok(Arc::new(CodexProvider {
         client: context.client(&root(model))?,
         models: models(),
+        state,
     }))
 }
 
 /// The streaming registration. The macro emits a `register` function, so it gets a module.
 mod streaming {
-    crate::registration::register_provider!(
+    crate::registration::register_scoped_provider!(
         super::PROVIDER_ID,
         super::catalog::BASE_URL,
         super::catalog::API,
         serde_json::json!({"id": super::PROVIDER_ID, "models": super::models(), "requiresAuth": true}),
+        super::State,
         super::create
     );
 }
 
 /// Declares the streaming provider and its OAuth flow. Streaming never depends on OAuth.
 pub(crate) fn register(api: &PluginApi) -> i32 {
-    let result = streaming::register(api);
-    if result != 0 {
-        return result;
-    }
+    let data = match streaming::register(api) {
+        Ok(data) => data,
+        Err(rc) => return rc,
+    };
     // A host without the OAuth slot keeps the provider; login then needs another credential.
     let Some(register_oauth) = api.register_oauth_provider else {
         return 0;
@@ -164,45 +165,40 @@ pub(crate) fn register(api: &PluginApi) -> i32 {
         StbStringRef::from_str(&manifest),
         oauth_request,
         free_string,
-        std::ptr::null_mut::<c_void>(),
+        data,
     )
 }
 
-/// Host action callback: `{action, providerId, input}` in, one standard envelope out.
-extern "C" fn oauth_request(
-    request: StbStringRef,
-    out: *mut StbString,
-    _user_data: *mut c_void,
-) -> i32 {
-    if out.is_null() {
-        return 2;
+rpi_plugin_sdk::string_handler! {
+    /// Host action callback: `{action, providerId, input}` in, one standard envelope out.
+    fn oauth_request(request, out, user_data) {
+        if !out.is_available() {
+            return 2;
+        }
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            oauth_action(streaming::REGISTRATIONS.state(user_data)?, request)
+        }));
+        let (status, body) = match result {
+            Ok(Ok(value)) => (0, value),
+            Ok(Err(message)) => (1, error_envelope(&message)),
+            Err(_) => (1, error_envelope("OpenAI Codex OAuth panicked")),
+        };
+        out.write(body.to_string());
+        status
     }
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        // SAFETY: the host keeps the request buffer valid until this callback returns.
-        let text = unsafe { request.as_str() }.to_owned();
-        oauth_action(&text)
-    }));
-    let (status, body) = match result {
-        Ok(Ok(value)) => (0, value),
-        Ok(Err(message)) => (1, error_envelope(&message)),
-        Err(_) => (1, error_envelope("OpenAI Codex OAuth panicked")),
-    };
-    // SAFETY: `out` is the host's exclusive output slot, checked non-null above.
-    unsafe { *out = StbString::from_string(body.to_string()) };
-    status
 }
 
 fn error_envelope(message: &str) -> Value {
     json!({"version": 1, "kind": "error", "payload": {"message": message}})
 }
 
-fn oauth_action(text: &str) -> Result<Value, String> {
+fn oauth_action(state: Arc<State>, text: &str) -> Result<Value, String> {
     let request: Value =
         serde_json::from_str(text).map_err(|_| "invalid OAuth request".to_owned())?;
     let input = &request["input"];
     match request["action"].as_str() {
-        Some("begin") => begin(),
-        Some("exchange") => exchange(input["value"].as_str().unwrap_or_default()),
+        Some("begin") => begin(&state),
+        Some("exchange") => exchange(state, input["value"].as_str().unwrap_or_default()),
         Some("refresh") => refresh(&input["credential"]),
         // OpenAI has no revoke endpoint. Success lets the host remove local credentials.
         Some("revoke") => Ok(json!({"version": 1, "kind": "success", "payload": {}})),
@@ -210,9 +206,10 @@ fn oauth_action(text: &str) -> Result<Value, String> {
     }
 }
 
-fn begin() -> Result<Value, String> {
+fn begin(owner: &State) -> Result<Value, String> {
     let auth::Authorization { url, state, login } = auth::authorize()?;
-    shared()
+    owner
+        .logins
         .lock()
         .unwrap()
         .insert(state, login, Instant::now());
@@ -227,11 +224,11 @@ fn begin() -> Result<Value, String> {
     }))
 }
 
-fn exchange(pasted: &str) -> Result<Value, String> {
+fn exchange(state: Arc<State>, pasted: &str) -> Result<Value, String> {
     let pasted = pasted.to_owned();
     block_on_oauth(move |net| async move {
         let result =
-            auth::complete(&net, &net.endpoints, shared(), &pasted, Instant::now()).await?;
+            auth::complete(&net, &net.endpoints, &state.logins, &pasted, Instant::now()).await?;
         Ok(credential_envelope(
             result["access"].as_str().unwrap_or_default(),
             result["refresh"].as_str().unwrap_or_default(),
