@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.19](https://github.com/pi-rust/rpi-extension/compare/rpi-im-message-v0.1.18...rpi-im-message-v0.1.19) - 2026-11-28
+
+### Added
+
+- *(im-message)* support direct chats with opt-in allowlist exemption ([#115](https://github.com/pi-rust/rpi-extension/pull/115))
+
 ### Added
 
 - Add `allowDirectChats` as an opt-in exemption from `allowChats` for confirmed

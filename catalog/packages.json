@@ -278,14 +278,14 @@
     "descriptionZh": "通过飞书、Lark 或企业微信智能机器人长连接接收消息，并发送文本、Markdown 和卡片。",
     "descriptionEn": "Receive Feishu/Lark or WeCom bot messages over a persistent connection and send text, Markdown and cards.",
     "description": "Receive Feishu/Lark or WeCom bot messages over a persistent connection and send text, Markdown and cards.",
-    "version": "0.1.18",
+    "version": "0.1.19",
     "type": "extension",
     "tool": "im_message_server",
     "inspiredBy": "Hermes Feishu/Lark and WeCom channels",
     "sourceDownloadsPerMonth": null,
     "install": "rpi install rpi-im-message --github pi-rust/rpi-extension",
     "repository": "https://github.com/pi-rust/rpi-extension",
-    "prebuilt_manifest": "https://github.com/pi-rust/rpi-extension/releases/download/rpi-im-message-v0.1.18/rpi-extension.json"
+    "prebuilt_manifest": "https://github.com/pi-rust/rpi-extension/releases/download/rpi-im-message-v0.1.19/rpi-extension.json"
   },
   {
     "name": "rpi-office",
@@ -406,14 +406,14 @@
     "descriptionZh": "在浏览器中管理项目和会话，查看流式对话、工具交互、文件预览与 Git 差异。",
     "descriptionEn": "Manage projects and sessions in a browser with streamed conversations, tool interactions, file previews and Git diffs.",
     "description": "Manage projects and sessions in a browser with streamed conversations, tool interactions, file previews and Git diffs.",
-    "version": "0.1.97",
+    "version": "0.1.98",
     "type": "extension",
     "tool": null,
     "inspiredBy": "Browser project and session workspace",
     "sourceDownloadsPerMonth": null,
     "install": "rpi install rpi-web --github pi-rust/rpi-extension",
     "repository": "https://github.com/pi-rust/rpi-extension",
-    "prebuilt_manifest": "https://github.com/pi-rust/rpi-extension/releases/download/rpi-web-v0.1.97/rpi-extension.json"
+    "prebuilt_manifest": "https://github.com/pi-rust/rpi-extension/releases/download/rpi-web-v0.1.98/rpi-extension.json"
   },
   {
     "name": "rpi-edit-diagnostics",

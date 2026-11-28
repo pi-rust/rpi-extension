@@ -2717,7 +2717,7 @@ dependencies = [
 
 [[package]]
 name = "rpi-im-message"
-version = "0.1.18"
+version = "0.1.19"
 dependencies = [
  "feishu-sdk",
  "futures-util",
@@ -3021,7 +3021,7 @@ dependencies = [
 
 [[package]]
 name = "rpi-web"
-version = "0.1.97"
+version = "0.1.98"
 dependencies = [
  "axum",
  "rpi-extcore",

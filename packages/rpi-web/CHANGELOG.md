@@ -2,6 +2,12 @@
 
 ## [Unreleased]
 
+## [0.1.98](https://github.com/pi-rust/rpi-extension/compare/rpi-web-v0.1.97...rpi-web-v0.1.98) - 2026-11-28
+
+### Fixed
+
+- *(web)* probe for `rpi updates` before spending a model turn ([#127](https://github.com/pi-rust/rpi-extension/pull/127))
+
 ## [0.1.97](https://github.com/pi-rust/rpi-extension/compare/rpi-web-v0.1.96...rpi-web-v0.1.97) - 2026-11-27
 
 ### Added
