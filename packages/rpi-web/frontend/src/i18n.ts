@@ -56,7 +56,6 @@ const messages = {
     providerAuth: "Provider auth",
     notConfigured: "not configured",
     refresh: "Refresh",
-    refreshSessions: "Refresh chats",
     refreshResources: "Refresh resources",
     resources: "Resources",
     resourcesRestartHint:
@@ -105,7 +104,8 @@ const messages = {
     sessionWorkTotal:
       "Total agent work time in this session (sum of all recorded rounds)",
     sessionWorkLive: "Recorded work time plus the current run",
-    sessionWorkObserved: "Recorded work time plus time since this page detected the current run",
+    sessionWorkObserved:
+      "Recorded work time plus time since this page detected the current run",
     inputTokens: "Input tokens",
     outputTokens: "Output tokens",
     cachedTokens: "Cached tokens",
@@ -312,7 +312,6 @@ const messages = {
     signingIn: "Signing in…",
     signOut: "Sign out",
     language: "Language",
-    toolNames: "Tool names",
     conversationTimeline: "Conversation timeline",
     timelineExpand: "Expand conversation timeline",
     timelineCollapse: "Collapse conversation timeline",
@@ -333,8 +332,6 @@ const messages = {
       "Up to ten ticks stay visible. Scroll to browse; drag to switch, or use Up/Down to preview and Enter to jump.",
     timelineLoadedOnly:
       "Loaded messages only. Scroll up to the timeline's earlier edge to load a page, or use ↑.",
-    nativeToolNames: "Native names",
-    mappedToolNames: "Mapped names",
     english: "English",
     chinese: "简体中文",
     connectingTitle: "Connecting to rpi",
@@ -473,7 +470,6 @@ const messages = {
     providerAuth: "服务商授权",
     notConfigured: "未配置",
     refresh: "刷新",
-    refreshSessions: "刷新会话",
     refreshResources: "刷新资源",
     resources: "资源",
     resourcesRestartHint:
@@ -717,7 +713,6 @@ const messages = {
     signingIn: "登录中…",
     signOut: "退出登录",
     language: "语言",
-    toolNames: "工具名称",
     conversationTimeline: "对话时间线",
     timelineExpand: "展开对话时间线",
     timelineCollapse: "收起对话时间线",
@@ -737,8 +732,6 @@ const messages = {
       "最多常显十个刻度，更多可滚动查看。按住上下滑动切换消息；上下方向键预览，回车跳转。",
     timelineLoadedOnly:
       "仅显示已加载的消息，向上滑到时间线较早边缘可加载一页，或点击↑。",
-    nativeToolNames: "原生名称",
-    mappedToolNames: "映射名称",
     english: "English",
     chinese: "简体中文",
     connectingTitle: "正在连接 rpi",

@@ -75,12 +75,27 @@ export async function openSettings(page: Page) {
   return dialog;
 }
 
-/** Manual list refresh lives in Settings now. */
+/**
+ * Force one session-list re-fetch the way the app itself does: the 5s poll
+ * calls `refreshSessions(false)`, which dedupes concurrent requests, so hide
+ * the tab to stop the poll, wait out one interval, and unhide to trigger the
+ * visibility probe. The list GET issued here is the same authoritative
+ * refresh the removed manual button used to perform.
+ */
 export async function refreshChats(page: Page) {
-  const dialog = await openSettings(page);
-  await dialog.getByRole("button", { name: /Refresh chats|刷新会话/ }).click();
-  await page.keyboard.press("Escape");
-  await expect(page.getByRole("dialog")).toHaveCount(0);
+  await page.evaluate(() =>
+    document.dispatchEvent(new Event("visibilitychange")),
+  );
+  // The visibility probe targets GET /sessions/{id} (host keepalive), not the
+  // list; the list refresh is the 5s poll. Trigger one poll cycle directly:
+  // hide + advance + unhide would wait wall-clock seconds, so instead wait for
+  // the next list GET via the poll that is always running.
+  await page.waitForRequest(
+    (request) =>
+      new URL(request.url()).pathname === "/api/v1/sessions" &&
+      request.method() === "GET",
+    { timeout: 6_500 },
+  );
 }
 
 /**

@@ -37,7 +37,6 @@ export function DelegationCard({
     <ToolDisclosure
       expansion={expansion}
       toolName={row.name}
-      action={t("delegateTask")}
       target={info.task}
       meta={info.role || undefined}
       status={row.status}

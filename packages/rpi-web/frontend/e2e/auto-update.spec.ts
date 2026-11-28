@@ -146,9 +146,6 @@ test("automatic update settings are available from the sidebar", async ({
   const dialog = await openSettings(page);
   const section = dialog.locator(".auto-update-settings");
   await expect(
-    section.getByText("Automatic updates", { exact: true }),
-  ).toBeVisible();
-  await expect(
     section.getByLabel("Check for new versions on open"),
   ).not.toBeChecked();
 
@@ -156,13 +153,17 @@ test("automatic update settings are available from the sidebar", async ({
   await section.getByLabel("Check for new versions on open").check();
   await expect.poll(() => checks).toBeGreaterThan(0);
   await expect(page.locator(".update-badge")).toBeVisible();
+  // Row layout: both targets share one status card, buttons are just "Update".
   await expect(
-    section.getByRole("button", { name: "Update host" }),
+    section.getByRole("button", { name: "Update", exact: true }).first(),
   ).toBeEnabled();
   await expect(
-    section.getByRole("button", { name: "Update extension" }),
-  ).toBeEnabled();
+    section.getByRole("button", { name: "Update", exact: true }),
+  ).toHaveCount(2);
   await expect(section.getByText("v0.30.0")).toBeVisible();
+  // Proxy and manual check live under the collapsed advanced disclosure;
+  // open it before touching the proxy input.
+  await section.getByText("Check proxy and manual check").click();
   await expect(section.getByLabel("Proxy URL (optional)")).toHaveValue(
     "http://127.0.0.1:7890",
   );
@@ -173,7 +174,10 @@ test("automatic update settings are available from the sidebar", async ({
   await section.getByRole("button", { name: "Save proxy" }).click();
   expect(savedProxy).toBe("http://127.0.0.1:10809");
 
-  await section.getByRole("button", { name: "Update host" }).click();
+  await section
+    .getByRole("button", { name: "Update", exact: true })
+    .first()
+    .click();
   await expect(section.locator(".update-task span")).toHaveText(
     "Update succeeded",
   );
