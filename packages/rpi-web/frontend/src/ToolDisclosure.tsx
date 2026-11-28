@@ -1,10 +1,4 @@
-import {
-  createContext,
-  useContext,
-  useEffect,
-  useState,
-  type ReactNode,
-} from "react";
+import { useEffect, useState, type ReactNode } from "react";
 import {
   BookOpen,
   Check,
@@ -23,10 +17,6 @@ import {
 } from "lucide-react";
 import { translate, type Language } from "./i18n";
 import { isShellTool, type ToolStatus } from "./transcript";
-
-export type ToolNameMode = "native" | "mapped";
-export const TOOL_NAME_MODE_KEY = "rpi-web-tool-name-mode";
-export const ToolNameModeContext = createContext<ToolNameMode>("native");
 
 function iconForTool(name: string) {
   const tool = name
@@ -81,7 +71,6 @@ export type ToolExpansion = ReturnType<typeof useToolExpansion>;
 export function ToolDisclosure({
   expansion,
   toolName,
-  action,
   target,
   status,
   doneLabel,
@@ -95,7 +84,6 @@ export function ToolDisclosure({
 }: {
   expansion: ToolExpansion;
   toolName: string;
-  action: string;
   target?: string;
   status: ToolStatus;
   doneLabel?: string;
@@ -108,8 +96,7 @@ export function ToolDisclosure({
   children: ReactNode;
 }) {
   const { open, setOpen } = expansion;
-  const nameMode = useContext(ToolNameModeContext);
-  const displayName = skillName ?? (nameMode === "native" ? toolName : action);
+  const displayName = skillName ?? toolName;
   const Icon = skillName ? BookOpen : iconForTool(toolName);
   const label =
     status === "done" && doneLabel

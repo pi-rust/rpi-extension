@@ -31,7 +31,6 @@ export function AskCard({
     <ToolDisclosure
       expansion={expansion}
       toolName={row.name}
-      action={t("askUser")}
       target={info.questions.map((question) => question.question).join(" · ")}
       status={row.status}
       language={language}

@@ -152,12 +152,9 @@ import { traceView } from "./executionTrace";
 import { AttachmentCard, UserMessageBody } from "./AttachmentCard";
 import {
   ToolDisclosure,
-  TOOL_NAME_MODE_KEY,
-  ToolNameModeContext,
   toolSummary,
   useToolExpansion,
   type ToolExpansion,
-  type ToolNameMode,
 } from "./ToolDisclosure";
 import {
   ConfirmDialog,
@@ -975,15 +972,6 @@ export default function App() {
   );
   const install = useInstallApp();
   const [installHint, setInstallHint] = useState(false);
-  const [toolNameMode, setToolNameMode] = useState<ToolNameMode>(() => {
-    try {
-      return localStorage.getItem(TOOL_NAME_MODE_KEY) === "mapped"
-        ? "mapped"
-        : "native";
-    } catch {
-      return "native";
-    }
-  });
   const [mobileSessionPicker, setMobileSessionPicker] = useState(false);
   const [mobileSessionQuery, setMobileSessionQuery] = useState("");
   const [creatingSession, setCreatingSession] = useState(false);
@@ -2217,14 +2205,21 @@ export default function App() {
     readyConnection.navigation === navigationRevision.current &&
     readyConnection.revision === connectionRevision &&
     !readyConnection.requests.signal.aborted &&
-    !loadingSession && !connectionFailed && !visiblePreview &&
-    status !== "closed" && status !== "error";
+    !loadingSession &&
+    !connectionFailed &&
+    !visiblePreview &&
+    status !== "closed" &&
+    status !== "error";
   // Queue operations can await an acknowledgement before sending another command.
   // Check the current connection again at that boundary.
   function canWriteSession() {
-    return liveReady && liveConnection.current === readyConnection &&
+    return (
+      liveReady &&
+      liveConnection.current === readyConnection &&
       readyConnection.navigation === navigationRevision.current &&
-      !readyConnection.requests.signal.aborted && !hostClosedRef.current;
+      !readyConnection.requests.signal.aborted &&
+      !hostClosedRef.current
+    );
   }
   const composerAbort = busy && canStopRun && liveReady;
   // While a run is active the main button is Stop for an empty composer and
@@ -2985,13 +2980,6 @@ export default function App() {
   );
 
   useEffect(() => {
-    try {
-      localStorage.setItem(TOOL_NAME_MODE_KEY, toolNameMode);
-    } catch {
-      /* optional display preference */
-    }
-  }, [toolNameMode]);
-  useEffect(() => {
     writeSessionAutoArchivePreference(autoArchive);
   }, [autoArchive]);
   useEffect(() => {
@@ -3398,7 +3386,9 @@ export default function App() {
       }
     };
 
-    const replaySnapshot = (snapshot: Awaited<ReturnType<typeof snapshotOf>>) => {
+    const replaySnapshot = (
+      snapshot: Awaited<ReturnType<typeof snapshotOf>>,
+    ) => {
       // History can see a committed entry before its final event reaches SSE.
       // Use native entry IDs across replay and the subsequent live stream.
       const committed = new Set<string>();
@@ -3407,7 +3397,10 @@ export default function App() {
         if (typeof entryId === "string" && entryId) committed.add(entryId);
       }
       snapshotMessageIds.current = committed;
-      for (const entry of eventsAfterSnapshot(snapshot.messages, snapshot.events))
+      for (const entry of eventsAfterSnapshot(
+        snapshot.messages,
+        snapshot.events,
+      ))
         applyEvent(entry.event, entry.seq);
       lastSeq.current = snapshot.lastSeq;
     };
@@ -3576,12 +3569,16 @@ export default function App() {
       !rowsBySession.current.get(sessionId)?.length &&
       (knownStatus === "offline" || knownStatus === "closed")
     ) {
-      void api.sessionPreview(sessionId, previewRequest.signal)
+      void api
+        .sessionPreview(sessionId, previewRequest.signal)
         .then((preview) => {
           if (
-            !isCurrent() || previewRequest.signal.aborted ||
-            preview?.sessionId !== sessionId || !Array.isArray(preview.messages)
-          ) return;
+            !isCurrent() ||
+            previewRequest.signal.aborted ||
+            preview?.sessionId !== sessionId ||
+            !Array.isArray(preview.messages)
+          )
+            return;
           const restored = rowsFromMessages(preview.messages);
           if (restored.length)
             setPreviewRows({ sessionId, navigation, rows: restored });
@@ -3681,7 +3678,12 @@ export default function App() {
       previewRequest.abort();
       setPreviewRows(null);
       connect(after);
-      liveConnection.current = { sessionId, navigation, revision: connectionRevision, requests };
+      liveConnection.current = {
+        sessionId,
+        navigation,
+        revision: connectionRevision,
+        requests,
+      };
       setLoadingSession(false);
 
       // Snapshot + replay own lifecycle status. Metadata never delays first
@@ -3864,9 +3866,7 @@ export default function App() {
           if (runActive) {
             const timestamp = value.openOperations?.find((record) => {
               const intent = record.intent as
-                | { kind?: unknown }
-                | null
-                | undefined;
+                { kind?: unknown } | null | undefined;
               return record.lane === "main" && intent?.kind === "run";
             })?.timestamp;
             if (
@@ -4886,7 +4886,11 @@ export default function App() {
   }
 
   async function queuePrompt() {
-    if (!canWriteSession() || !queueDraft.trim() || !supported.has("queue_message"))
+    if (
+      !canWriteSession() ||
+      !queueDraft.trim() ||
+      !supported.has("queue_message")
+    )
       return;
     if (queueSubmission.current.has(sessionId)) return;
     const message = queueDraft.trim();
@@ -5872,7 +5876,8 @@ export default function App() {
                         aria-label={`${t("sendNow")}: ${item.text}`}
                         onClick={() => void sendQueuedNow(item.entryId)}
                         disabled={
-                          !liveReady || queueRunning ||
+                          !liveReady ||
+                          queueRunning ||
                           (sendNowPending?.entryId === item.entryId &&
                             sendNowPending?.sessionId === sessionId) ||
                           (sendNowSent?.entryId === item.entryId &&
@@ -6329,171 +6334,158 @@ export default function App() {
                 { value: "en", label: "English" },
               ]}
             />
-            <label>{t("toolNames")}</label>
-            <div
-              className="project-mode"
-              role="group"
-              aria-label={t("toolNames")}
-            >
-              <button
-                type="button"
-                aria-pressed={toolNameMode === "native"}
-                onClick={() => setToolNameMode("native")}
-              >
-                {t("nativeToolNames")}
-              </button>
-              <button
-                type="button"
-                aria-pressed={toolNameMode === "mapped"}
-                onClick={() => setToolNameMode("mapped")}
-              >
-                {t("mappedToolNames")}
-              </button>
-            </div>
             <div className="auto-update-settings">
-              <label htmlFor="settings-auto-update-enabled">
-                {language === "zh" ? "自动更新" : "Automatic updates"}
-              </label>
-              <label
-                className="settings-toggle"
-                htmlFor="settings-auto-update-enabled"
-              >
-                <input
-                  id="settings-auto-update-enabled"
-                  type="checkbox"
-                  checked={autoUpdate.enabled}
-                  onChange={(event) => {
-                    const next = { enabled: event.target.checked };
-                    setAutoUpdate(next);
-                    writeAutoUpdatePreference(next);
-                    if (next.enabled) void checkUpdates();
-                  }}
-                />
-                {language === "zh"
-                  ? "打开网页时检查新版本"
-                  : "Check for new versions on open"}
-              </label>
-              <p className="form-hint">
-                {language === "zh"
-                  ? "仅检查并提示，不会自动安装；安装后需重启 rpi 宿主生效。开启后每次打开页面会调用一次原生 rpi 检查更新。"
-                  : "Checks and notifies only; updates are installed manually and require restarting the rpi host. When enabled, each page open runs one native rpi check."}
-              </p>
+              <div className="settings-row">
+                <div className="settings-row-label">
+                  <label htmlFor="settings-auto-update-enabled">
+                    {language === "zh"
+                      ? "打开页面时检查新版本"
+                      : "Check for new versions on open"}
+                  </label>
+                  <span className="settings-row-hint">
+                    {language === "zh"
+                      ? "仅提示，不自动安装；安装后重启 rpi 宿主生效"
+                      : "Notifies only; restart the rpi host after installing"}
+                  </span>
+                </div>
+                <label className="settings-switch">
+                  <input
+                    id="settings-auto-update-enabled"
+                    type="checkbox"
+                    checked={autoUpdate.enabled}
+                    onChange={(event) => {
+                      const next = { enabled: event.target.checked };
+                      setAutoUpdate(next);
+                      writeAutoUpdatePreference(next);
+                      if (next.enabled) void checkUpdates();
+                    }}
+                  />
+                </label>
+              </div>
               <div className="update-targets">
                 <div className="update-target">
-                  <strong>{language === "zh" ? "宿主 rpi" : "rpi host"}</strong>
-                  <span>
-                    {language === "zh" ? "当前" : "Current"}: v
-                    {updateInfo?.host?.current ?? "—"}
-                    {updateInfo?.host?.latest
-                      ? ` · ${language === "zh" ? "最新" : "latest"}: v${updateInfo.host.latest}`
-                      : ""}
-                  </span>
+                  <div className="update-target-info">
+                    <strong>
+                      {language === "zh" ? "宿主 rpi" : "rpi host"}
+                    </strong>
+                    <span>
+                      {language === "zh" ? "当前" : "Current"}: v
+                      {updateInfo?.host?.current ?? "—"}
+                      {updateInfo?.host?.latest
+                        ? ` · ${language === "zh" ? "最新" : "latest"}: v${updateInfo.host.latest}`
+                        : ""}
+                    </span>
+                  </div>
                   <button
                     type="button"
-                    className="settings-refresh"
                     disabled={!updateInfo?.host?.updatable || updateRunning}
                     onClick={() => void startUpdate("host")}
                   >
-                    {language === "zh" ? "更新宿主" : "Update host"}
+                    {language === "zh" ? "更新" : "Update"}
                   </button>
                 </div>
                 <div className="update-target">
-                  <strong>rpi-web</strong>
-                  <span>
-                    {language === "zh" ? "当前" : "Current"}: v
-                    {webExtensionUpdate?.current ?? "—"}
-                    {webExtensionUpdate?.latest
-                      ? ` · ${language === "zh" ? "最新" : "latest"}: v${webExtensionUpdate.latest}`
-                      : ""}
-                    {webExtensionUpdate?.reason === "local-install"
-                      ? ` · ${language === "zh" ? "本地安装，不适用" : "local install"}`
-                      : ""}
-                  </span>
+                  <div className="update-target-info">
+                    <strong>rpi-web</strong>
+                    <span>
+                      {language === "zh" ? "当前" : "Current"}: v
+                      {webExtensionUpdate?.current ?? "—"}
+                      {webExtensionUpdate?.latest
+                        ? ` · ${language === "zh" ? "最新" : "latest"}: v${webExtensionUpdate.latest}`
+                        : ""}
+                      {webExtensionUpdate?.reason === "local-install"
+                        ? ` · ${language === "zh" ? "本地安装，不适用" : "local install"}`
+                        : ""}
+                    </span>
+                  </div>
                   <button
                     type="button"
-                    className="settings-refresh"
                     disabled={!webExtensionUpdate?.updatable || updateRunning}
                     onClick={() => void startUpdate("extension")}
                   >
-                    {language === "zh" ? "更新扩展" : "Update extension"}
+                    {language === "zh" ? "更新" : "Update"}
                   </button>
                 </div>
               </div>
-              <div className="update-proxy">
-                <label htmlFor="settings-update-proxy">
+              <details className="update-advanced">
+                <summary>
                   {language === "zh"
-                    ? "代理地址（可选）"
-                    : "Proxy URL (optional)"}
-                </label>
-                <input
-                  id="settings-update-proxy"
-                  className="settings-text"
-                  type="url"
-                  placeholder="http://127.0.0.1:7890"
-                  value={proxyDraft}
-                  onChange={(event) => setProxyDraft(event.target.value)}
-                />
-                <p className="form-hint">
-                  {language === "zh"
-                    ? "填写本地代理监听地址，不是订阅链接。仅支持 http:// 或 https://。"
-                    : "Enter a local proxy listener URL, not a subscription link. Only http:// and https:// are supported."}
-                </p>
-                <div className="update-proxy-actions">
-                  <button
-                    type="button"
-                    className="settings-refresh"
-                    disabled={proxyBusy}
-                    onClick={() => void saveProxy()}
-                  >
-                    {language === "zh" ? "保存代理" : "Save proxy"}
-                  </button>
-                  <button
-                    type="button"
-                    className="settings-refresh"
-                    disabled={proxyBusy}
-                    onClick={() => {
-                      // A rejected clear must report, and the draft only
-                      // changes once the server accepted it.
-                      setUpdateError("");
-                      void api
-                        .saveUpdatesProxy("")
-                        .then((result) => {
-                          setProxyDraft("");
-                          setUpdateInfo((previous) =>
-                            previous
-                              ? {
-                                  ...previous,
-                                  proxy: result.proxy,
-                                  proxyConfigured: result.proxyConfigured,
-                                }
-                              : previous,
+                    ? "检查代理与手动检查"
+                    : "Check proxy and manual check"}
+                </summary>
+                <div className="update-proxy">
+                  <label htmlFor="settings-update-proxy">
+                    {language === "zh"
+                      ? "代理地址（可选）"
+                      : "Proxy URL (optional)"}
+                  </label>
+                  <input
+                    id="settings-update-proxy"
+                    className="settings-text"
+                    type="url"
+                    placeholder="http://127.0.0.1:7890"
+                    value={proxyDraft}
+                    onChange={(event) => setProxyDraft(event.target.value)}
+                  />
+                  <p className="form-hint">
+                    {language === "zh"
+                      ? "填写本地代理监听地址，不是订阅链接。仅支持 http:// 或 https://。"
+                      : "Enter a local proxy listener URL, not a subscription link. Only http:// and https:// are supported."}
+                  </p>
+                  <div className="update-proxy-actions">
+                    <button
+                      type="button"
+                      disabled={proxyBusy}
+                      onClick={() => void saveProxy()}
+                    >
+                      {language === "zh" ? "保存代理" : "Save proxy"}
+                    </button>
+                    <button
+                      type="button"
+                      disabled={proxyBusy}
+                      onClick={() => {
+                        // A rejected clear must report, and the draft only
+                        // changes once the server accepted it.
+                        setUpdateError("");
+                        void api
+                          .saveUpdatesProxy("")
+                          .then((result) => {
+                            setProxyDraft("");
+                            setUpdateInfo((previous) =>
+                              previous
+                                ? {
+                                    ...previous,
+                                    proxy: result.proxy,
+                                    proxyConfigured: result.proxyConfigured,
+                                  }
+                                : previous,
+                            );
+                          })
+                          .catch((cause: unknown) =>
+                            setUpdateError(
+                              cause instanceof Error
+                                ? cause.message
+                                : String(cause),
+                            ),
                           );
-                        })
-                        .catch((cause: unknown) =>
-                          setUpdateError(
-                            cause instanceof Error
-                              ? cause.message
-                              : String(cause),
-                          ),
-                        );
-                    }}
-                  >
-                    {language === "zh" ? "清除" : "Clear"}
-                  </button>
-                  <button
-                    type="button"
-                    className="settings-refresh"
-                    disabled={updateBusy}
-                    onClick={() => void checkUpdates(true)}
-                  >
-                    <RefreshCw
-                      size={14}
-                      className={updateBusy ? "spin" : undefined}
-                    />
-                    {language === "zh" ? "立即检查" : "Check now"}
-                  </button>
+                      }}
+                    >
+                      {language === "zh" ? "清除" : "Clear"}
+                    </button>
+                    <button
+                      type="button"
+                      disabled={updateBusy}
+                      onClick={() => void checkUpdates(true)}
+                    >
+                      <RefreshCw
+                        size={14}
+                        className={updateBusy ? "spin" : undefined}
+                      />
+                      {language === "zh" ? "立即检查" : "Check now"}
+                    </button>
+                  </div>
                 </div>
-              </div>
+              </details>
               {updateTask && (
                 <div className="update-task" role="status">
                   <strong>
@@ -6538,70 +6530,71 @@ export default function App() {
               )}
             </div>
             <div className="auto-archive-settings">
-              <label htmlFor="settings-auto-archive-days">
-                {language === "zh" ? "自动会话归档" : "Auto-archive sessions"}
-              </label>
-              <label
-                className="settings-toggle"
-                htmlFor="settings-auto-archive-enabled"
+              <div className="settings-row">
+                <div className="settings-row-label">
+                  <label htmlFor="settings-auto-archive-enabled">
+                    {language === "zh"
+                      ? "自动归档闲置会话"
+                      : "Auto-archive idle sessions"}
+                  </label>
+                  <span className="settings-row-hint">
+                    {language === "zh"
+                      ? `无交互超过设定天数后，下次打开页面时归档（${MIN_SESSION_AUTO_ARCHIVE_DAYS}-${MAX_SESSION_AUTO_ARCHIVE_DAYS} 天）`
+                      : `Archives sessions idle for the set days on next page open (${MIN_SESSION_AUTO_ARCHIVE_DAYS}-${MAX_SESSION_AUTO_ARCHIVE_DAYS} days)`}
+                  </span>
+                </div>
+                <label className="settings-switch">
+                  <input
+                    id="settings-auto-archive-enabled"
+                    type="checkbox"
+                    checked={autoArchive.enabled}
+                    onChange={(event) =>
+                      setAutoArchive((previous) => ({
+                        ...previous,
+                        enabled: event.target.checked,
+                      }))
+                    }
+                  />
+                </label>
+              </div>
+              <div
+                className={
+                  "settings-row settings-row-days" +
+                  (autoArchive.enabled ? "" : " settings-row-disabled")
+                }
               >
+                <div className="settings-row-label">
+                  <label htmlFor="settings-auto-archive-days">
+                    {language === "zh"
+                      ? "闲置天数"
+                      : "Days without interaction"}
+                  </label>
+                </div>
                 <input
-                  id="settings-auto-archive-enabled"
-                  type="checkbox"
-                  checked={autoArchive.enabled}
+                  id="settings-auto-archive-days"
+                  className="settings-number"
+                  type="number"
+                  min={MIN_SESSION_AUTO_ARCHIVE_DAYS}
+                  max={MAX_SESSION_AUTO_ARCHIVE_DAYS}
+                  step={1}
+                  value={autoArchive.days}
+                  disabled={!autoArchive.enabled}
                   onChange={(event) =>
                     setAutoArchive((previous) => ({
                       ...previous,
-                      enabled: event.target.checked,
+                      days: Number(event.target.value),
                     }))
                   }
+                  onBlur={(event) => {
+                    const days = normalizeSessionAutoArchiveDays(
+                      event.target.value,
+                    );
+                    event.target.value = String(days);
+                    setAutoArchive((previous) => ({ ...previous, days }));
+                  }}
                 />
-                {language === "zh" ? "开启" : "Enabled"}
-              </label>
-              <label
-                className="settings-number-label"
-                htmlFor="settings-auto-archive-days"
-              >
-                {language === "zh"
-                  ? "未发生交互天数"
-                  : "Days without interaction"}
-              </label>
-              <input
-                id="settings-auto-archive-days"
-                className="settings-number"
-                type="number"
-                min={MIN_SESSION_AUTO_ARCHIVE_DAYS}
-                max={MAX_SESSION_AUTO_ARCHIVE_DAYS}
-                step={1}
-                value={autoArchive.days}
-                disabled={!autoArchive.enabled}
-                onChange={(event) =>
-                  setAutoArchive((previous) => ({
-                    ...previous,
-                    days: Number(event.target.value),
-                  }))
-                }
-                onBlur={(event) => {
-                  const days = normalizeSessionAutoArchiveDays(
-                    event.target.value,
-                  );
-                  event.target.value = String(days);
-                  setAutoArchive((previous) => ({ ...previous, days }));
-                }}
-              />
-              <p className="form-hint">
-                {language === "zh"
-                  ? `从会话最后一轮回复完成时间起，${MIN_SESSION_AUTO_ARCHIVE_DAYS}-${MAX_SESSION_AUTO_ARCHIVE_DAYS} 日内未发生任何交互，则在下一次打开页面时归档。`
-                  : `Sessions with no interaction for ${MIN_SESSION_AUTO_ARCHIVE_DAYS}-${MAX_SESSION_AUTO_ARCHIVE_DAYS} days after their last completed turn are archived the next time this page opens.`}
-              </p>
+              </div>
             </div>
-            <button
-              type="button"
-              className="settings-refresh"
-              onClick={() => void refreshSessions()}
-            >
-              <RefreshCw size={14} /> {t("refreshSessions")}
-            </button>
             {authRequired && (
               <button
                 type="button"
@@ -7357,69 +7350,69 @@ export default function App() {
                     )}
 
                   <ProjectImageContext.Provider value={project}>
-                    <ToolNameModeContext.Provider value={toolNameMode}>
-                      <ToolProgramProvider
-                        key={`${traceBinding}:${historical.active}:${historical.target?.entryId ?? ""}:${historical.page?.firstId ?? ""}`}
-                        sessionId={sessionId}
-                        enabled={!loadingSession && !connectionFailed}
-                      >
-                        {displayedRows.map((row) => {
-                          // A historical window may begin mid-run, without all run
-                          // boundaries. Keep every update visible instead of folding
-                          // separate executions into an apparently current todo card.
-                          const group = historical.active
-                            ? undefined
-                            : todoGroups.get(row.id);
-                          return (
-                            <div
-                              className="transcript-row"
-                              data-transcript-row={row.id}
-                              key={row.id}
-                            >
-                              {group !== null && (
-                                <RowView
-                                  row={group?.latest ?? row}
-                                  todoHistory={group?.previous}
+                    <ToolProgramProvider
+                      key={`${traceBinding}:${historical.active}:${historical.target?.entryId ?? ""}:${historical.page?.firstId ?? ""}`}
+                      sessionId={sessionId}
+                      enabled={!loadingSession && !connectionFailed}
+                    >
+                      {displayedRows.map((row) => {
+                        // A historical window may begin mid-run, without all run
+                        // boundaries. Keep every update visible instead of folding
+                        // separate executions into an apparently current todo card.
+                        const group = historical.active
+                          ? undefined
+                          : todoGroups.get(row.id);
+                        return (
+                          <div
+                            className="transcript-row"
+                            data-transcript-row={row.id}
+                            key={row.id}
+                          >
+                            {group !== null && (
+                              <RowView
+                                row={group?.latest ?? row}
+                                todoHistory={group?.previous}
+                                language={language}
+                                onSpeak={speakMessage}
+                                readingRowId={readingRowId}
+                                onFork={
+                                  visiblePreview
+                                    ? undefined
+                                    : (entryId) => void forkCurrent(entryId)
+                                }
+                                forkPending={forkPending}
+                                assistantStreamRevision={
+                                  assistantStreamRevision
+                                }
+                                thinkingStreaming={
+                                  !historical.active &&
+                                  streamingAssistant.current !== null &&
+                                  row.id.startsWith(
+                                    `${streamingAssistant.current}:`,
+                                  )
+                                }
+                              />
+                            )}
+                            {group !== null &&
+                              row.kind === "tool" &&
+                              parentToolCallId(row) && (
+                                <ToolProgramChildren
+                                  rootCallId={parentToolCallId(row)!}
+                                  rootToolName={row.name}
                                   language={language}
-                                  onSpeak={speakMessage}
-                                  readingRowId={readingRowId}
-                                  onFork={
-                                    visiblePreview ? undefined : (entryId) => void forkCurrent(entryId)
-                                  }
-                                  forkPending={forkPending}
-                                  assistantStreamRevision={
-                                    assistantStreamRevision
-                                  }
-                                  thinkingStreaming={
-                                    !historical.active &&
-                                    streamingAssistant.current !== null &&
-                                    row.id.startsWith(
-                                      `${streamingAssistant.current}:`,
-                                    )
-                                  }
                                 />
                               )}
-                              {group !== null &&
-                                row.kind === "tool" &&
-                                parentToolCallId(row) && (
-                                  <ToolProgramChildren
-                                    rootCallId={parentToolCallId(row)!}
-                                    rootToolName={row.name}
-                                    language={language}
-                                  />
-                                )}
-                              {runFooters.get(row.id)?.map((timing) => (
-                                <RunElapsed
-                                  key={timing.runId}
-                                  timing={timing}
-                                  language={language}
-                                />
-                              ))}
-                            </div>
-                          );
-                        })}
-                      </ToolProgramProvider>
-                    </ToolNameModeContext.Provider>
+                            {runFooters.get(row.id)?.map((timing) => (
+                              <RunElapsed
+                                key={timing.runId}
+                                timing={timing}
+                                language={language}
+                              />
+                            ))}
+                          </div>
+                        );
+                      })}
+                    </ToolProgramProvider>
                   </ProjectImageContext.Provider>
 
                   {!historical.active && busy && rows.length > 0 && (
@@ -7562,7 +7555,8 @@ export default function App() {
                                     void sendQueuedNow(item.entryId)
                                   }
                                   disabled={
-                                    !liveReady || queueRunning ||
+                                    !liveReady ||
+                                    queueRunning ||
                                     (sendNowPending?.entryId === item.entryId &&
                                       sendNowPending?.sessionId ===
                                         sessionId) ||
@@ -7747,7 +7741,12 @@ export default function App() {
                       className="composer-attach"
                       aria-label={t("attachFiles")}
                       title={t("attachFiles")}
-                      disabled={Boolean(visiblePreview) || !sessionId || !projectId || uploading}
+                      disabled={
+                        Boolean(visiblePreview) ||
+                        !sessionId ||
+                        !projectId ||
+                        uploading
+                      }
                       onClick={() => fileInputRef.current?.click()}
                     >
                       {uploading ? (
@@ -8867,7 +8866,6 @@ function PlanCard({
       expansion={expansion}
       toolName={row.name}
       className="plan-card"
-      action={t("plan")}
       status={row.status}
       language={language}
       meta={plan.active ? t("planActive") : t("planDone")}
@@ -8913,7 +8911,6 @@ function TodoCard({
       expansion={expansion}
       toolName={row.name}
       className="todo-card"
-      action={t("todos")}
       status={row.status}
       doneLabel={t("todoCallDone")}
       language={language}
@@ -9125,11 +9122,6 @@ function ShellCard({
       className="shell-card"
       status={row.status}
       language={language}
-      action={t(
-        row.status === "running" || row.status === "pending"
-          ? "toolRunningCommand"
-          : "toolRan",
-      )}
       target={command || row.name}
       targetClassName="shell-command"
       timing={
