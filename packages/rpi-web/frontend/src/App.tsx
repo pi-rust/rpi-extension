@@ -8029,7 +8029,12 @@ function DialogOverlay({
     (ui.kind === "selector" || ui.kind === "input");
   const multiple = structured && !!ui.allowMultiple;
   const comment = structured && !!ui.allowComment;
+  const skip =
+    ui.purpose !== "permission" &&
+    ui.kind !== "selector" &&
+    ui.kind !== "input";
   const [selected, setSelected] = useState<number[]>([]);
+  const [manualAnswer, setManualAnswer] = useState(false);
   const optionValue = (index: number) =>
     options[index].value ??
     options[index].permission ??
@@ -8037,7 +8042,9 @@ function DialogOverlay({
     String(index);
   const freeform =
     Boolean(ui.allowFreeform ?? ui.freeform) || options.length === 0;
-  const canSubmit = selected.length > 0 || (freeform && !!answer.trim());
+  const manual = manualAnswer && !freeform;
+  const canSubmit =
+    selected.length > 0 || ((freeform || manual) && !!answer.trim());
   const submit = () => {
     if (!canSubmit || busy) return;
     onSubmit(
@@ -8058,7 +8065,7 @@ function DialogOverlay({
       <form
         className="dialog-card"
         role="dialog"
-        aria-modal="true"
+        aria-modal="false"
         aria-labelledby="native-dialog-title"
         onSubmit={(event) => {
           event.preventDefault();
@@ -8121,20 +8128,20 @@ function DialogOverlay({
             })}
           </div>
         )}
-        {(freeform || comment) && (
+        {(freeform || comment || manual) && (
           <>
             <label htmlFor="dialog-answer">{t("answer")}</label>
             <textarea
               id="dialog-answer"
               value={answer}
               onChange={(event) => onAnswer(event.target.value)}
-              autoFocus
+              autoFocus={!manual}
               rows={4}
               placeholder={ui.suggest}
             />
           </>
         )}
-        {(freeform || multiple || comment) && (
+        {(freeform || multiple || comment || manual) && (
           <div className="dialog-actions">
             <button type="button" onClick={onCancel} disabled={busy}>
               {t("cancel")}
@@ -8145,6 +8152,23 @@ function DialogOverlay({
               disabled={busy || !canSubmit}
             >
               {t("submit")}
+            </button>
+          </div>
+        )}
+        {skip && (
+          <div className="dialog-actions dialog-extra-actions">
+            <button
+              type="button"
+              onClick={() => {
+                setSelected([]);
+                setManualAnswer(true);
+              }}
+              disabled={busy}
+            >
+              {t("manualAnswer")}
+            </button>
+            <button type="button" onClick={onCancel} disabled={busy}>
+              {t("skipAnswer")}
             </button>
           </div>
         )}
