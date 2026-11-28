@@ -4319,8 +4319,8 @@ details[open] > summary:before {
   display: grid;
   place-items: center;
   padding: 20px;
-  background: rgba(20, 20, 26, 0.32);
-  backdrop-filter: blur(3px);
+  background: rgba(20, 20, 26, 0.18);
+  pointer-events: none;
 }
 .dialog-card {
   width: min(100%, 520px);
@@ -4332,6 +4332,7 @@ details[open] > summary:before {
   background: var(--surface);
   color: var(--text);
   box-shadow: 0 20px 70px rgba(0, 0, 0, 0.25);
+  pointer-events: auto;
 }
 .dialog-heading,
 .dialog-actions {
@@ -4370,6 +4371,13 @@ details[open] > summary:before {
   display: block;
   margin-top: 3px;
   color: var(--muted);
+}
+.dialog-extra-actions {
+  justify-content: stretch;
+}
+.dialog-extra-actions button {
+  flex: 1;
+  justify-content: center;
 }
 
 .tool-elapsed {
