@@ -157,8 +157,12 @@ impl Host {
         assert_eq!(handler(StablePluginEvent::empty(tag), cookie), 0);
     }
 
-    fn start(&self, name: &str, mut params: Value) -> Step {
-        params["__rpi"] = json!({"sessionId":"duplicate"});
+    fn start(&self, name: &str, params: Value) -> Step {
+        self.start_with_context(name, params, json!({"sessionId":"duplicate"}))
+    }
+
+    fn start_with_context(&self, name: &str, mut params: Value, context: Value) -> Step {
+        params["__rpi"] = context;
         let tool = self.callbacks.tools[name];
         let handle = (tool.0)(
             StbStringRef::from_str("test"),
@@ -310,4 +314,128 @@ fn duplicate_sessions_have_independent_tools_events_and_cleanup() {
     );
     // The initial counter call and the intervening echo each advanced the server.
     assert_eq!(counter(&b, path), (pid_b, count_b + 2));
+}
+
+#[test]
+fn implicit_config_compact_discovery_validation_and_policy_cross_plugin_abi() {
+    struct Workspace(PathBuf);
+    impl Drop for Workspace {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    let workspace =
+        Workspace(std::env::temp_dir().join(format!("mcp-discovery-{}", std::process::id())));
+    let project = workspace.0.join(".rpi");
+    std::fs::create_dir_all(&project).unwrap();
+    let log = workspace.0.join("requests.jsonl");
+    let denied_log = workspace.0.join("denied.jsonl");
+    let executable = env!("CARGO_BIN_EXE_fake_mcp_server");
+    std::fs::write(project.join("mcp.json"), json!({"mcpServers": {
+        "dbx": {
+            "command": executable,
+            "args": ["--discovery-catalog", format!("--ownership-log={}", log.display())],
+        },
+        "bad": {
+            "command": executable,
+            "args": ["--hang"],
+            "timeout": 1,
+        },
+        "guarded": {
+            "command": executable,
+            "args": ["--discovery-catalog", format!("--ownership-log={}", denied_log.display())],
+            "toolPolicy": {"readOnly":["dbx_*"],"deny":["dbx_execute_*"],"preset":"database"}
+        }
+    }}).to_string()).unwrap();
+
+    let host = Host::new(true);
+    let run = |name, params| {
+        host.start_with_context(
+            name,
+            params,
+            json!({"sessionId":"discovery","cwd":workspace.0}),
+        )
+        .result()
+    };
+    let listing = |params| {
+        let result = run("mcp_list", params).unwrap();
+        let text = result["content"][0]["text"].as_str().unwrap();
+        (text.len(), serde_json::from_str::<Value>(text).unwrap())
+    };
+    let (_, listed) = listing(json!({}));
+    assert_eq!(listed["servers"].as_array().unwrap().len(), 3);
+    assert!(!log.exists());
+    let error = run(
+        "mcp_call",
+        json!({"server":"guarded","tool":"dbx_execute_query"}),
+    )
+    .unwrap_err();
+    assert!(error.contains("denied by toolPolicy"), "{error}");
+    assert!(!denied_log.exists());
+
+    let result = run(
+        "mcp_call",
+        json!({"server":"dbx","tool":"dbx_list_connections"}),
+    )
+    .unwrap();
+    assert_eq!(result["content"][0]["text"], "[fixture-db]");
+    let (compact_bytes, compact) = listing(json!({"server":"dbx"}));
+    let (full_bytes, _) = listing(json!({"server":"dbx","detail":"full"}));
+    assert_eq!(compact["tools"].as_array().unwrap().len(), 23);
+    assert_eq!(compact["tools"][1]["required"], json!(["table"]));
+    assert!(
+        compact_bytes * 8 < full_bytes,
+        "{compact_bytes} vs {full_bytes}"
+    );
+    assert!(compact["tools"][1].get("inputSchema").is_none());
+
+    let (_, selected) = listing(json!({"server":"dbx","tools":["dbx_describe_table"]}));
+    assert_eq!(selected["tools"].as_array().unwrap().len(), 1);
+    let tool = &selected["tools"][0];
+    assert_eq!(
+        tool["inputSchema"]["properties"]["format"]["enum"],
+        json!(["brief", "full"])
+    );
+    assert!(tool["inputSchema"].get("$schema").is_none());
+    assert!(tool.to_string().len() <= 360);
+
+    let calls = || {
+        std::fs::read_to_string(&log)
+            .unwrap()
+            .matches("tools/call")
+            .count()
+    };
+    for (arguments, field) in [
+        (json!({"table_name":"inventory"}), "table"),
+        (json!({"table":false}), "table"),
+        (json!({"table":"inventory","format":"xml"}), "format"),
+        (json!({"table":"inventory","unknown":true}), "unknown"),
+    ] {
+        let error = run(
+            "mcp_call",
+            json!({"server":"dbx","tool":"dbx_describe_table","arguments":arguments}),
+        )
+        .unwrap_err();
+        let error: Value = serde_json::from_str(&error).unwrap();
+        assert_eq!(error["code"], "invalid_tool_arguments");
+        assert_eq!(error["field"], field);
+        assert_eq!(
+            error["signature"]["inputSchema"]["required"],
+            json!(["table"])
+        );
+        assert_eq!(calls(), 1);
+    }
+
+    let (_, probed) = listing(json!({"probe":true,"timeoutSeconds":2}));
+    let servers = probed["servers"].as_array().unwrap();
+    assert_eq!(servers[0]["server"], "bad");
+    assert_eq!(servers[0]["status"], "failed");
+    assert!(servers[0]["error"].as_str().unwrap().contains("timed out"));
+    assert!(servers[0]["stderr"]
+        .as_str()
+        .unwrap()
+        .contains("deliberately blocked"));
+    assert_eq!(servers[1]["toolCount"], 23);
+    assert_eq!(servers[1]["status"], "ready");
 }

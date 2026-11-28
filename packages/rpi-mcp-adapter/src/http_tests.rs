@@ -196,7 +196,7 @@ fn managed_flow(sse: bool) {
     let discovery = mcp_list(
         &runtime,
         &context,
-        &json!({"url":server.url}),
+        &json!({"url":server.url,"tools":["image"]}),
         &Control::default(),
     )
     .unwrap_or_else(|e| panic!("{e}; seen={:?}", server.seen.lock().unwrap()));
