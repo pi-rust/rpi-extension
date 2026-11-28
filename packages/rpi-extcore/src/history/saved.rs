@@ -7,7 +7,7 @@ use std::{
     path::{Path, PathBuf},
     time::{Duration, Instant},
 };
-fn locate(root: &Path, id: &str) -> ResourceResult<PathBuf> {
+pub(crate) fn locate(root: &Path, id: &str) -> ResourceResult<PathBuf> {
     let root = std::fs::canonicalize(root).map_err(ResourceError::unavailable)?;
     let deadline = Instant::now() + Duration::from_secs(2);
     let mut entries = 0usize;

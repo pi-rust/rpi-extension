@@ -132,6 +132,123 @@ async fn bounded<T>(future: impl std::future::Future<Output = T>) -> T {
         .expect("retirement deadline")
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn reopen_disconnected_local_host_requires_saved_history_and_native_writer_lease() {
+    use fs2::FileExt;
+    use tokio::{io::AsyncWriteExt, net::UnixListener};
+
+    async fn request(socket: &mut BufReader<tokio::net::UnixStream>) -> Value {
+        let mut line = String::new();
+        socket.read_line(&mut line).await.unwrap();
+        serde_json::from_str(&line).unwrap()
+    }
+
+    async fn ready(socket: &mut BufReader<tokio::net::UnixStream>, id: &str) {
+        let opened = json!({"type":"opened", "host_pid":std::process::id(),
+            "agent_id":uuid::Uuid::new_v4().to_string(), "session_id":id});
+        socket
+            .get_mut()
+            .write_all(
+                format!("{opened}\n{{\"type\":\"ready\",\"protocol\":\"rpi\"}}\n").as_bytes(),
+            )
+            .await
+            .unwrap();
+    }
+
+    let mut f = Fixture::new().await;
+    let socket_dir = tempfile::Builder::new().prefix("rh").tempdir().unwrap();
+    let socket_path = socket_dir.path().join("rpc.sock");
+    let listener = UnixListener::bind(&socket_path).unwrap();
+    Arc::get_mut(&mut f.service).unwrap().local_host_socket = Some(socket_path);
+    let id = f.id.clone();
+    let history = f.history();
+    let lock_path = history.with_extension("jsonl.lock");
+    let old_lease = std::fs::File::create(&lock_path).unwrap();
+    FileExt::try_lock_exclusive(&old_lease).unwrap();
+    let (disconnect, disconnecting) = tokio::sync::oneshot::channel();
+    let host = tokio::spawn(async move {
+        let mut old = BufReader::new(listener.accept().await.unwrap().0);
+        assert_eq!(request(&mut old).await["rpc"]["session_id"], id);
+        ready(&mut old, &id).await;
+        disconnecting.await.unwrap();
+        // An invalid UTF-8 frame ends the old Web read task without EOF.
+        old.get_mut().write_all(&[0xff, b'\n']).await.unwrap();
+        assert_eq!(old.read_line(&mut String::new()).await.unwrap(), 0);
+        drop(old);
+
+        let check_restore = |opening: Value| {
+            assert_eq!(opening["rpc"]["session"], json!(history));
+            assert!(opening["rpc"]["session_id"].is_null());
+        };
+        let mut busy = BufReader::new(listener.accept().await.unwrap().0);
+        check_restore(request(&mut busy).await);
+        let lease = std::fs::File::open(lock_path).unwrap();
+        assert!(FileExt::try_lock_exclusive(&lease).is_err());
+        busy.get_mut()
+            .write_all(b"{\"type\":\"error\",\"message\":\"writer lease is already held\"}\n")
+            .await
+            .unwrap();
+        drop(old_lease);
+        drop(busy);
+
+        let mut restored = BufReader::new(listener.accept().await.unwrap().0);
+        check_restore(request(&mut restored).await);
+        FileExt::try_lock_exclusive(&lease).unwrap();
+        ready(&mut restored, &id).await;
+        assert_eq!(restored.read_line(&mut String::new()).await.unwrap(), 0);
+        drop(lease);
+    });
+
+    assert_eq!(
+        bounded(open_session(&f.service, f.id.clone())).await.0,
+        ReplyKind::Success
+    );
+    let old = f.service.live_session(&f.id).await.unwrap();
+    disconnect.send(()).unwrap();
+    let mut closed = old.closed_receiver();
+    bounded(closed.wait_for(|closed| *closed)).await.unwrap();
+    assert!(bounded(old.await_resource_exit()).await.is_err());
+
+    let missing = bounded(open_session(&f.service, f.id.clone())).await;
+    assert_eq!(missing.0, ReplyKind::Conflict);
+    assert!(Arc::ptr_eq(
+        &old,
+        &f.service.live_session(&f.id).await.unwrap()
+    ));
+    f.native_files();
+
+    let busy = bounded(open_session(&f.service, f.id.clone())).await;
+    assert_eq!(busy.0, ReplyKind::HostUnavailable);
+    assert!(busy.1["error"]
+        .as_str()
+        .unwrap()
+        .contains("writer lease is already held"));
+    assert!(Arc::ptr_eq(
+        &old,
+        &f.service.live_session(&f.id).await.unwrap()
+    ));
+
+    let (first, second) = bounded(async {
+        tokio::join!(
+            open_session(&f.service, f.id.clone()),
+            open_session(&f.service, f.id.clone())
+        )
+    })
+    .await;
+    for (kind, body) in [first, second] {
+        assert_eq!(kind, ReplyKind::Success);
+        assert_eq!(body["sessionId"], f.id);
+        assert_eq!(body["status"], "ready");
+    }
+    assert!(!Arc::ptr_eq(
+        &old,
+        &f.service.live_session(&f.id).await.unwrap()
+    ));
+    f.finish().await;
+    bounded(host).await.unwrap();
+}
+
 #[tokio::test]
 async fn archive_idle_closes_preserves_history_and_restore_never_spawns() {
     let f = Fixture::new().await;

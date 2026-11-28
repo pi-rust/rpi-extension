@@ -24,7 +24,7 @@ mod retirement;
 #[path = "service_retirement_tests.rs"]
 mod service_retirement_tests;
 use crate::{
-    host::HostSession,
+    host::{ExitConfirmation, HostSession},
     projects::Projects,
     protocol::{self, ApiCommand},
     registry::{Registry, RegistryEntry},
@@ -764,7 +764,7 @@ async fn create_session_owned(
             return resources::reply_error(error);
         }
     }
-    match spawn_host(state, &id, &project, false).await {
+    match spawn_host(state, &id, &project, false, None).await {
         Ok((session, record)) => {
             let ready = session.ready();
             let snapshot = session.snapshot().await;
@@ -809,6 +809,7 @@ async fn spawn_host(
     id: &str,
     project: &Project,
     reopening: bool,
+    saved_session: Option<PathBuf>,
 ) -> Result<
     (
         Arc<HostSession>,
@@ -816,9 +817,10 @@ async fn spawn_host(
     ),
     String,
 > {
-    let options = resources::host_options(state, id, project)
+    let mut options = resources::host_options(state, id, project)
         .await
         .map_err(|e| e.to_string())?;
+    options.saved_session = saved_session;
     let session = state.start_native_session(options, None, reopening).await?;
     match resources::prepare_open_observation(state, id, &session).await {
         Ok(record) => Ok((session, record)),
@@ -1214,6 +1216,7 @@ async fn open_session_owned(state: &Service, id: String) -> (ReplyKind, Value) {
         }
     }
     let existing = state.sessions.read().await.get(&id).cloned();
+    let mut saved_session = None;
     if let Some(session) = existing {
         let snapshot = session.snapshot().await;
         if snapshot.status != "closed" {
@@ -1238,13 +1241,39 @@ async fn open_session_owned(state: &Service, id: String) -> (ReplyKind, Value) {
                 Err(error) => (ReplyKind::HostUnavailable, json!({"error":error})),
             };
         }
-        // The native child exited (crash, kill, or `stop`); drop the corpse so
-        // the branch can be reopened from its persisted session file.
-        if let Err(error) = session.await_resource_exit().await {
-            return resources::reply_error(error);
+        match session.await_exit_confirmation().await {
+            Ok(ExitConfirmation::Confirmed) => {
+                state.sessions.write().await.remove(&id);
+                state.session_activity.write().await.remove(&id);
+            }
+            Ok(ExitConfirmation::LocalSocketDisconnected) => {
+                // The lost transport can't attest to writer retirement. Open
+                // the existing file through native's exclusive writer lease;
+                // leave the old host registered until replacement succeeds.
+                let Some(root) = state.config.session_dir.clone() else {
+                    return (
+                        ReplyKind::HostUnavailable,
+                        json!({"error":"local Host session directory unavailable"}),
+                    );
+                };
+                let saved_id = id.clone();
+                match tokio::task::spawn_blocking(move || {
+                    crate::history::saved::locate(&root, &saved_id)
+                })
+                .await
+                {
+                    Ok(Ok(path)) => saved_session = Some(path),
+                    Ok(Err(error)) => return resources::reply_error(error),
+                    Err(_) => {
+                        return (
+                            ReplyKind::Unavailable,
+                            json!({"error":"saved location owner failed"}),
+                        )
+                    }
+                }
+            }
+            Err(error) => return resources::reply_error(error),
         }
-        state.sessions.write().await.remove(&id);
-        state.session_activity.write().await.remove(&id);
     }
     let known = state.registry.read().await.get(&id).cloned();
     let Some(mut entry) = known else {
@@ -1257,7 +1286,7 @@ async fn open_session_owned(state: &Service, id: String) -> (ReplyKind, Value) {
         Ok(project) => project,
         Err(error) => return (ReplyKind::InvalidInput, json!({"error":error})),
     };
-    match spawn_host(state, &id, &project, true).await {
+    match spawn_host(state, &id, &project, true, saved_session).await {
         Ok((session, record)) => {
             let snapshot = session.snapshot().await;
             // Configuration publication preserves the latest stored metadata,

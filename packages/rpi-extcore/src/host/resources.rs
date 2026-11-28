@@ -67,6 +67,11 @@ pub(crate) struct ResourceFence {
     _admission: tokio::sync::OwnedRwLockWriteGuard<()>,
     _run: tokio::sync::OwnedMutexGuard<()>,
 }
+pub(crate) enum ExitConfirmation {
+    Confirmed,
+    LocalSocketDisconnected,
+}
+
 impl HostSession {
     pub async fn resource_state(&self) -> ResourceResult<ResourceObservation> {
         if !self.supports_command("get_resource_state")
@@ -257,9 +262,20 @@ impl HostSession {
     pub(crate) fn retire_resources(&self, _fence: &ResourceFence) {
         self.retired.store(true, Ordering::Release);
     }
-    /// No abort/drop-as-exit inference. On timeout retain the owned worker and
-    /// permanent fence; never start a second transcript writer.
+    /// Operations that require an offline session must prove native retirement.
     pub(crate) async fn await_resource_exit(&self) -> ResourceResult<()> {
+        match self.await_exit_confirmation().await? {
+            ExitConfirmation::Confirmed => Ok(()),
+            ExitConfirmation::LocalSocketDisconnected => Err(ResourceError::unavailable(
+                "local Host session close not confirmed",
+            )),
+        }
+    }
+
+    /// Join the transport before classifying closure. A timeout retains the
+    /// worker and its launch lock. Socket read failure can end the worker
+    /// without proving native retirement.
+    pub(crate) async fn await_exit_confirmation(&self) -> ResourceResult<ExitConfirmation> {
         let _shutdown = self.shutdown_gate.lock().await;
         let _ = tokio::time::timeout(Duration::from_secs(1), self.stop()).await;
         let mut worker = self.worker.lock().await;
@@ -278,12 +294,11 @@ impl HostSession {
         // Socket EOF follows native writer retirement. An aborted reader
         // does not establish that the native session closed.
         if let Some(eof) = &self.socket_eof {
-            if eof.load(Ordering::Acquire) {
-                return Ok(());
-            }
-            return Err(ResourceError::unavailable(
-                "local Host session close not confirmed",
-            ));
+            return Ok(if eof.load(Ordering::Acquire) {
+                ExitConfirmation::Confirmed
+            } else {
+                ExitConfirmation::LocalSocketDisconnected
+            });
         }
         // An owned process needs independent OS-reap evidence.
         if let Some(child) = &self.child_owner {
@@ -297,6 +312,6 @@ impl HostSession {
                 "native child exit ownership unavailable",
             ));
         }
-        Ok(())
+        Ok(ExitConfirmation::Confirmed)
     }
 }
