@@ -197,7 +197,31 @@ fn main() {
             }
             "tools/list" => {
                 let echo = json!({"name":"echo","description":"Echo one value","inputSchema":{"type":"object","properties":{"value":{"type":"string"}}}});
-                if mode("--duplicate-tools") {
+                if mode("--discovery-catalog") {
+                    let tools: Vec<_> = ["dbx_list_connections", "dbx_describe_table"]
+                        .into_iter()
+                        .map(str::to_string)
+                        .chain((0..21).map(|i| format!("dbx_fixture_{i:02}")))
+                        .map(|name| {
+                            let mut schema = json!({
+                                "$schema":"https://json-schema.org/draft/2020-12/schema",
+                                "title":name,
+                                "type":"object",
+                                "additionalProperties":false,
+                                "properties": {},
+                            });
+                            if name == "dbx_describe_table" {
+                                schema["required"] = json!(["table"]);
+                                schema["properties"]["table"] = json!({"type":"string"});
+                                schema["properties"]["format"] =
+                                    json!({"type":"string","enum":["brief","full"]});
+                            }
+                            schema["description"] = json!("Schema details. ".repeat(42));
+                            json!({"name":name,"description":"Database tool","inputSchema":schema})
+                        })
+                        .collect();
+                    json!({"tools":tools})
+                } else if mode("--duplicate-tools") {
                     json!({"tools":[echo.clone(),echo]})
                 } else if mode("--invalid-schema") {
                     json!({"tools":[{"name":"echo","inputSchema":{"type":"array"}}]})
@@ -237,6 +261,9 @@ fn main() {
                 match request["params"]["name"].as_str().unwrap_or("") {
                     "typed_raw" if mode("--typed-raw") => {
                         json!({"isError":true,"content":[{"type":"text","text":"raw error","annotations":{"priority":0.5}}],"structuredContent":{"arguments":request["params"]["arguments"]},"opaqueMetadata":{"retained":true}})
+                    }
+                    "dbx_list_connections" if mode("--discovery-catalog") => {
+                        json!({"content":[{"type":"text","text":"[fixture-db]"}]})
                     }
                     "counter" => {
                         json!({"content":[{"type":"text","text":format!("{}:{calls}", std::process::id())}]})

@@ -348,6 +348,17 @@ impl McpRuntime {
     ) -> Result<Value, String> {
         self.state.call(context, params, control)
     }
+    /// Check arguments against the freshly discovered tool before sending tools/call.
+    /// The callback runs under the connection lock and must not re-enter the runtime.
+    pub fn call_checked(
+        &self,
+        context: &CoreRequestContext,
+        params: &Value,
+        control: &Control,
+        validate: impl FnOnce(&Tool, &Value) -> Result<(), String>,
+    ) -> Result<Value, String> {
+        self.state.call_checked(context, params, control, validate)
+    }
     pub fn list(
         &self,
         context: &CoreRequestContext,
@@ -663,11 +674,14 @@ impl State {
         if !matches!(action, "list" | "close") {
             return Err("mcp_list action must be list or close".into());
         }
-        if params.get("configPath").is_some() && params.get("server").is_none() {
+        if params.get("configPath").is_some()
+            && params.get("server").is_none()
+            && params.get("url").is_none()
+        {
             if action != "list" {
                 return Err("close requires a server or url".into());
             }
-            let (_, config) = self.load_config(context, params)?;
+            let (_, config) = self.load_config(context, params, None)?;
             let servers: Vec<Value> = config
                 .servers
                 .iter()
@@ -681,7 +695,7 @@ impl State {
                 .collect();
             return Ok(json!({"servers":servers}));
         }
-        let (key, name, config, timeout) = self.target(context, params)?;
+        let (key, name, config, timeout) = self.target(context, params, None)?;
         if action == "close" {
             self.close_key(&key)?;
             return Ok(json!({"server":name,"closed":true}));
@@ -707,6 +721,17 @@ impl State {
         params: &Value,
         control: &Control,
     ) -> Result<Value, String> {
+        self.call_checked(context, params, control, |_, _| Ok(()))
+    }
+
+    fn call_checked(
+        self: &Arc<Self>,
+        context: &CoreRequestContext,
+        params: &Value,
+        control: &Control,
+        validate: impl FnOnce(&Tool, &Value) -> Result<(), String>,
+    ) -> Result<Value, String> {
+        control.check()?;
         let tool = crate::kit::string_param(params, "tool")?;
         if tool.trim().is_empty() || tool.len() > 200 {
             return Err("MCP tool must contain 1-200 characters".into());
@@ -718,7 +743,7 @@ impl State {
         if !arguments.is_object() {
             return Err("MCP arguments must be an object".into());
         }
-        let (key, _, config, timeout) = self.target(context, params)?;
+        let (key, _, config, timeout) = self.target(context, params, Some(&tool))?;
         self.with_session(
             key,
             config,
@@ -727,9 +752,11 @@ impl State {
             None,
             |session, control, _| {
                 let tools = session.tools(control)?;
-                if !tools.iter().any(|t| t.name == tool) {
-                    return Err(format!("MCP server does not expose tool {tool:?}"));
-                }
+                let selected = tools
+                    .iter()
+                    .find(|candidate| candidate.name == tool)
+                    .ok_or_else(|| format!("MCP server does not expose tool {tool:?}"))?;
+                validate(selected, &arguments)?;
                 let request = tools_call_request(0, &tool, arguments);
                 response_result(session.request(
                     "tools/call",
@@ -744,20 +771,27 @@ impl State {
         self: &Arc<Self>,
         context: &CoreRequestContext,
         params: &Value,
+        tool: Option<&str>,
     ) -> Result<(String, String, McpServerConfig, u64), String> {
         let scope = context.scope.clone();
-        let (name, identity, mut config) = if params.get("configPath").is_some() {
+        let (name, identity, mut config, config_path) = if params.get("configPath").is_some() {
             if params.get("url").is_some() {
                 return Err("specify configPath/server or url, not both".into());
             }
             let name = crate::kit::string_param(params, "server")?;
-            let (path, config) = self.load_config(context, params)?;
+            let (path, config) =
+                self.load_config(context, params, tool.map(|tool| (name.as_str(), tool)))?;
             let server = config
                 .servers
                 .get(&name)
                 .ok_or_else(|| format!("MCP server {name:?} is not configured"))?
                 .clone();
-            (name, path.to_string_lossy().into_owned(), server)
+            (
+                name,
+                path.to_string_lossy().into_owned(),
+                server,
+                Some(path),
+            )
         } else {
             if params.get("server").is_some() {
                 return Err("server requires configPath".into());
@@ -771,7 +805,7 @@ impl State {
                 timeout: 60,
                 exposure: Default::default(),
             });
-            ("http".into(), url, config)
+            ("http".into(), url, config, None)
         };
         let key = serde_json::to_string(&(scope, identity, &name)).map_err(|e| e.to_string())?;
         let (enabled, default_timeout) = match &config {
@@ -786,9 +820,10 @@ impl State {
             // A configured cwd is relative to the config file; otherwise use host project cwd.
             if let Some(cwd) = &server.cwd {
                 if Path::new(cwd).is_relative() {
-                    let file = self.config_file(context, params)?;
                     server.cwd = Some(
-                        file.parent()
+                        config_path
+                            .as_deref()
+                            .and_then(Path::parent)
                             .unwrap_or(Path::new("."))
                             .join(cwd)
                             .to_string_lossy()
@@ -813,10 +848,15 @@ impl State {
         self: &Arc<Self>,
         context: &CoreRequestContext,
         params: &Value,
+        call: Option<(&str, &str)>,
     ) -> Result<(PathBuf, McpConfig), String> {
         let path = self.config_file(context, params)?;
         let text = std::fs::read_to_string(&path).map_err(|e| format!("read MCP config: {e}"))?;
-        Ok((path, McpConfig::parse(&text)?))
+        let config = McpConfig::parse(&text)?;
+        if let Some((server, tool)) = call {
+            crate::config::check_tool_policy(&text, server, tool)?;
+        }
+        Ok((path, config))
     }
 
     fn config_file(
@@ -1049,7 +1089,7 @@ impl State {
         if !matches!(action, "list" | "read" | "subscribe" | "unsubscribe") {
             return Err("mcp_resource action must be list, read, subscribe or unsubscribe".into());
         }
-        let (key, name, config, timeout) = self.target(context, params)?;
+        let (key, name, config, timeout) = self.target(context, params, None)?;
 
         if action == "list" {
             return self.with_session(

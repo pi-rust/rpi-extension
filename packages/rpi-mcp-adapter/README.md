@@ -3,8 +3,8 @@
 MCP tools for the RPI Rust extension ABI, with persistent stdio and Streamable
 HTTP connections. The host registers four stable tools:
 
-- `mcp_list`: list configured servers or discover a server's tools and schemas;
-- `mcp_call`: call a discovered tool, preserving text/images and structured results;
+- `mcp_list`: list configured servers, discover tools, or fetch selected signatures;
+- `mcp_call`: call a known tool directly, preserving text/images and structured results;
 - `mcp_resource`: list, read, subscribe to, or unsubscribe from a server's resources;
 - `mcp_request`: send a raw HTTP JSON-RPC request for compatibility/diagnostics.
   This low-level tool does not manage initialization; use the other tools for normal MCP calls.
@@ -36,24 +36,26 @@ missing values by a schema validator.
 
 | Tool | Required target / parameters | Omission defaults |
 | --- | --- | --- |
-| `mcp_list` | `configPath` alone lists configured names; `configPath` + `server` or `url` discovers tools. `action: "close"` requires a full target. | `action: "list"` |
-| `mcp_call` | `configPath` + `server` or `url`, plus `tool` | `arguments: {}` |
-| `mcp_resource` | `configPath` + `server` or `url`, even for list; `uri` for read/subscribe/unsubscribe | `action: "list"` |
+| `mcp_list` | No target lists configured names. `server` or `url` discovers tools and is required for `action: "close"`. | `action: "list"`, `probe: false` |
+| `mcp_call` | `server` or `url`, plus `tool` | `arguments: {}` |
+| `mcp_resource` | `server` or `url`, even for list. `uri` for read/subscribe/unsubscribe. | `action: "list"` |
 | `mcp_request` | `url`, `method` | `params: {}`, `id: 1`, `timeoutSeconds: 60` |
 
-For managed tools, do not combine `url` with `configPath` or `server`.
-`timeoutSeconds` is an integer from 1 to 300. Managed target operations use the
-configured timeout clamped to this range (configuration default 60), or 60 for a
-direct URL. There is no fixed schema default for these configuration-dependent
-values. Configuration-only listing does not use the timeout. Deadlines apply to
-each protocol request, not the entire multi-request operation or subscription
-lifetime, and do not override remote tools' action timeouts.
+Configured targets accept an optional `configPath`. `url` is exclusive with
+`configPath` and `server`. `timeoutSeconds` accepts integers from 1 to 300.
+A targeted operation uses the server's `timeout` (default 60 seconds) or
+60 seconds for a direct URL unless overridden. This deadline applies per
+protocol request. A probe uses a 15-second budget for the whole page by default.
+A listing without a target or probe reads configuration only.
 
 `tool` and raw `method` must be nonblank and at most 200 UTF-8 bytes; schema string
 length limits are character-based, so runtime byte validation remains authoritative.
-`arguments` must be an object, but the adapter does not validate it against the
-remote tool's schema: inspect discovery first. Raw `params` may be any JSON value;
-raw `id` is a string or signed/unsigned 64-bit integer, never null. Resource URIs
+`arguments` must be an object. Before sending `tools/call`, the adapter checks
+top-level required fields, types, enum values, and unknown fields for simple
+closed object schemas. Invalid arguments return an error with the field and
+projected signature. The managed connection still fetches the tool catalog
+before the check. The server validates the full schema. Raw `params` may be any
+JSON value. Raw `id` is a string or signed/unsigned 64-bit integer. Resource URIs
 are opaque strings, not locally validated URLs or local filesystem paths; use the
 exact URI returned by the server. `uri` is ignored for resource listing. Resource
 listing does not discover resource templates.
@@ -98,30 +100,58 @@ or full-fidelity resource representation.
 {"mcpServers":{"playwright":{"command":"node","args":["server.js","--extension"],"timeout":60},"remote":{"url":"http://localhost:8931/mcp","headers":{}}}}
 ```
 
-List server names without starting processes with `mcp_list`:
+The adapter resolves omitted `configPath` in this order:
+
+1. `RPI_MCP_CONFIG`, resolved against the host workspace when relative.
+2. `mcp.configPath` in the agent's `settings.json`. Relative paths resolve
+   against that file's directory.
+3. `mcp.json` in the agent directory (`RPI_CODING_AGENT_DIR` or `~/.rpi/agent`).
+
+Select a trusted workspace config explicitly through `configPath` or
+`RPI_MCP_CONFIG`. Explicit `configPath` takes precedence and resolves
+against the host workspace when relative. A stdio server starts in that workspace unless
+`cwd` is configured. A relative server `cwd` uses the config file's directory.
+
+| Example parameters | Result |
+| --- | --- |
+| `{}` | Configured server names and enabled flags. Starts no servers. |
+| `{"probe":true}` | Status and tool counts for up to eight servers per page. Probes run concurrently on temporary connections and return a failure reason and the first available stderr line. |
+| `{"server":"playwright"}` | Up to 30 tool names, short descriptions and required argument names. |
+| `{"server":"playwright","tools":["browser_tabs"]}` | The selected tool's projected signature, including argument types and enums. |
+| `{"server":"playwright","tools":["browser_tabs"],"detail":"full"}` | The original schema for the selected tool. |
+
+Use `nextOffset` as `offset` for the next catalog or probe page. Compact results
+may flag truncated fields. Rust library discovery helpers continue to return the
+full catalog. A model that knows the tool name can call it directly with
+`mcp_call`:
 
 ```json
-{"configPath":".rpi/mcp.json"}
+{"server":"playwright","tool":"browser_tabs","arguments":{"action":"list"}}
 ```
 
-Discover all tool schemas, including paginated tool lists:
+Configured stdio and HTTP servers can set `toolPolicy`:
 
 ```json
-{"configPath":".rpi/mcp.json","server":"playwright"}
+{
+  "mcpServers": {
+    "dbx": {
+      "command": "dbx-mcp",
+      "toolPolicy": {
+        "readOnly": ["dbx_list_*", "dbx_describe_*"],
+        "deny": ["dbx_execute_*"],
+        "preset": "database"
+      }
+    }
+  }
+}
 ```
 
-Call a tool with `mcp_call`:
-
-```json
-{"configPath":".rpi/mcp.json","server":"playwright","tool":"browser_tabs","arguments":{"action":"list"},"timeoutSeconds":60}
-```
-
-All three managed tools also accept `url` instead of `configPath`/`server` for a direct HTTP
-server. Loopback and private addresses are supported. HTTP redirects are disabled
-so configured authentication headers are not forwarded to another endpoint.
-Relative config paths resolve against the host project cwd. A stdio server starts
-in that cwd unless `cwd` is configured; a relative configured cwd resolves against
-the config file's directory. Environment settings are passed to the subprocess.
+`readOnly` is an optional allowlist of tool names or globs. `deny` takes
+precedence. The opt-in `database` preset also denies `*_execute_*`,
+`*_open_table`, and `*_rollback_*`. The adapter checks the policy before
+connecting for a configured call. Policies are scoped to the selected server
+configuration. Direct URLs and raw requests operate outside that policy, and a
+name-based rule cannot establish whether an allowed tool is read-only.
 
 ### Playwright extension screenshots
 
@@ -260,8 +290,9 @@ exclusivity, action requirements, and compatibility with host metadata:
 cargo test --locked -p rpi-mcp-adapter registered_schemas
 ```
 
-These schema tests do not connect to servers or replace runtime integration
-tests. For runtime changes, run `cargo test -p rpi-mcp-adapter` and
+The registration integration test exercises compact discovery, argument checks,
+denial before spawn, and probe isolation through the plugin callbacks.
+For runtime changes, run `cargo test -p rpi-mcp-adapter` and
 `cargo clippy -p rpi-mcp-adapter --all-targets -- -D warnings`.
 Tests exercise persistent processes, pagination, blocked writes, cancellation,
 size limits, stderr diagnostics, HTTP JSON/SSE lifecycle, session headers,

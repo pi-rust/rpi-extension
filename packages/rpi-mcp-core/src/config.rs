@@ -1,6 +1,7 @@
 //! Pi-compatible MCP server configuration owned by the extension.
 
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use std::collections::BTreeMap;
 
 #[derive(Debug, Clone, Deserialize, Serialize, Default, PartialEq)]
@@ -81,6 +82,65 @@ impl McpConfig {
         }
         Ok(config)
     }
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ToolPolicy {
+    #[serde(default)]
+    deny: Vec<String>,
+    read_only: Option<Vec<String>>,
+    preset: Option<PolicyPreset>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum PolicyPreset {
+    Database,
+}
+
+impl ToolPolicy {
+    fn check(&self, server: &str, tool: &str) -> Result<(), String> {
+        let matches = |patterns: &[String]| -> Result<bool, String> {
+            let mut matched = false;
+            for pattern in patterns {
+                let pattern = glob::Pattern::new(pattern)
+                    .map_err(|e| format!("invalid MCP toolPolicy glob for {server:?}: {e}"))?;
+                matched |= pattern.matches(tool);
+            }
+            Ok(matched)
+        };
+        let denied = matches(&self.deny)?;
+        let allowed = match &self.read_only {
+            Some(patterns) => matches(patterns)?,
+            None => true,
+        };
+        let database_write = self.preset.is_some()
+            && ["*_execute_*", "*_open_table", "*_rollback_*"]
+                .iter()
+                .any(|pattern| {
+                    glob::Pattern::new(pattern)
+                        .expect("valid preset glob")
+                        .matches(tool)
+                });
+        if denied || !allowed || database_write {
+            return Err(format!(
+                "MCP tool {tool:?} on server {server:?} is denied by toolPolicy; execute it manually if intended"
+            ));
+        }
+        Ok(())
+    }
+}
+
+pub(crate) fn check_tool_policy(text: &str, server: &str, tool: &str) -> Result<(), String> {
+    let document: Value =
+        serde_json::from_str(text).map_err(|e| format!("invalid mcp config: {e}"))?;
+    let Some(policy) = document["mcpServers"][server].get("toolPolicy") else {
+        return Ok(());
+    };
+    let policy: ToolPolicy = serde_json::from_value(policy.clone())
+        .map_err(|e| format!("invalid MCP toolPolicy for {server:?}: {e}"))?;
+    policy.check(server, tool)
 }
 
 fn validate_name(name: &str) -> Result<(), String> {
