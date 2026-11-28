@@ -2,6 +2,12 @@
 
 ## [Unreleased]
 
+## [0.1.99](https://github.com/pi-rust/rpi-extension/compare/rpi-web-v0.1.98...rpi-web-v0.1.99) - 2026-11-28
+
+### Fixed
+
+- *(web)* make ask dialog non-modal with manual answers ([#132](https://github.com/pi-rust/rpi-extension/pull/132))
+
 ## [0.1.98](https://github.com/pi-rust/rpi-extension/compare/rpi-web-v0.1.97...rpi-web-v0.1.98) - 2026-11-28
 
 ### Fixed

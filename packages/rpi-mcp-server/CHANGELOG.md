@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.4](https://github.com/pi-rust/rpi-extension/compare/rpi-mcp-server-v0.1.3...rpi-mcp-server-v0.1.4) - 2026-11-28
+
+### Other
+
+- updated the following local packages: rpi-extcore
+
 ## [0.1.3](https://github.com/pi-rust/rpi-extension/compare/rpi-mcp-server-v0.1.2...rpi-mcp-server-v0.1.3) - 2026-11-27
 
 ### Other

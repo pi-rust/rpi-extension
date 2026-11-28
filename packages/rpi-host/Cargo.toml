@@ -22,7 +22,7 @@ supported-targets = []
 
 [dependencies]
 rpi-plugin-sdk.workspace = true
-rpi-extcore = { path = "../rpi-extcore", version = "0.2.18" }
+rpi-extcore = { path = "../rpi-extcore", version = "0.2.19" }
 serde.workspace = true
 serde_json.workspace = true
 tokio = { version = "1", features = ["rt", "time", "macros"] }

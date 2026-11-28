@@ -22,14 +22,14 @@
     "descriptionZh": "通过 stdio 或 Streamable HTTP 连接 MCP 服务，调用工具并读取或订阅资源。",
     "descriptionEn": "Connect to MCP servers over stdio or Streamable HTTP to call tools and read or subscribe to resources.",
     "description": "Connect to MCP servers over stdio or Streamable HTTP to call tools and read or subscribe to resources.",
-    "version": "0.2.13",
+    "version": "0.2.14",
     "type": "extension",
     "tool": "mcp_list + mcp_call + mcp_request",
     "inspiredBy": "pi-mcp-adapter",
     "sourceDownloadsPerMonth": 761442,
     "install": "rpi install rpi-mcp-adapter --github pi-rust/rpi-extension",
     "repository": "https://github.com/pi-rust/rpi-extension",
-    "prebuilt_manifest": "https://github.com/pi-rust/rpi-extension/releases/download/rpi-mcp-adapter-v0.2.13/rpi-extension.json"
+    "prebuilt_manifest": "https://github.com/pi-rust/rpi-extension/releases/download/rpi-mcp-adapter-v0.2.14/rpi-extension.json"
   },
   {
     "name": "rpi-mcp-server",
@@ -38,14 +38,14 @@
     "descriptionZh": "将 rpi 作为 MCP 服务供其他客户端调用，支持 stdio 和 Streamable HTTP。",
     "descriptionEn": "Expose rpi to MCP clients as a server over stdio or Streamable HTTP.",
     "description": "Expose rpi to MCP clients as a server over stdio or Streamable HTTP.",
-    "version": "0.1.3",
+    "version": "0.1.4",
     "type": "extension",
     "tool": "--mcp (MCP stdio server)",
     "inspiredBy": "Model Context Protocol",
     "sourceDownloadsPerMonth": null,
     "install": "rpi install rpi-mcp-server --github pi-rust/rpi-extension",
     "repository": "https://github.com/pi-rust/rpi-extension",
-    "prebuilt_manifest": "https://github.com/pi-rust/rpi-extension/releases/download/rpi-mcp-server-v0.1.3/rpi-extension.json"
+    "prebuilt_manifest": "https://github.com/pi-rust/rpi-extension/releases/download/rpi-mcp-server-v0.1.4/rpi-extension.json"
   },
   {
     "name": "rpi-subagents",
@@ -342,14 +342,14 @@
     "descriptionZh": "通过 ACP 将 rpi 接入 Zed 等客户端，支持流式回复、工具交互和会话管理。",
     "descriptionEn": "Use rpi in Zed and other ACP clients, with streamed replies, tool interactions and session management.",
     "description": "Use rpi in Zed and other ACP clients, with streamed replies, tool interactions and session management.",
-    "version": "0.2.21",
+    "version": "0.2.22",
     "type": "extension",
     "tool": "--acp (Agent Client Protocol stdio server)",
     "inspiredBy": "Zed external agents / agent-client-protocol",
     "sourceDownloadsPerMonth": null,
     "install": "rpi install rpi-acp --github pi-rust/rpi-extension",
     "repository": "https://github.com/pi-rust/rpi-extension",
-    "prebuilt_manifest": "https://github.com/pi-rust/rpi-extension/releases/download/rpi-acp-v0.2.21/rpi-extension.json"
+    "prebuilt_manifest": "https://github.com/pi-rust/rpi-extension/releases/download/rpi-acp-v0.2.22/rpi-extension.json"
   },
   {
     "name": "rpi-permission-gate",
@@ -406,14 +406,14 @@
     "descriptionZh": "在浏览器中管理项目和会话，查看流式对话、工具交互、文件预览与 Git 差异。",
     "descriptionEn": "Manage projects and sessions in a browser with streamed conversations, tool interactions, file previews and Git diffs.",
     "description": "Manage projects and sessions in a browser with streamed conversations, tool interactions, file previews and Git diffs.",
-    "version": "0.1.98",
+    "version": "0.1.99",
     "type": "extension",
     "tool": null,
     "inspiredBy": "Browser project and session workspace",
     "sourceDownloadsPerMonth": null,
     "install": "rpi install rpi-web --github pi-rust/rpi-extension",
     "repository": "https://github.com/pi-rust/rpi-extension",
-    "prebuilt_manifest": "https://github.com/pi-rust/rpi-extension/releases/download/rpi-web-v0.1.98/rpi-extension.json"
+    "prebuilt_manifest": "https://github.com/pi-rust/rpi-extension/releases/download/rpi-web-v0.1.99/rpi-extension.json"
   },
   {
     "name": "rpi-edit-diagnostics",
@@ -438,13 +438,13 @@
     "descriptionZh": "通过原生扩展或独立服务提供 HTTP/SSE API，复用共享运行时且不附带前端界面。",
     "descriptionEn": "Serve the shared runtime through an HTTP/SSE API using a native extension or standalone service, without a frontend.",
     "description": "Serve the shared runtime through an HTTP/SSE API using a native extension or standalone service, without a frontend.",
-    "version": "0.2.7",
+    "version": "0.2.8",
     "type": "extension",
     "tool": null,
     "inspiredBy": "API-only HTTP/SSE service over the shared rpi core",
     "sourceDownloadsPerMonth": null,
     "install": "rpi install rpi-http --github pi-rust/rpi-extension",
     "repository": "https://github.com/pi-rust/rpi-extension",
-    "prebuilt_manifest": "https://github.com/pi-rust/rpi-extension/releases/download/rpi-http-v0.2.7/rpi-extension.json"
+    "prebuilt_manifest": "https://github.com/pi-rust/rpi-extension/releases/download/rpi-http-v0.2.8/rpi-extension.json"
   }
 ]
