@@ -9133,6 +9133,110 @@ test("composer shows the active project path, branch and linked worktree on narr
   await expect(context).not.toContainText("codex/a-long-worktree-branch");
 });
 
+test("automatic compaction resets footer CH and context without a new prompt", async ({
+  page,
+}) => {
+  const staleStats = {
+    messageCount: 1,
+    input: 100,
+    output: 252,
+    cacheRead: 20,
+    cacheWrite: 0,
+    totalTokens: 352,
+    cachedTokens: 20,
+    uncachedTokens: 80,
+    cost: 0.01,
+    costTotal: 0.01,
+  };
+  const staleSettings = {
+    sessionId,
+    leafId: "leaf-before-compact",
+    context: { tokens: 900_000, window: 1_000_000, percent: 90 },
+    stats: staleStats,
+  };
+  const freshSettings = {
+    sessionId,
+    leafId: "leaf-after-compact",
+    context: { tokens: 12_000, window: 1_000_000, percent: 1.2 },
+    stats: staleStats,
+  };
+  await mockHost(page);
+  let compacted = false;
+  let releaseSse!: () => void;
+  const sseReady = new Promise<void>((resolve) => {
+    releaseSse = resolve;
+  });
+  await page.route(`**/api/v1/sessions/${sessionId}/commands`, (route) => {
+    const { type } = route.request().postDataJSON();
+    if (type === "get_state")
+      return route.fulfill({
+        json: response(compacted ? freshSettings : staleSettings, type),
+      });
+    if (type === "get_stats")
+      return route.fulfill({ json: response(staleStats, type) });
+    return route.fallback();
+  });
+  await page.route(snapshotRoute, (route) =>
+    route.fulfill({
+      json: {
+        sessionId,
+        status: "ready",
+        messageCount: 1,
+        cachedTokens: 20,
+        uncachedTokens: 80,
+        totalTokens: 352,
+        costTotal: 0.01,
+        messages: [],
+        events: [],
+        lastSeq: 4,
+      },
+    }),
+  );
+  // The host projects compaction entries as a custom-role message whose role
+  // matches the native `compactionSummary` role (rpi-harness messages.rs),
+  // carrying the pre-compaction usage in `usage`.
+  const sseBody =
+    'id: 5\nevent: message_end\ndata: {"type":"message_end","message":{"role":"compactionSummary","usage":{"input":999,"output":1,"cacheRead":999,"totalTokens":1999}}}\n\n' +
+    'id: 6\nevent: agent_settled\ndata: {"type":"agent_settled","runId":"compact-auto","outcome":"completed","summary":"Conversation compacted"}\n\n';
+  await page.route(
+    `**/api/v1/sessions/${sessionId}/events?*`,
+    async (route) => {
+      await sseReady;
+      compacted = true;
+      return route.fulfill({
+        contentType: "text/event-stream",
+        body: sseBody,
+      });
+    },
+  );
+  await page.goto("/");
+
+  const metrics = page.locator(".composer-metrics");
+  await expect(
+    metrics.getByLabel("Cache hit: 20%", { exact: true }),
+  ).toBeVisible();
+  await expect(
+    metrics.getByLabel("Context: 900k / 1.0M", { exact: true }),
+  ).toBeVisible();
+  releaseSse();
+
+  // Both live metrics change before the next user prompt. The summary's own
+  // usage must not keep the old CH alive through the message fallback.
+  await expect(
+    metrics.getByLabel("Cache hit: \u2014", { exact: true }),
+  ).toBeVisible();
+  await expect(
+    metrics.getByLabel("Context: 12k / 1.0M", { exact: true }),
+  ).toBeVisible();
+  await openRuntimePanel(page);
+  const inspector = page.locator("aside.inspector");
+  await expect(
+    inspector.locator(".stat-row").filter({ hasText: "Context" }),
+  ).toContainText("1.2% / 1.0M");
+  await expect(inspector).toContainText("Input tokens");
+  await expect(inspector).toContainText("\u2014");
+});
+
 test("mobile composer footer keeps model picker usable beside session metrics", async ({
   page,
 }) => {

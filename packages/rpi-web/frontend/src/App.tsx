@@ -1377,6 +1377,13 @@ export default function App() {
   const traceButtonRef = useRef<HTMLButtonElement>(null);
   const [seen, setSeen] = useState(0);
   const [settleTick, setSettleTick] = useState(0);
+  // Compaction settlements carry a legacy `stats` snapshot describing the
+  // pre-compaction context. Mark them so the post-settlement get_state can
+  // refresh context usage without adopting those stale token totals, until
+  // the next run provides fresh usage.
+  const compactSettlement = useRef(false);
+  const compactRequested = useRef(false);
+  const emptyStats = useRef(false);
   const [connectionRevision, setConnectionRevision] = useState(0);
   /**
    * Bounded rearm budget for a stream that keeps failing. Reset whenever a
@@ -2410,6 +2417,9 @@ export default function App() {
           const isCompacting =
             event.type === "operation_accepted" && event.command === "compact";
           patchCompacting(isCompacting);
+          // A new run invalidates the post-compaction stats suppression: the
+          // upcoming settlement will report fresh usage again.
+          emptyStats.current = false;
           setRows((previous) =>
             previous.filter((row) => row.id !== "retry-note"),
           );
@@ -2435,6 +2445,14 @@ export default function App() {
           setInterrupted(Boolean(event.pendingResume));
           setRecoveryNoticeDismissed(false);
           const outcome = String(event.outcome ?? "settled");
+          // A compaction settlement invalidates the pre-compaction stats:
+          // manual `/compact` settles as `compacted`, automatic threshold
+          // compaction already flagged itself via its live summary message.
+          compactRequested.current = false;
+          if (outcome === "compacted") {
+            compactSettlement.current = true;
+            emptyStats.current = true;
+          }
           const settlement: SettlementIdentity = {
             outcome,
             error: shortReason(event.error) || undefined,
@@ -2629,7 +2647,21 @@ export default function App() {
             }
             break;
           }
-          if (roleOf(event.message) !== "assistant") break;
+          if (roleOf(event.message) !== "assistant") {
+            // The native compaction summary is a custom-role message
+            // (`compactionSummary`, rpi-harness messages.rs). Its usage
+            // describes the pre-compaction context, so it must not feed the
+            // message-stats fallback; it flags an automatic compaction whose
+            // settlement will reset the stale stats.
+            if (
+              event.type === "message_end" &&
+              roleOf(event.message) === "compactionSummary"
+            ) {
+              compactSettlement.current = true;
+              emptyStats.current = true;
+            }
+            break;
+          }
           if (event.type === "message_end") {
             const stats = latestMessageStats([event.message]);
             if (stats)
@@ -3850,7 +3882,19 @@ export default function App() {
         jobs.push(async () => {
           const rawStats = await api.stats(id, controller.signal);
           if (!current()) return;
-          const stats = normalizeRuntimeStats(rawStats);
+          const stats = emptyStats.current
+            ? {
+                messageCount: 0,
+                cachedTokens: 0,
+                uncachedTokens: 0,
+                totalTokens: 0,
+                inputTokens: 0,
+                outputTokens: 0,
+                cacheWrite: 0,
+                cacheHitRatio: null,
+                costTotal: 0,
+              }
+            : normalizeRuntimeStats(rawStats);
           if (stats)
             setRuntime((previous) =>
               previous ? { ...previous, stats } : { stats },
@@ -4029,14 +4073,35 @@ export default function App() {
     void refreshSessions();
     if (!sessionId) return;
     const controller = new AbortController();
+    const clearStaleStats = compactSettlement.current;
+    compactSettlement.current = false;
     void api
       .runtimeState(sessionId, controller.signal)
       .then((state) => {
         if (
           !controller.signal.aborted &&
           activeSessionRef.current === sessionId
-        )
-          setRuntime(state);
+        ) {
+          setRuntime(
+            clearStaleStats
+              ? {
+                  ...state,
+                  stats: {
+                    messageCount: 0,
+                    cachedTokens: 0,
+                    uncachedTokens: 0,
+                    totalTokens: 0,
+                    inputTokens: 0,
+                    outputTokens: 0,
+                    cacheWrite: 0,
+                    cacheHitRatio: null,
+                    costTotal: 0,
+                  },
+                }
+              : state,
+          );
+        }
+        if (clearStaleStats) setMessageStats({ sessionId, stats: null });
       })
       .catch(() => {});
     return () => controller.abort();
@@ -4146,6 +4211,7 @@ export default function App() {
           note("compact is not advertised by this host.");
           return;
         }
+        compactRequested.current = true;
         patchCompacting(true);
         setStatus("compacting");
         setRunActive(true);
@@ -4252,6 +4318,7 @@ export default function App() {
         updateDraft(raw, targetSession);
       if (navigation !== navigationRevision.current) return;
       if (name === "/compact" && cursor === lastSeq.current) {
+        compactRequested.current = false;
         patchCompacting(false);
         setStatus((current) =>
           current === "reconnecting" ? current : priorStatus,
