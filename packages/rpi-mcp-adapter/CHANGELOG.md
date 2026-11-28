@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.13](https://github.com/pi-rust/rpi-extension/compare/rpi-mcp-adapter-v0.2.12...rpi-mcp-adapter-v0.2.13) - 2026-11-27
+
+### Other
+
+- *(release)* prepare workspace-wide SDK 0.31.0 release ([#124](https://github.com/pi-rust/rpi-extension/pull/124))
+
 ## [0.2.11](https://github.com/pi-rust/rpi-package/compare/rpi-mcp-adapter-v0.2.10...rpi-mcp-adapter-v0.2.11) - 2026-11-14
 
 ### Fixed

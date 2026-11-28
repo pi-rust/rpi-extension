@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.6](https://github.com/pi-rust/rpi-extension/compare/rpi-todo-v0.3.5...rpi-todo-v0.3.6) - 2026-11-27
+
+### Other
+
+- *(release)* prepare workspace-wide SDK 0.31.0 release ([#124](https://github.com/pi-rust/rpi-extension/pull/124))
+
 ## [0.3.4](https://github.com/pi-rust/rpi-package/compare/rpi-todo-v0.3.3...rpi-todo-v0.3.4) - 2026-11-06
 
 ### Fixed

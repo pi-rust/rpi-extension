@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.8](https://github.com/pi-rust/rpi-extension/compare/rpi-run-stats-v0.1.7...rpi-run-stats-v0.1.8) - 2026-11-27
+
+### Other
+
+- *(release)* prepare workspace-wide SDK 0.31.0 release ([#124](https://github.com/pi-rust/rpi-extension/pull/124))
+
 ## [0.1.6](https://github.com/pi-rust/rpi-package/compare/rpi-run-stats-v0.1.5...rpi-run-stats-v0.1.6) - 2026-11-06
 
 ### Fixed

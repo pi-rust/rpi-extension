@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.12](https://github.com/pi-rust/rpi-extension/compare/rpi-permissions-v0.1.11...rpi-permissions-v0.1.12) - 2026-11-27
+
+### Other
+
+- *(release)* prepare workspace-wide SDK 0.31.0 release ([#124](https://github.com/pi-rust/rpi-extension/pull/124))
+
 ## [0.1.10](https://github.com/pi-rust/rpi-extension/compare/rpi-permissions-v0.1.9...rpi-permissions-v0.1.10) - 2026-11-23
 
 ### Fixed

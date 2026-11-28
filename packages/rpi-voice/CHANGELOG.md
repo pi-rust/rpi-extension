@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.18](https://github.com/pi-rust/rpi-extension/compare/rpi-voice-v0.3.17...rpi-voice-v0.3.18) - 2026-11-27
+
+### Other
+
+- *(release)* prepare workspace-wide SDK 0.31.0 release ([#124](https://github.com/pi-rust/rpi-extension/pull/124))
+
 ## [0.3.16](https://github.com/pi-rust/rpi-extension/compare/rpi-voice-v0.3.15...rpi-voice-v0.3.16) - 2026-11-23
 
 ### Other

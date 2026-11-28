@@ -41,6 +41,11 @@ pub(crate) struct UpdateState {
     /// One check at a time. Two tabs opening together, or a "Check now" during
     /// the startup check, would otherwise each spawn a network-bound CLI.
     checking: Arc<tokio::sync::Mutex<()>>,
+    /// Cached `rpi updates` support, probed once per process. A native CLI
+    /// without that subcommand does not fail — the argument falls through to
+    /// the prompt path and runs a model turn — so every check must know
+    /// whether the subcommand exists *before* invoking it.
+    inventory_support: Arc<Mutex<Option<bool>>>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -99,6 +104,7 @@ pub(crate) fn routes(config: Arc<AppConfig>) -> Router {
         tasks: Arc::new(Mutex::new(HashMap::new())),
         installing: Arc::new(Mutex::new(false)),
         checking: Arc::new(tokio::sync::Mutex::new(())),
+        inventory_support: Arc::new(Mutex::new(None)),
     });
     Router::new()
         .route("/api/v1/updates/check", get(check))
@@ -123,6 +129,15 @@ async fn check(
     let _checking = state.checking.clone().lock_owned().await;
     if let Some(cached) = cached_inventory(&state) {
         return Json(cached);
+    }
+    // Never invoke an unknown subcommand: this CLI sends unrecognized
+    // arguments to the prompt path, which spends a model turn per call.
+    if !inventory_supported(&state).await {
+        return Json(unavailable_response(
+            cached_inventory(&state),
+            "This rpi build has no `rpi updates` command; install a newer native rpi to check for updates."
+                .into(),
+        ));
     }
     let refresh = run_cli_json(&state, &["updates", "refresh", "--json"]).await;
     let (inventory, mut error) = match refresh {
@@ -360,6 +375,47 @@ fn unavailable_response(stale: Option<Value>, error: String) -> Value {
     response
 }
 
+/// Whether the configured native binary implements `rpi updates`.
+///
+/// `rpi --help` is a static usage dump, so this is a cheap local probe rather
+/// than a network or model operation. The answer is cached: the binary cannot
+/// change under a running service except through an update, which restarts it.
+async fn inventory_supported(state: &Arc<UpdateState>) -> bool {
+    if let Some(known) = *state
+        .inventory_support
+        .lock()
+        .expect("update support cache")
+    {
+        return known;
+    }
+    let mut command = tokio::process::Command::new(&state.config.rpi_bin);
+    command
+        .arg("--help")
+        .current_dir(&state.config.project)
+        .stdin(std::process::Stdio::null());
+    let supported = match command.output().await {
+        Ok(output) => help_lists_updates(&String::from_utf8_lossy(&output.stdout)),
+        Err(_) => false,
+    };
+    *state
+        .inventory_support
+        .lock()
+        .expect("update support cache") = Some(supported);
+    supported
+}
+
+/// Whether a `rpi --help` dump advertises the `updates` subcommand.
+///
+/// The name is matched as a whole word: `update` alone must not count, and
+/// the historical `rpi update` line must not be mistaken for it.
+fn help_lists_updates(help: &str) -> bool {
+    help.lines().any(|line| {
+        line.split_whitespace()
+            .next()
+            .is_some_and(|word| word == "updates")
+    })
+}
+
 /// Run an inventory command and require a JSON object.
 ///
 /// A native CLI without the `updates` subcommand does not fail: the argument
@@ -564,6 +620,11 @@ fn now_ms() -> u64 {
 mod tests {
     use super::{normalize_inventory, validate_proxy, write_atomically};
     use serde_json::json;
+    // Only the process-level probe test needs `Arc`/`UpdateState`, and that
+    // test is Unix-only: an unconditional import would be unused (and a
+    // `-D warnings` failure) on Windows.
+    #[cfg(unix)]
+    use std::sync::Arc;
 
     #[test]
     fn proxy_validation_accepts_http_and_https_and_rejects_subscription_urls() {
@@ -578,6 +639,67 @@ mod tests {
         // child process environment as HTTP_PROXY.
         assert!(validate_proxy("http://user:pass@proxy:8080").is_err());
         assert!(validate_proxy("http://proxy:8080\nHTTPS_PROXY=x").is_err());
+    }
+
+    #[cfg(unix)]
+    fn state_with(bin: std::path::PathBuf) -> Arc<super::UpdateState> {
+        Arc::new(super::UpdateState {
+            config: Arc::new(crate::server::AppConfig {
+                rpi_bin: bin,
+                ..Default::default()
+            }),
+            cache: Arc::new(std::sync::Mutex::new(None)),
+            tasks: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            installing: Arc::new(std::sync::Mutex::new(false)),
+            checking: Arc::new(tokio::sync::Mutex::new(())),
+            inventory_support: Arc::new(std::sync::Mutex::new(None)),
+        })
+    }
+
+    #[test]
+    fn only_the_updates_subcommand_counts_as_inventory_support() {
+        // 0.31.0: the historical singular command is present, the inventory is not.
+        assert!(!super::help_lists_updates(
+            "Subcommands:\n  update                       Update the rpi CLI\n  extension update [name]        Update extensions\n"
+        ));
+        // A binary with the inventory lists it as its own subcommand.
+        assert!(super::help_lists_updates(
+            "Subcommands:\n  update                       Update the rpi CLI\n  updates check --json          Report update state\n"
+        ));
+        // Flags must not be read as the subcommand name.
+        assert!(!super::help_lists_updates("  --updates check\n"));
+        assert!(!super::help_lists_updates(""));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_binary_without_the_updates_subcommand_is_detected_before_it_runs() {
+        use std::os::unix::fs::PermissionsExt;
+        let root =
+            std::env::temp_dir().join(format!("rpi-probe-{}", uuid::Uuid::new_v4().simple()));
+        std::fs::create_dir_all(&root).unwrap();
+        let write = |name: &str, body: &str| {
+            let path = root.join(name);
+            std::fs::write(&path, body).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+            path
+        };
+        // 0.31.0 lists `update` but not `updates`; passing `updates check` to it
+        // reaches the prompt path and spends a model turn.
+        let old = write(
+            "rpi-old",
+            "#!/bin/sh\nprintf 'Subcommands:\\n  update  Update the rpi CLI\\n'\n",
+        );
+        assert!(!super::inventory_supported(&state_with(old.clone())).await);
+        // The second call reuses the cached answer instead of probing again.
+        assert!(!super::inventory_supported(&state_with(old)).await);
+
+        let new = write(
+            "rpi-new",
+            "#!/bin/sh\nprintf 'Subcommands:\\n  updates check --json  Report update state\\n'\n",
+        );
+        assert!(super::inventory_supported(&state_with(new)).await);
+        std::fs::remove_dir_all(&root).unwrap();
     }
 
     #[test]

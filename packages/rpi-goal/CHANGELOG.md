@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.7](https://github.com/pi-rust/rpi-extension/compare/rpi-goal-v0.2.6...rpi-goal-v0.2.7) - 2026-11-27
+
+### Other
+
+- *(release)* prepare workspace-wide SDK 0.31.0 release ([#124](https://github.com/pi-rust/rpi-extension/pull/124))
+- Use independent runs for subagent delegation ([#121](https://github.com/pi-rust/rpi-extension/pull/121))
+
 ### Fixed
 
 - Record legacy `goal {action: "complete"}` as a model completion, so verifier
