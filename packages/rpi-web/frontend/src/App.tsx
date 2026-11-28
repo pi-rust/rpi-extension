@@ -1135,6 +1135,12 @@ export default function App() {
   const traceButtonRef = useRef<HTMLButtonElement>(null);
   const [seen, setSeen] = useState(0);
   const [settleTick, setSettleTick] = useState(0);
+  // Compact settlements carry a legacy `stats` snapshot describing the
+  // pre-compaction context. Mark them so the post-settlement get_state can
+  // refresh context usage without adopting those stale token totals.
+  const compactSettlement = useRef(false);
+  const compactRequested = useRef(false);
+  const emptyStats = useRef(false);
   const [connectionRevision, setConnectionRevision] = useState(0);
   /**
    * Bounded rearm budget for a stream that keeps failing. Reset whenever a
@@ -2062,6 +2068,16 @@ export default function App() {
           setInterrupted(Boolean(event.pendingResume));
           setRecoveryNoticeDismissed(false);
           const outcome = String(event.outcome ?? "settled");
+          // `compact_pending` is raised while a compaction is being summarized.
+          // Manual `/compact` can also settle as `compacted`/`declined`.
+          if (
+            compactRequested.current ||
+            (outcome !== "failed" &&
+              rows.some((row) => row.id.startsWith("compaction-")))
+          ) {
+            compactSettlement.current = true;
+          }
+          compactRequested.current = false;
           const settlement: SettlementIdentity = {
             outcome,
             error: shortReason(event.error) || undefined,
@@ -3294,7 +3310,19 @@ export default function App() {
         jobs.push(async () => {
           const rawStats = await api.stats(id, controller.signal);
           if (!current()) return;
-          const stats = normalizeRuntimeStats(rawStats);
+          const stats = emptyStats.current
+            ? {
+                messageCount: 0,
+                cachedTokens: 0,
+                uncachedTokens: 0,
+                totalTokens: 0,
+                inputTokens: 0,
+                outputTokens: 0,
+                cacheWrite: 0,
+                cacheHitRatio: null,
+                costTotal: 0,
+              }
+            : normalizeRuntimeStats(rawStats);
           if (stats)
             setRuntime((previous) =>
               previous ? { ...previous, stats } : { stats },
@@ -3457,14 +3485,36 @@ export default function App() {
     void refreshSessions();
     if (!sessionId) return;
     const controller = new AbortController();
+    const clearStaleStats = compactSettlement.current;
+    compactSettlement.current = false;
+    emptyStats.current = true;
     void api
       .runtimeState(sessionId, controller.signal)
       .then((state) => {
         if (
           !controller.signal.aborted &&
           activeSessionRef.current === sessionId
-        )
-          setRuntime(state);
+        ) {
+          setRuntime(
+            clearStaleStats
+              ? {
+                  ...state,
+                  stats: {
+                    messageCount: 0,
+                    cachedTokens: 0,
+                    uncachedTokens: 0,
+                    totalTokens: 0,
+                    inputTokens: 0,
+                    outputTokens: 0,
+                    cacheWrite: 0,
+                    cacheHitRatio: null,
+                    costTotal: 0,
+                  },
+                }
+              : state,
+          );
+        }
+        if (clearStaleStats) setMessageStats({ sessionId, stats: null });
       })
       .catch(() => {});
     return () => controller.abort();
@@ -3577,6 +3627,7 @@ export default function App() {
         }
         setStatus("running");
         setRunActive(true);
+        compactRequested.current = true;
         await commandData(
           sessionId,
           "compact",
@@ -3676,6 +3727,7 @@ export default function App() {
       }
       note(`Unknown command ${name}. Try /help.`);
     } catch (cause) {
+      compactRequested.current = false;
       if (!draftBySession.current.get(targetSession))
         updateDraft(raw, targetSession);
       if (navigation !== navigationRevision.current) return;
