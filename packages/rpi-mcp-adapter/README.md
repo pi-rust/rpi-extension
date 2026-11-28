@@ -103,19 +103,19 @@ or full-fidelity resource representation.
 The adapter resolves omitted `configPath` in this order:
 
 1. `RPI_MCP_CONFIG`, resolved against the host workspace when relative.
-2. `mcp.configPath` in project `.rpi/settings.json`, then agent `settings.json`.
-   Relative paths resolve against the settings file's directory.
-3. The first existing `mcp.json` in project `.rpi`, then the agent directory
-   (`RPI_CODING_AGENT_DIR` or `~/.rpi/agent`).
+2. `mcp.configPath` in the agent's `settings.json`. Relative paths resolve
+   against that file's directory.
+3. `mcp.json` in the agent directory (`RPI_CODING_AGENT_DIR` or `~/.rpi/agent`).
 
-An explicit `configPath` takes precedence and resolves against the host
-workspace when relative. A stdio server starts in that workspace unless
+Select a trusted workspace config explicitly through `configPath` or
+`RPI_MCP_CONFIG`. Explicit `configPath` takes precedence and resolves
+against the host workspace when relative. A stdio server starts in that workspace unless
 `cwd` is configured. A relative server `cwd` uses the config file's directory.
 
 | Example parameters | Result |
 | --- | --- |
 | `{}` | Configured server names and enabled flags. Starts no servers. |
-| `{"probe":true}` | Status and tool counts for up to eight servers per page. Probes run concurrently and return a failure reason and the first available stderr line. |
+| `{"probe":true}` | Status and tool counts for up to eight servers per page. Probes run concurrently on temporary connections and return a failure reason and the first available stderr line. |
 | `{"server":"playwright"}` | Up to 30 tool names, short descriptions and required argument names. |
 | `{"server":"playwright","tools":["browser_tabs"]}` | The selected tool's projected signature, including argument types and enums. |
 | `{"server":"playwright","tools":["browser_tabs"],"detail":"full"}` | The original schema for the selected tool. |
@@ -290,8 +290,8 @@ exclusivity, action requirements, and compatibility with host metadata:
 cargo test --locked -p rpi-mcp-adapter registered_schemas
 ```
 
-The registration integration test exercises implicit configuration, compact
-discovery, argument checks and denial before spawn through the plugin callbacks.
+The registration integration test exercises compact discovery, argument checks,
+denial before spawn, and probe isolation through the plugin callbacks.
 For runtime changes, run `cargo test -p rpi-mcp-adapter` and
 `cargo clippy -p rpi-mcp-adapter --all-targets -- -D warnings`.
 Tests exercise persistent processes, pagination, blocked writes, cancellation,

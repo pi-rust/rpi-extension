@@ -104,18 +104,32 @@ impl<'a> Discovery<'a> {
             page
         } else {
             page.iter()
-                .map(|tool| {
-                    let name = tool["name"].as_str().unwrap_or_default();
+                .map(|tool| -> Result<Value, String> {
+                    let name = tool["name"]
+                        .as_str()
+                        .filter(|name| !name.trim().is_empty() && name.len() <= 200)
+                        .ok_or(
+                            "MCP server returned a tool name outside the 1–200 UTF-8 byte limit",
+                        )?;
                     let description = tool["description"].as_str().unwrap_or_default();
                     let schema = &tool["inputSchema"];
                     if self.selected.is_some() {
-                        signature(name, description, schema)
+                        Ok(signature(name, description, schema))
                     } else {
-                        summary(name, description, schema)
+                        Ok(summary(name, description, schema))
                     }
                 })
-                .collect()
+                .collect::<Result<Vec<_>, String>>()?
         });
+        if !self.full {
+            if let Some(info) = result["serverInfo"].as_object_mut() {
+                for value in info.values_mut() {
+                    if let Some(text) = value.as_str() {
+                        *value = json!(short_description(text));
+                    }
+                }
+            }
+        }
         result["toolCount"] = json!(total);
         if self.selected.is_none() && self.offset + PAGE_SIZE < total {
             result["nextOffset"] = json!(self.offset + PAGE_SIZE);
@@ -253,10 +267,67 @@ pub(crate) fn validate_arguments(tool: &Tool, arguments: &Value) -> Result<(), S
         }
         if property["enum"]
             .as_array()
-            .is_some_and(|choices| !choices.contains(value))
+            .is_some_and(|choices| !choices.iter().any(|choice| enum_value_eq(choice, value)))
         {
             return fail(field, "argument is not an allowed enum value");
         }
     }
     Ok(())
+}
+
+// JSON Schema compares numbers by value, even when their JSON forms differ.
+fn enum_value_eq(left: &Value, right: &Value) -> bool {
+    if left == right {
+        return true;
+    }
+    match (left, right) {
+        (Value::Number(left), Value::Number(right)) => {
+            let integer = |number: &serde_json::Number| {
+                number
+                    .as_i64()
+                    .map(i128::from)
+                    .or_else(|| number.as_u64().map(i128::from))
+            };
+            let (whole, decimal) = match (integer(left), integer(right)) {
+                (Some(whole), None) => (whole, right),
+                (None, Some(whole)) => (whole, left),
+                _ => return false,
+            };
+            decimal
+                .as_f64()
+                .is_some_and(|value| value.fract() == 0.0 && value as i128 == whole)
+        }
+        (Value::Array(left), Value::Array(right)) => {
+            left.len() == right.len() && left.iter().zip(right).all(|(a, b)| enum_value_eq(a, b))
+        }
+        (Value::Object(left), Value::Object(right)) => {
+            left.len() == right.len()
+                && left.iter().all(|(key, value)| {
+                    right
+                        .get(key)
+                        .is_some_and(|other| enum_value_eq(value, other))
+                })
+        }
+        _ => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn argument_enum_uses_numeric_values_instead_of_json_number_representations() {
+        let tool = Tool {
+            name: "lookup".into(),
+            description: String::new(),
+            input_schema: json!({"properties":{"arg":{"enum":[{"items":[1, 2]}]}}}),
+        };
+        assert!(validate_arguments(&tool, &json!({"arg":{"items":[1.0, 2.0]}})).is_ok());
+        assert!(validate_arguments(&tool, &json!({"arg":{"items":[1.0, 2.5]}})).is_err());
+        assert!(!enum_value_eq(
+            &json!(u64::MAX),
+            &json!(18446744073709551616.0)
+        ));
+    }
 }

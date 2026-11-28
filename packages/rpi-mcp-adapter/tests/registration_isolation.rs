@@ -317,7 +317,7 @@ fn duplicate_sessions_have_independent_tools_events_and_cleanup() {
 }
 
 #[test]
-fn implicit_config_compact_discovery_validation_and_policy_cross_plugin_abi() {
+fn compact_discovery_validation_and_policy_cross_plugin_abi() {
     struct Workspace(PathBuf);
     impl Drop for Workspace {
         fn drop(&mut self) {
@@ -350,7 +350,8 @@ fn implicit_config_compact_discovery_validation_and_policy_cross_plugin_abi() {
     }}).to_string()).unwrap();
 
     let host = Host::new(true);
-    let run = |name, params| {
+    let run = |name, mut params: Value| {
+        params["configPath"] = json!(".rpi/mcp.json");
         host.start_with_context(
             name,
             params,
@@ -438,4 +439,28 @@ fn implicit_config_compact_discovery_validation_and_policy_cross_plugin_abi() {
         .contains("deliberately blocked"));
     assert_eq!(servers[1]["toolCount"], 23);
     assert_eq!(servers[1]["status"], "ready");
+    let after_probe = run(
+        "mcp_call",
+        json!({"server":"dbx","tool":"dbx_list_connections"}),
+    )
+    .unwrap();
+    assert_eq!(after_probe["content"][0]["text"], "[fixture-db]");
+    let events: Vec<Value> = std::fs::read_to_string(&log)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    let starts: Vec<_> = events
+        .iter()
+        .filter(|entry| entry["event"] == "start")
+        .collect();
+    let calls: Vec<_> = events
+        .iter()
+        .filter(|entry| entry["details"]["method"] == "tools/call")
+        .collect();
+    assert_eq!(starts.len(), 2);
+    assert_ne!(starts[0]["pid"], starts[1]["pid"]);
+    assert_eq!(calls.len(), 2);
+    assert_eq!(calls[0]["pid"], calls[1]["pid"]);
+    assert_eq!(calls[0]["pid"], starts[0]["pid"]);
 }

@@ -42,49 +42,49 @@ fn discover(
         }
         return Ok(cwd.join(path));
     }
-    let project = cwd.join(".rpi");
-    let config_dirs = std::iter::once(project.as_path()).chain(agent_dir);
-    for directory in config_dirs.clone() {
-        let settings = directory.join("settings.json");
-        match settings.metadata() {
-            Ok(metadata) if metadata.is_file() => {}
-            Ok(_) => return Err(format!("MCP settings {} is not a file", settings.display())),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(e) => return Err(format!("read MCP settings {}: {e}", settings.display())),
-        }
-        let text = std::fs::read_to_string(&settings)
-            .map_err(|e| format!("read MCP settings {}: {e}", settings.display()))?;
-        let value = parse_settings(&text)
-            .map_err(|e| format!("invalid MCP settings {}: {e}", settings.display()))?;
-        if let Some(path) = value["mcp"].get("configPath") {
-            let path = path
-                .as_str()
-                .filter(|path| !path.trim().is_empty())
-                .ok_or_else(|| {
-                    format!(
-                        "mcp.configPath in {} must name a configuration file",
-                        settings.display()
-                    )
-                })?;
-            return Ok(directory.join(path));
-        }
+    // The current plugin ABI doesn't provide the host's project trust decision.
+    // A checkout must not be able to shadow the user's default executable config.
+    let agent_dir = agent_dir.ok_or("MCP config not found; set RPI_MCP_CONFIG or configPath")?;
+    let settings = agent_dir.join("settings.json");
+    let settings_value = read_settings(&settings)?;
+    if let Some(path) = settings_value
+        .as_ref()
+        .and_then(|value| value["mcp"].get("configPath"))
+    {
+        let path = path
+            .as_str()
+            .filter(|path| !path.trim().is_empty())
+            .ok_or_else(|| {
+                format!(
+                    "mcp.configPath in {} must name a configuration file",
+                    settings.display()
+                )
+            })?;
+        return Ok(agent_dir.join(path));
     }
-    let mut attempted = Vec::new();
-    for directory in config_dirs {
-        let path = directory.join("mcp.json");
-        match path.metadata() {
-            Ok(metadata) if metadata.is_file() => return Ok(path),
-            Ok(_) => return Err(format!("MCP config {} is not a file", path.display())),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                attempted.push(path.display().to_string())
-            }
-            Err(e) => return Err(format!("read MCP config {}: {e}", path.display())),
+    let path = agent_dir.join("mcp.json");
+    match path.metadata() {
+        Ok(metadata) if metadata.is_file() => Ok(path),
+        Ok(_) => Err(format!("MCP config {} is not a file", path.display())),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            Err(format!("MCP config not found; tried {}", path.display()))
         }
+        Err(e) => Err(format!("read MCP config {}: {e}", path.display())),
     }
-    Err(format!(
-        "MCP config not found; tried {}",
-        attempted.join(", ")
-    ))
+}
+
+fn read_settings(path: &Path) -> Result<Option<Value>, String> {
+    match path.metadata() {
+        Ok(metadata) if metadata.is_file() => {}
+        Ok(_) => return Err(format!("MCP settings {} is not a file", path.display())),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(format!("read MCP settings {}: {e}", path.display())),
+    }
+    let text = std::fs::read_to_string(path)
+        .map_err(|e| format!("read MCP settings {}: {e}", path.display()))?;
+    parse_settings(&text)
+        .map(Some)
+        .map_err(|e| format!("invalid MCP settings {}: {e}", path.display()))
 }
 
 fn parse_settings(text: &str) -> serde_json::Result<Value> {
@@ -120,7 +120,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn config_search_prefers_overrides_then_project_then_agent() {
+    fn config_search_uses_agent_config_and_explicit_overrides() {
         let root = std::env::temp_dir().join(format!("mcp-config-search-{}", std::process::id()));
         let cwd = root.join("workspace");
         let project = cwd.join(".rpi");
@@ -128,19 +128,18 @@ mod tests {
         std::fs::create_dir_all(&project).unwrap();
         std::fs::create_dir_all(&agent).unwrap();
 
+        std::fs::write(project.join("mcp.json"), "{}").unwrap();
+        std::fs::write(
+            project.join("settings.json"),
+            r#"{"mcp":{"configPath":"shadow.json"}}"#,
+        )
+        .unwrap();
         let error = discover(&cwd, Some(&agent), None).unwrap_err();
-        for path in [project.join("mcp.json"), agent.join("mcp.json")] {
-            assert!(error.contains(&path.display().to_string()), "{error}");
-        }
+        assert!(error.contains(&agent.join("mcp.json").display().to_string()));
         std::fs::write(agent.join("mcp.json"), "{}").unwrap();
         assert_eq!(
             discover(&cwd, Some(&agent), None).unwrap(),
             agent.join("mcp.json")
-        );
-        std::fs::write(project.join("mcp.json"), "{}").unwrap();
-        assert_eq!(
-            discover(&cwd, Some(&agent), None).unwrap(),
-            project.join("mcp.json")
         );
         std::fs::write(
             agent.join("settings.json"),

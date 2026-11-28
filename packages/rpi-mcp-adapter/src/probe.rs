@@ -30,8 +30,11 @@ pub(crate) fn list(
         .cloned()
         .collect();
     let deadline = Instant::now() + Duration::from_secs(seconds);
-
+    // Probing must neither consume the session's connection slots nor replace
+    // its live connections when the configuration has changed.
+    let probe_runtime = crate::runtime::new_runtime();
     let results = std::thread::scope(|scope| {
+        let probe_runtime = &probe_runtime;
         let probe_control = Control::default();
         let (done, wait) = mpsc::channel::<()>();
         let timer_control = probe_control.clone();
@@ -58,7 +61,7 @@ pub(crate) fn list(
                     }
                     let target =
                         json!({"configPath":params["configPath"],"server":server["server"]});
-                    match runtime.list(context, &target, &probe_control) {
+                    match probe_runtime.list(context, &target, &probe_control) {
                         Ok(result) => {
                             server["status"] = json!("ready");
                             server["toolCount"] =
