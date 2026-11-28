@@ -6,7 +6,7 @@ pub(crate) mod local_socket;
 mod resources;
 mod startup;
 use admission::{ExecutionAdmission, ExecutionProjection, ExecutionTicket};
-pub(crate) use resources::ResourceFence;
+pub(crate) use resources::{ExitConfirmation, ResourceFence};
 use std::{
     collections::{HashMap, VecDeque},
     path::PathBuf,
