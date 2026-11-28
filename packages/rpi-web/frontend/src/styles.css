@@ -1343,9 +1343,21 @@ code {
 .settings-switch:has(input:checked)::after {
   transform: translateX(16px);
 }
-.settings-switch input:focus-visible::before {
+.settings-switch:has(input:focus-visible)::before {
   outline: 2px solid var(--blue);
   outline-offset: 2px;
+}
+/* Inspector autoRead switch still uses the old toggle label; keep it styled. */
+.settings-toggle {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 10px 0 14px;
+  color: var(--muted);
+  font-size: 13px;
+}
+.settings-toggle input {
+  accent-color: var(--blue);
 }
 .auto-update-settings,
 .auto-archive-settings {
