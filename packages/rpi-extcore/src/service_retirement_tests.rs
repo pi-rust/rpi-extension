@@ -136,6 +136,7 @@ async fn bounded<T>(future: impl std::future::Future<Output = T>) -> T {
 #[tokio::test]
 async fn reopen_disconnected_local_host_requires_saved_history_and_native_writer_lease() {
     use fs2::FileExt;
+    use std::os::unix::fs::PermissionsExt;
     use tokio::{io::AsyncWriteExt, net::UnixListener};
 
     async fn request(socket: &mut BufReader<tokio::net::UnixStream>) -> Value {
@@ -158,6 +159,7 @@ async fn reopen_disconnected_local_host_requires_saved_history_and_native_writer
 
     let mut f = Fixture::new().await;
     let socket_dir = tempfile::Builder::new().prefix("rh").tempdir().unwrap();
+    std::fs::set_permissions(socket_dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
     let socket_path = socket_dir.path().join("rpc.sock");
     let listener = UnixListener::bind(&socket_path).unwrap();
     Arc::get_mut(&mut f.service).unwrap().local_host_socket = Some(socket_path);
@@ -200,10 +202,8 @@ async fn reopen_disconnected_local_host_requires_saved_history_and_native_writer
         drop(lease);
     });
 
-    assert_eq!(
-        bounded(open_session(&f.service, f.id.clone())).await.0,
-        ReplyKind::Success
-    );
+    let opened = bounded(open_session(&f.service, f.id.clone())).await;
+    assert_eq!(opened.0, ReplyKind::Success, "{opened:?}");
     let old = f.service.live_session(&f.id).await.unwrap();
     disconnect.send(()).unwrap();
     let mut closed = old.closed_receiver();
